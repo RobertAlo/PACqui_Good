@@ -2971,7 +2971,7 @@ class LLMChatDialog(tk.Toplevel):
         # System
         sysf = ttk.LabelFrame(root, text="System"); sysf.pack(fill="x")
         self.txt_sys = ScrolledText(sysf, height=3, wrap="word")
-        self.txt_sys.insert("1.0", "Eres PACqui, asistente de documentación para la PAC. Responde en español con precisión.")
+        self.txt_sys.insert("1.0", "Soy PACqui, asistente de documentación para la PAC. Encantada de saludarte.")
         self.txt_sys.pack(fill="x")
 
         # Conversación
