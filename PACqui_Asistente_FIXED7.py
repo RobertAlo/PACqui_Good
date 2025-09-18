@@ -3109,7 +3109,7 @@ class LLMChatDialog(tk.Toplevel):
         except Exception:
             sys_text = ""
         if not sys_text:
-            sys_text = "Eres PACqui, asistente de documentación para la PAC. Responde en español y con precisión."
+            sys_text = "Soy PACqui, asistente de documentación para la PAC. Encantada de saludarte."
 
         user_payload = user
         if ctx and not ctx.strip().startswith("[0]"):
