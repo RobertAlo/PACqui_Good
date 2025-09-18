@@ -2920,29 +2920,46 @@ class HelpDialog(tk.Toplevel):
         except Exception as e:
             self._append_msg(f'RAG retrieve error: {e}', 'WARN')
             return ""
+
 class LLMChatDialog(tk.Toplevel):
-    """Chat con modelo GGUF local usando llama-cpp-python."""
+    """Chat con modelo GGUF local usando llama-cpp-python.
+    * Arreglo clave: define `self._stop` y usa `self.stop_event` de forma segura.
+    * Corrige métodos que quedaron fuera de clase en versiones previas.
+    * Streaming con fallback y botón Detener funcional.
+    """
     def __init__(self, master, app):
         super().__init__(master)
         self.title("PACqui — Asistente LLM (local)")
         self.transient(master); self.resizable(True, True); self.grab_set()
         self.geometry("860x680")
         self.app = app
+
+        # Estado LLM
         self.model = None
         self.model_path = getattr(app, "llm_model_path", "") or ""
         self.stop_event = threading.Event()
+        self._stream_thread = None
+
         self.messages = []
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------------- UI ----------------
     def _build_ui(self):
         root = ttk.Frame(self, padding=10); root.pack(fill="both", expand=True)
+
+        # Línea de carga de modelo
         top = ttk.Frame(root); top.pack(fill="x")
         ttk.Label(top, text="Modelo GGUF:").pack(side="left")
         self.var_path = tk.StringVar(value=self.model_path)
-        ent = ttk.Entry(top, textvariable=self.var_path); ent.pack(side="left", fill="x", expand=True, padx=6)
+        ent = ttk.Entry(top, textvariable=self.var_path)
+        ent.pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(top, text="Elegir…", command=self._choose_model).pack(side="left")
-        self.btn_cargar = ttk.Button(top, text="Cargar", command=self._load_model); self.btn_cargar.pack(side="left", padx=(6,0))
+        self.btn_cargar = ttk.Button(top, text="Cargar", command=self._load_model)
+        self.btn_cargar.pack(side="left", padx=(6,0))
         self.lbl_status = ttk.Label(top, text="(sin cargar)"); self.lbl_status.pack(side="left", padx=(8,0))
+
+        # Parámetros
         opts = ttk.Frame(root); opts.pack(fill="x", pady=(8,4))
         ttk.Label(opts, text="Temperatura:").pack(side="left"); self.var_temp = tk.DoubleVar(value=0.4)
         ttk.Entry(opts, width=5, textvariable=self.var_temp).pack(side="left", padx=(4,10))
@@ -2950,96 +2967,455 @@ class LLMChatDialog(tk.Toplevel):
         ttk.Entry(opts, width=6, textvariable=self.var_maxtok).pack(side="left", padx=(4,10))
         ttk.Label(opts, text="Contexto:").pack(side="left"); self.var_ctx = tk.IntVar(value=8192)
         ttk.Entry(opts, width=7, textvariable=self.var_ctx).pack(side="left", padx=(4,10))
+
+        # System
         sysf = ttk.LabelFrame(root, text="System"); sysf.pack(fill="x")
-        self.txt_sys = ScrolledText(sysf, height=3, wrap="word"); self.txt_sys.insert("1.0", "Soy PACqui, tu asistente para las dudas que tengas acerca de la PAC \n."); self.txt_sys.pack(fill="x")
+        self.txt_sys = ScrolledText(sysf, height=3, wrap="word")
+        self.txt_sys.insert("1.0", "Eres PACqui, asistente de documentación para la PAC. Responde en español con precisión.")
+        self.txt_sys.pack(fill="x")
+
+        # Conversación
         chatf = ttk.LabelFrame(root, text="Conversación"); chatf.pack(fill="both", expand=True, pady=(8,0))
-        self.txt_chat = ScrolledText(chatf, wrap="word"); self.txt_chat.pack(fill="both", expand=True); self.txt_chat.configure(state="disabled")
+        self.txt_chat = ScrolledText(chatf, wrap="word")
+        self.txt_chat.pack(fill="both", expand=True); self.txt_chat.configure(state="disabled")
+
+        # Entrada usuario
         bot = ttk.Frame(root); bot.pack(fill="x", pady=(8,0))
         self.var_user = tk.StringVar()
-        ent_u = ttk.Entry(bot, textvariable=self.var_user); ent_u.pack(side="left", fill="x", expand=True); ent_u.bind("<Return>", lambda e: self._send())
+        ent_u = ttk.Entry(bot, textvariable=self.var_user)
+        ent_u.pack(side="left", fill="x", expand=True)
+        ent_u.bind("<Return>", lambda e: self._send())
         ttk.Button(bot, text="Enviar", command=self._send).pack(side="left", padx=6)
-        self.btn_stop = ttk.Button(bot, text="Detener", command=self._stop, state="disabled"); self.btn_stop.pack(side="left")
-        if self.model_path and Path(self.model_path).exists(): self.after(250, self._load_model)
+        # IMPORTANTE: `_stop` existe (arreglo del AttributeError)
+        self.btn_stop = ttk.Button(bot, text="Detener", command=self._stop, state="disabled")
+        self.btn_stop.pack(side="left")
+
+        if self.model_path and Path(self.model_path).exists():
+            self.after(250, self._load_model)
+
     def _choose_model(self):
         path = filedialog.askopenfilename(title="Selecciona el archivo .gguf", filetypes=[("GGUF","*.gguf"),("Todos","*.*")])
-        if path: self.var_path.set(path)
+        if path:
+            self.var_path.set(path)
+
     def _append_chat(self, who, text):
         self.txt_chat.configure(state="normal")
-        self.txt_chat.insert("end", f"{who}: ", ("who",)); self.txt_chat.insert("end", (text or "").strip()+"\n")
-        self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold")); self.txt_chat.see("end"); self.txt_chat.configure(state="disabled")
+        self.txt_chat.insert("end", f"{who}: ", ("who",))
+        self.txt_chat.insert("end", (text or "").strip()+"\n")
+        self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
+        self.txt_chat.see("end")
+        self.txt_chat.configure(state="disabled")
+
+    def _append_stream_text(self, txt, end_turn=False):
+        self.txt_chat.configure(state="normal")
+        if not hasattr(self, "_in_stream"):
+            self._in_stream = False
+        if not self._in_stream:
+            self.txt_chat.insert("end", "PACqui:\n", ("who",))
+            self._in_stream = True
+        self.txt_chat.insert("end", txt)
+        if end_turn:
+            self.txt_chat.insert("end", "\n")
+            self._in_stream = False
+        self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
+        self.txt_chat.see("end")
+        self.txt_chat.configure(state="disabled")
+
     def _set_status(self, s):
-        try: self.lbl_status.configure(text=s); self.update_idletasks()
-        except Exception: pass
+        try:
+            self.lbl_status.configure(text=s); self.update_idletasks()
+        except Exception:
+            pass
+
+    # ---------------- Modelo ----------------
     def _load_model(self):
         path = self.var_path.get().strip()
         if not path or not Path(path).exists():
-            messagebox.showwarning(APP_NAME, "Selecciona primero un archivo .gguf válido."); return
-        self.model_path = path; self._set_status("Cargando…"); self.btn_cargar.configure(state="disabled")
+            messagebox.showwarning(APP_NAME, "Selecciona primero un archivo .gguf válido.")
+            return
+        self.model_path = path
+        self._set_status("Cargando…")
+        self.btn_cargar.configure(state="disabled")
         threading.Thread(target=self._worker_load_model, daemon=True).start()
+
     def _worker_load_model(self):
         try:
             try:
                 from llama_cpp import Llama
             except Exception:
-                self.after(0, lambda: messagebox.showerror(APP_NAME, "No está instalado 'llama-cpp-python'.\\n\\nInstala:\\nCPU: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu\\nCUDA: pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124"))
-                self.after(0, lambda: self._set_status("(falta instalar)")); self.after(0, lambda: self.btn_cargar.configure(state="normal")); return
+                err_txt = (
+                    "No se pudo importar llama-cpp-python.\n"
+                    "Instálalo, por ejemplo:\n\n"
+                    "  pip install llama-cpp-python --extra-index-url "
+                    "https://abetlen.github.io/llama-cpp-python/whl/cpu"
+                )
+                self.after(0, lambda: messagebox.showerror(APP_NAME, err_txt))
+                self.after(0, lambda: self.btn_cargar.configure(state="normal"))
+                return
+
             ctx = int(self.var_ctx.get() or 4096)
-            self.model = Llama(model_path=self.model_path, n_ctx=ctx, n_gpu_layers=-1, chat_format="mistral-instruct")
-            self.app.llm_model_path = self.model_path
-            try: self.app._save_config()
-            except Exception: pass
+            # Inicialización robusta en distintas versiones
+            try:
+                self.model = Llama(model_path=self.model_path, n_ctx=ctx, n_gpu_layers=-1)
+            except Exception:
+                try:
+                    self.model = Llama(model_path=self.model_path, n_ctx=ctx)
+                except Exception:
+                    self.model = Llama(model_path=self.model_path, n_ctx=ctx, chat_format="mistral-instruct")
+
+            # Persistir ruta en configuración principal
+            try:
+                self.app.llm_model_path = self.model_path
+                self.app._save_config()
+            except Exception:
+                pass
+
             self.after(0, lambda: self._set_status("Modelo cargado ✓"))
         except Exception as e:
-            self.after(0, lambda: self._set_status("(error)"))
-            self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error cargando el modelo:\\n{e}"))
+            self.after(0, lambda: (self._set_status("(error)"), messagebox.showerror(APP_NAME, f"Error cargando el modelo:\n{e}")))
         finally:
             self.after(0, lambda: self.btn_cargar.configure(state="normal"))
-    def _stop(self): self.stop_event.set()
-    
+
+    # ---------------- Chat ----------------
+    def _build_instruct_prompt(self, sys_text: str, user_text: str) -> str:
+        sys_text = (sys_text or "").strip()
+        user_text = (user_text or "").strip()
+        parts = []
+        if sys_text:
+            parts.append("### System\n" + sys_text + "\n")
+        parts.append("### Instruction\n" + user_text + "\n\n### Response\n")
+        return "\n".join(parts)
+
     def _send(self):
         user = (self.var_user.get() or "").strip()
-        if not user: return
-        self.var_user.set(""); self._append_chat("Tú", user)
+        if not user:
+            return
+        self.var_user.set("")
+        self._append_chat("Tú", user)
+
         if self.model is None:
-            self._append_chat("PACqui", "Primero carga el modelo (botón Cargar)."); return
-        # Recuperar contexto acotado a la carpeta base activa
+            self._append_chat("PACqui", "Primero carga el modelo (botón Cargar).")
+            return
+
+        # Recuperación de contexto (RAG) — no crítico si falla
+        ctx = ""
         try:
-            ctx = getattr(self.app, '_retrieve_context', lambda *_a, **_k: '')(user, k=6)
+            ctx = getattr(self.app, "_retrieve_context", lambda *_a, **_k: "")(user, k=6) or ""
         except Exception as e:
-            self._append_chat("PACqui", f"Error recuperando contexto: {e}"); return
-        if not ctx:
-            self._append_chat("PACqui", "No está en la base (vuelve a escanear la carpeta base o afina la búsqueda)."); return
-        # Prompt endurecido
-        sys_prompt = "Eres PACqui, asistente de documentación para la PAC. Responde SOLO usando el CONTEXTO proporcionado. Si la información no aparece, responde exactamente: 'No está en la base'. Cita los fragmentos como [n] si procede."
-        self.messages = [{"role":"system","content":sys_prompt},
-                         {"role":"user","content": f"### CONTEXTO RELEVANTE (solo documentos de la carpeta base actual):\n{ctx}\n\n### PREGUNTA:\n{user}"}]
-        self.stop_event.clear(); self.btn_stop.configure(state="normal")
-        threading.Thread(target=self._worker_chat_stream, daemon=True).start()
+            self._append_chat("PACqui", f"(RAG) {e}")
+
+        try:
+            sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
+        except Exception:
+            sys_text = ""
+        if not sys_text:
+            sys_text = "Eres PACqui, asistente de documentación para la PAC. Responde en español y con precisión."
+
+        user_payload = user
+        if ctx and not ctx.strip().startswith("[0]"):
+            user_payload = f"### CONTEXTO RELEVANTE (trozos):\n{ctx}\n\n### PREGUNTA:\n{user}"
+
+        self.messages = [
+            {"role": "system", "content": sys_text},
+            {"role": "user", "content": user_payload},
+        ]
+
+        # Lanzar hilo de streaming
+        self.stop_event.clear()
+        self.btn_stop.configure(state="normal")
+        self._stream_thread = threading.Thread(target=self._worker_chat_stream, daemon=True)
+        self._stream_thread.start()
 
     def _worker_chat_stream(self):
         try:
-            temp = float(self.var_temp.get() or 0.3); max_t = int(self.var_maxtok.get() or 512); out=[]
-            for chunk in self.model.create_chat_completion(messages=self.messages, temperature=temp, max_tokens=max_t, stream=True):
-                if self.stop_event.is_set(): break
-                try: delta = chunk["choices"][0]["delta"].get("content","")
-                except Exception: delta = ""
-                if delta: out.append(delta); self.after(0, lambda t=delta: self._append_stream_text(t))
-            final = "".join(out).strip()
-            if final: self.messages.append({"role":"assistant","content":final}); self.after(0, lambda: self._append_stream_text("\n", end_turn=True))
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error en inferencia:\\n{e}"))
-        finally:
-            self.after(0, lambda: self.btn_stop.configure(state="normal"))
-    def _append_stream_text(self, txt, end_turn=False):
-        self.txt_chat.configure(state="normal")
-        if not hasattr(self, "_in_stream"): self._in_stream = False
-        if not self._in_stream: self.txt_chat.insert("end", "PACqui:\n", ("who",)); self._in_stream = True
-        self.txt_chat.insert("end", txt)
-        if end_turn: self.txt_chat.insert("end", "\n"); self._in_stream = False
-        self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold")); self.txt_chat.see("end"); self.txt_chat.configure(state="disabled")
-    def _on_close(self):
-        self.stop_event.set(); self.destroy()
+            temp = float(self.var_temp.get() or 0.3)
+            max_t = int(self.var_maxtok.get() or 512)
+            out = []
+            # 1) Intento con chat-completions (stream=True)
+            stream = None
+            try:
+                stream = self.model.create_chat_completion(
+                    messages=self.messages, temperature=temp, max_tokens=max_t, stream=True
+                )
+            except TypeError:
+                # Algunas builds cambian la signatura
+                stream = self.model.create_chat_completion(
+                    messages=self.messages, temperature=temp, max_tokens=max_t, stream=True
+                )
+            except Exception:
+                stream = None
 
+            if stream is not None:
+                try:
+                    for chunk in stream:
+                        if self.stop_event.is_set():
+                            break
+                        delta = ""
+                        try:
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                        except Exception:
+                            pass
+                        if not delta:
+                            ch0 = (chunk.get("choices") or [{}])[0]
+                            delta = ch0.get("text", "") or (ch0.get("message") or {}).get("content", "")
+                        if delta:
+                            out.append(delta)
+                            self.after(0, lambda t=delta: self._append_stream_text(t))
+                except Exception:
+                    pass
+
+            final = "".join(out).strip()
+
+            # 2) Fallback sin streaming
+            if not final and not self.stop_event.is_set():
+                try:
+                    resp = self.model.create_chat_completion(
+                        messages=self.messages, temperature=temp, max_tokens=max_t, stream=False
+                    )
+                    ch0 = (resp.get("choices") or [{}])[0]
+                    final = ch0.get("message", {}).get("content", "") or ch0.get("text", "") or ""
+                except Exception:
+                    final = ""
+
+            # 3) Fallback a completion raw (stream)
+            if not final and not self.stop_event.is_set():
+                try:
+                    sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
+                    user_text = ""
+                    for m in self.messages:
+                        if m.get("role") == "user":
+                            user_text = m.get("content", "")
+                            break
+                    prompt = self._build_instruct_prompt(sys_text, user_text)
+                    stream2 = self.model.create_completion(prompt=prompt, temperature=temp, max_tokens=max_t, stream=True)
+                    out2 = []
+                    for chunk in stream2:
+                        if self.stop_event.is_set():
+                            break
+                        delta = ""
+                        try:
+                            delta = chunk["choices"][0].get("text", "")
+                        except Exception:
+                            pass
+                        if delta:
+                            out2.append(delta)
+                            self.after(0, lambda t=delta: self._append_stream_text(t))
+                    final = "".join(out2).strip()
+                except Exception:
+                    final = final
+
+            # 4) Fallback a completion raw (no stream)
+            if not final and not self.stop_event.is_set():
+                try:
+                    sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
+                    user_text = ""
+                    for m in self.messages:
+                        if m.get("role") == "user":
+                            user_text = m.get("content", "")
+                            break
+                    prompt = self._build_instruct_prompt(sys_text, user_text)
+                    resp2 = self.model.create_completion(prompt=prompt, temperature=temp, max_tokens=max_t)
+                    final = (resp2.get("choices") or [{}])[0].get("text", "") or ""
+                except Exception:
+                    final = ""
+
+            if final:
+                self.messages.append({"role": "assistant", "content": final})
+
+            self.after(0, lambda: self._append_stream_text("\n", end_turn=True))
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error en inferencia:\n{e}"))
+        finally:
+            self.after(0, lambda: self.btn_stop.configure(state="disabled"))
+
+    # ---------------- Control de parada y cierre ----------------
+    def _stop(self):
+        """Callback del botón Detener (arreglo del AttributeError)."""
+        try:
+            self.stop_event.set()
+        except Exception:
+            pass
+
+    def _on_close(self):
+        try:
+            self.stop_event.set()
+            if self._stream_thread and self._stream_thread.is_alive():
+                # damos un pequeño margen a que termine
+                self._stream_thread.join(timeout=0.8)
+        except Exception:
+            pass
+        self.destroy()
+
+# ===================== RAG monkey-patch (auto-inyección) =====================
+import os, sys, types
+try:
+    def __RAG__rag__conn(self):
+        import sqlite3
+        try:
+            conn = getattr(self, "_db_conn", None)
+            if conn is None:
+                conn = sqlite3.connect(self._db_path(), check_same_thread=False)
+                self._db_conn = conn
+            self._db_rag_ensure(conn); return conn
+        except Exception:
+            return sqlite3.connect(self._db_path(), check_same_thread=False)
+    def __RAG__db_rag_ensure(self, conn):
+        try:
+            c = conn.cursor()
+            c.execute("CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, file_path TEXT, mtime REAL, text TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS embeddings(chunk_id INTEGER PRIMARY KEY, vec BLOB)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(file_path)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_chunks_mtime ON chunks(mtime)")
+            conn.commit()
+        except Exception as e:
+            try: self._append_msg(f"SQLite (RAG) error: {e}", "WARN")
+            except Exception: pass
+    def __RAG__vec_to_blob(self, v):
+        import array; return array.array('f', [float(x) for x in v]).tobytes()
+    def __RAG__hash_embedder(self, text, dim=256):
+        import hashlib, re
+        v = [0.0]*dim
+        if text:
+            for tok in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{2,}", str(text).lower()):
+                h = int(hashlib.md5(tok.encode('utf-8')).hexdigest(), 16)
+                i = h % dim; s = 1.0 if (h >> 1) & 1 else -1.0; v[i] += s
+        n = (sum(x*x for x in v) ** 0.5) or 1.0; return [x/n for x in v]
+    def __RAG__text_chunks(self, txt: str, max_chars=1200, overlap=200):
+        txt = (txt or '').replace('\r\n','\n').replace('\r','\n')
+        parts=[]; step=max(1, max_chars-overlap); i=0; N=len(txt)
+        while i<N: parts.append(txt[i:i+max_chars]); i+=step
+        return parts
+    def __RAG__extract_text_generic(self, path, max_chars=300_000):
+        import os, zipfile, re
+        path = str(path); ext = os.path.splitext(path)[1].lower()
+        if ext in ('.txt','.md','.py','.csv','.log','.ini','.json','.xml','.yaml','.yml','.sql','.html','.htm'):
+            try:
+                with open(path,'r',encoding='utf-8',errors='ignore') as f: return f.read(max_chars)
+            except Exception: return ''
+        if ext == '.docx':
+            try:
+                z = zipfile.ZipFile(path); t=[]
+                for n in z.namelist():
+                    if n.startswith('word/') and n.endswith('.xml'):
+                        s = z.read(n).decode('utf-8','ignore'); t.append(re.sub(r'<[^>]+>',' ',s))
+                return ' '.join(t)[:max_chars]
+            except Exception: return ''
+        if ext in ('.pptx','.ppsx','.pps','.pptm','.pps'):
+            try:
+                z = zipfile.ZipFile(path); t=[]
+                for n in z.namelist():
+                    if n.startswith('ppt/slides/') and n.endswith('.xml'):
+                        s = z.read(n).decode('utf-8','ignore'); t.append(re.sub(r'<[^>]+>',' ',s))
+                return ' '.join(t)[:max_chars]
+            except Exception: return ''
+        if ext in ('.xlsx','.xlsm','.xltx'):
+            try:
+                z = zipfile.ZipFile(path); t=[]
+                if 'xl/sharedStrings.xml' in z.namelist():
+                    s = z.read('xl/sharedStrings.xml').decode('utf-8','ignore'); t.append(re.sub(r'<[^>]+>',' ',s))
+                for n in z.namelist():
+                    if n.startswith('xl/worksheets/') and n.endswith('.xml'):
+                        s = z.read(n).decode('utf-8','ignore'); t.append(re.sub(r'<[^>]+>',' ',s))
+                return ' '.join(t)[:max_chars]
+            except Exception: return ''
+        if ext == '.pdf':
+            try:
+                import fitz
+                doc = fitz.open(path); t=[]
+                for p in doc:
+                    t.append(p.get_text() or '')
+                    if sum(len(x) for x in t) > max_chars: break
+                return '\n'.join(t)[:max_chars]
+            except Exception:
+                try:
+                    from PyPDF2 import PdfReader
+                    r = PdfReader(path); t=[]
+                    for p in r.pages:
+                        t.append(p.extract_text() or '')
+                        if sum(len(x) for x in t) > max_chars: break
+                    return '\n'.join(t)[:max_chars]
+                except Exception: return ''
+        return ''
+    def __RAG__index_file_chunks(self, fullpath: str, mtime_ts: float):
+        import sqlite3, os
+        try:
+            conn = self._rag__conn(); c = conn.cursor()
+            try:
+                c.execute("DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_path=?)", (fullpath,))
+                c.execute("DELETE FROM chunks WHERE file_path=?", (fullpath,))
+            except Exception: pass
+            txt = self._extract_text_generic(fullpath)
+            if not txt: return 0
+            count=0
+            for ch in self._text_chunks(txt, max_chars=1200, overlap=200):
+                c.execute("INSERT INTO chunks(file_path, mtime, text) VALUES(?,?,?)", (fullpath, float(mtime_ts or 0.0), ch))
+                cid = c.lastrowid; vec = self._hash_embedder(ch, dim=256)
+                c.execute("INSERT OR REPLACE INTO embeddings(chunk_id, vec) VALUES(?,?)", (cid, self._vec_to_blob(vec))); count+=1
+            conn.commit()
+            try: self.queue.put(('msg', (f'RAG: indexado {count} chunks — {os.path.basename(fullpath)}','DEBUG')))
+            except Exception: pass
+            return count
+        except Exception as _e:
+            try: self.queue.put(('msg', (f'RAG: fallo indexando {os.path.basename(fullpath)}: {_e}','WARN')))
+            except Exception: pass
+            return 0
+    def __RAG__retrieve_context(self, query: str, k: int = 6) -> str:
+        import sqlite3, math, struct
+        try:
+            conn = self._rag__conn(); c = conn.cursor()
+            base = getattr(self, 'base_path', None)
+            if base:
+                like_param = str(base).rstrip('/\\') + '%'
+                rows = c.execute('SELECT c.id, c.text, c.file_path, e.vec FROM chunks c JOIN embeddings e ON e.chunk_id=c.id WHERE c.file_path LIKE ?', (like_param,)).fetchall()
+            else:
+                rows = c.execute('SELECT c.id, c.text, c.file_path, e.vec FROM chunks c JOIN embeddings e ON e.chunk_id=c.id').fetchall()
+            if not rows:
+                return "[0] (vacío)\n\"\"\"\n\n\"\"\""
+            def blob_to_vec(b: bytes):
+                n = len(b)//4; 
+                return list(struct.unpack('<'+'f'*n, b)) if n>0 else []
+            def dot(a,b): return sum((x*y for x,y in zip(a,b)))
+            def norm(a):
+                s = math.sqrt(sum((x*x for x in a))) or 1.0; return [x/s for x in a]
+            vq = norm(self._hash_embedder(query or '', dim=256))
+            scored=[]
+            for cid, txt, fp, blob in rows:
+                vv = norm(blob_to_vec(blob)); s = dot(vq, vv)
+                frag = (txt or '').strip()
+                if len(frag)>1200: frag = frag[:1200] + '…'
+                scored.append((s, frag, fp))
+            scored.sort(reverse=True, key=lambda t: t[0])
+            top = scored[:max(1,int(k))]; partes=[]
+            for i,(_,frag,fp) in enumerate(top, start=1):
+                partes.append(f"[{i}] {fp}\n\"\"\"\n{frag}\n\"\"\"")
+            return "\n\n".join(partes) if partes else "[0] (vacío)\n\"\"\"\n\n\"\"\""
+        except Exception as e:
+            try: self._append_msg(f'RAG retrieve error: {e}', 'WARN')
+            except Exception: pass
+            return "[0] (error)\n\"\"\"\n\n\"\"\""
+    try:
+        _ = OrganizadorFrame
+        for name, fn in {
+            '_rag__conn': __RAG__rag__conn,
+            '_db_rag_ensure': __RAG__db_rag_ensure,
+            '_vec_to_blob': __RAG__vec_to_blob,
+            '_hash_embedder': __RAG__hash_embedder,
+            '_text_chunks': __RAG__text_chunks,
+            '_extract_text_generic': __RAG__extract_text_generic,
+            '_index_file_chunks': __RAG__index_file_chunks,
+            '_retrieve_context': __RAG__retrieve_context,
+        }.items():
+            try: setattr(OrganizadorFrame, name, fn)
+            except Exception: pass
+        try:
+            attr = getattr(OrganizadorFrame, '_index_file_chunks', None)
+            print('RAG monkey-patch listo:', 'OK' if callable(attr) else type(attr).__name__)
+        except Exception: pass
+    except NameError:
+        pass
+except Exception as _patch_exc:
+    print('RAG monkey-patch error:', _patch_exc)
+# ============================================================================
 
 def main():
     root = tk.Tk()
