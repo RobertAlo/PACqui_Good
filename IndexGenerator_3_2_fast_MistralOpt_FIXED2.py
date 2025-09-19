@@ -49,7 +49,7 @@ import xml.etree.ElementTree as ET
 
 
 APP_NAME = "IndexGenerator"
-APP_VERSION = "3.2-fast"
+APP_VERSION = "3.2-fast+llmopt"
 CONFIG_PATH = Path.home() / ".organizador_red.json"
 
 
@@ -2965,7 +2965,7 @@ class LLMChatDialog(tk.Toplevel):
         ttk.Entry(opts, width=5, textvariable=self.var_temp).pack(side="left", padx=(4,10))
         ttk.Label(opts, text="Máx. tokens:").pack(side="left"); self.var_maxtok = tk.IntVar(value=512)
         ttk.Entry(opts, width=6, textvariable=self.var_maxtok).pack(side="left", padx=(4,10))
-        ttk.Label(opts, text="Contexto:").pack(side="left"); self.var_ctx = tk.IntVar(value=8192)
+        ttk.Label(opts, text="Contexto:").pack(side="left"); self.var_ctx = tk.IntVar(value=2048)
         ttk.Entry(opts, width=7, textvariable=self.var_ctx).pack(side="left", padx=(4,10))
 
         # System
@@ -3021,6 +3021,42 @@ class LLMChatDialog(tk.Toplevel):
         self.txt_chat.see("end")
         self.txt_chat.configure(state="disabled")
 
+    def _build_instruct_prompt(self, system_text: str, user_text: str) -> str:
+        system_text = (system_text or "").strip()
+        user_text = (user_text or "").strip()
+        if system_text:
+            return f"<s>[INST] {system_text}\n{user_text} [/INST]"
+        return f"<s>[INST] {user_text} [/INST]"
+
+    def _send(self):
+        try:
+            text = (self.var_user.get() or "").strip()
+            if not text:
+                return
+            if not self.model:
+                messagebox.showwarning(APP_NAME, "Carga primero un modelo GGUF.")
+                return
+
+            # Añadir system si es el primer turno
+            if not any(m.get("role") == "system" for m in self.messages):
+                sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
+                if sys_text:
+                    self.messages.append({"role": "system", "content": sys_text})
+
+            # Añadir turno de usuario
+            self.messages.append({"role": "user", "content": text})
+            self._append_chat("Tú", text)
+            self.var_user.set("")
+
+            # Lanzar hilo de inferencia en streaming
+            self._set_status("Generando…")
+            self.stop_event.clear()
+            self.btn_stop.configure(state="normal")
+            self._stream_thread = threading.Thread(target=self._worker_chat_stream, daemon=True)
+            self._stream_thread.start()
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Error al enviar:\n{e}")
+
     def _set_status(self, s):
         try:
             self.lbl_status.configure(text=s); self.update_idletasks()
@@ -3039,6 +3075,7 @@ class LLMChatDialog(tk.Toplevel):
         threading.Thread(target=self._worker_load_model, daemon=True).start()
 
     def _worker_load_model(self):
+        import os
         try:
             try:
                 from llama_cpp import Llama
@@ -3053,95 +3090,65 @@ class LLMChatDialog(tk.Toplevel):
                 self.after(0, lambda: self.btn_cargar.configure(state="normal"))
                 return
 
-            ctx = int(self.var_ctx.get() or 4096)
-            # Inicialización robusta en distintas versiones
-            try:
-                self.model = Llama(model_path=self.model_path, n_ctx=ctx, n_gpu_layers=-1)
-            except Exception:
-                try:
-                    self.model = Llama(model_path=self.model_path, n_ctx=ctx)
-                except Exception:
-                    self.model = Llama(model_path=self.model_path, n_ctx=ctx, chat_format="mistral-instruct")
+            ctx = int(self.var_ctx.get() or 2048)
 
-            # Persistir ruta en configuración principal
+            # Heurística CPU: hilos y batch conservadores para 16 GB RAM
+            cpu = os.cpu_count() or 4
+            threads = max(2, cpu - 1)
+            n_batch = 256
+
+            base_args = dict(
+                model_path=self.model_path,
+                n_ctx=ctx,
+                n_threads=threads,
+                n_batch=n_batch,
+                n_gpu_layers=0,              # CPU only
+                chat_format="mistral-instruct",
+                f16_kv=True,                 # reduce KV-cache a la mitad
+                use_mmap=True,               # arranque y RSS más ligeros
+                vocab_only=False,
+            )
+
+            try:
+                self.model = Llama(**base_args)
+            except TypeError:
+                # Fallback para ruedas antiguas (sin f16_kv/use_mmap/chat_format)
+                fallback_args = dict(base_args)
+                for k in ("use_mmap", "f16_kv", "chat_format"):
+                    fallback_args.pop(k, None)
+                self.model = Llama(**fallback_args)
+
+            # Guardar ruta en la app
             try:
                 self.app.llm_model_path = self.model_path
                 self.app._save_config()
             except Exception:
                 pass
 
-            self.after(0, lambda: self._set_status("Modelo cargado ✓"))
+            self.after(0, lambda: self._set_status(f"Modelo cargado ✓  (ctx={ctx}, th={threads}, batch={n_batch})"))
         except Exception as e:
-            self.after(0, lambda: (self._set_status("(error)"), messagebox.showerror(APP_NAME, f"Error cargando el modelo:\n{e}")))
+            self.after(0, lambda: (self._set_status("(error)"),
+                                   messagebox.showerror(APP_NAME, f"Error cargando el modelo:\n{e}")))
         finally:
             self.after(0, lambda: self.btn_cargar.configure(state="normal"))
-
-    # ---------------- Chat ----------------
-    def _build_instruct_prompt(self, sys_text: str, user_text: str) -> str:
-        sys_text = (sys_text or "").strip()
-        user_text = (user_text or "").strip()
-        parts = []
-        if sys_text:
-            parts.append("### System\n" + sys_text + "\n")
-        parts.append("### Instruction\n" + user_text + "\n\n### Response\n")
-        return "\n".join(parts)
-
-    def _send(self):
-        user = (self.var_user.get() or "").strip()
-        if not user:
-            return
-        self.var_user.set("")
-        self._append_chat("Tú", user)
-
-        if self.model is None:
-            self._append_chat("PACqui", "Primero carga el modelo (botón Cargar).")
-            return
-
-        # Recuperación de contexto (RAG) — no crítico si falla
-        ctx = ""
-        try:
-            ctx = getattr(self.app, "_retrieve_context", lambda *_a, **_k: "")(user, k=6) or ""
-        except Exception as e:
-            self._append_chat("PACqui", f"(RAG) {e}")
-
-        try:
-            sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
-        except Exception:
-            sys_text = ""
-        if not sys_text:
-            sys_text = "Soy PACqui, asistente de documentación para la PAC. Encantada de saludarte."
-
-        user_payload = user
-        if ctx and not ctx.strip().startswith("[0]"):
-            user_payload = f"### CONTEXTO RELEVANTE (trozos):\n{ctx}\n\n### PREGUNTA:\n{user}"
-
-        self.messages = [
-            {"role": "system", "content": sys_text},
-            {"role": "user", "content": user_payload},
-        ]
-
-        # Lanzar hilo de streaming
-        self.stop_event.clear()
-        self.btn_stop.configure(state="normal")
-        self._stream_thread = threading.Thread(target=self._worker_chat_stream, daemon=True)
-        self._stream_thread.start()
 
     def _worker_chat_stream(self):
         try:
             temp = float(self.var_temp.get() or 0.3)
             max_t = int(self.var_maxtok.get() or 512)
             out = []
-            # 1) Intento con chat-completions (stream=True)
+
+            # 1) Intento con chat-completions (stream=True) + cache_prompt si está disponible
             stream = None
             try:
-                stream = self.model.create_chat_completion(
-                    messages=self.messages, temperature=temp, max_tokens=max_t, stream=True
-                )
-            except TypeError:
-                # Algunas builds cambian la signatura
-                stream = self.model.create_chat_completion(
-                    messages=self.messages, temperature=temp, max_tokens=max_t, stream=True
-                )
+                try:
+                    stream = self.model.create_chat_completion(
+                        messages=self.messages, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
+                    )
+                except TypeError:
+                    stream = self.model.create_chat_completion(
+                        messages=self.messages, temperature=temp, max_tokens=max_t, stream=True
+                    )
             except Exception:
                 stream = None
 
@@ -3166,12 +3173,17 @@ class LLMChatDialog(tk.Toplevel):
 
             final = "".join(out).strip()
 
-            # 2) Fallback sin streaming
+            # 2) Fallback sin streaming (chat-completion)
             if not final and not self.stop_event.is_set():
                 try:
-                    resp = self.model.create_chat_completion(
-                        messages=self.messages, temperature=temp, max_tokens=max_t, stream=False
-                    )
+                    try:
+                        resp = self.model.create_chat_completion(
+                            messages=self.messages, temperature=temp, max_tokens=max_t, stream=False, cache_prompt=True
+                        )
+                    except TypeError:
+                        resp = self.model.create_chat_completion(
+                            messages=self.messages, temperature=temp, max_tokens=max_t, stream=False
+                        )
                     ch0 = (resp.get("choices") or [{}])[0]
                     final = ch0.get("message", {}).get("content", "") or ch0.get("text", "") or ""
                 except Exception:
@@ -3202,7 +3214,7 @@ class LLMChatDialog(tk.Toplevel):
                             self.after(0, lambda t=delta: self._append_stream_text(t))
                     final = "".join(out2).strip()
                 except Exception:
-                    final = final
+                    pass
 
             # 4) Fallback a completion raw (no stream)
             if not final and not self.stop_event.is_set():
@@ -3228,7 +3240,6 @@ class LLMChatDialog(tk.Toplevel):
         finally:
             self.after(0, lambda: self.btn_stop.configure(state="disabled"))
 
-    # ---------------- Control de parada y cierre ----------------
     def _stop(self):
         """Callback del botón Detener (arreglo del AttributeError)."""
         try:
