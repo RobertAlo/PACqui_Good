@@ -46,6 +46,8 @@ import collections
 import math
 import zipfile
 import xml.etree.ElementTree as ET
+from massive_indexer import export_massive_index
+
 
 
 APP_NAME = "IndexGenerator"
@@ -1389,12 +1391,46 @@ class OrganizadorFrame(ttk.Frame):
         m.add_command(label='Exportar Excel (visibles, rápido)', command=self.cmd_exportar_excel_rapido_visibles)
         m.add_command(label='Exportar Excel (todo, rápido 150k+)', command=self.cmd_exportar_excel_rapido)
         m.add_separator()
+        m.add_command(
+            label='Exportar (motor masivo directo)',
+            command=self._exportar_masivo_directo
+        )
         m.add_command(label='Exportar Excel (visibles, clásico)', command=lambda: self.cmd_exportar_excel(False))
         m.add_command(label='Exportar Excel (todo, clásico)', command=lambda: self.cmd_exportar_excel(True))
         self._export_menu = m
+    def _exportar_masivo_directo(self):
+        from tkinter import filedialog, messagebox
+        try:
+            base = self.base_path or Path(
+                filedialog.askdirectory(title="Selecciona la CARPETA BASE (hipermasiva)")
+            )
+            if not base:
+                return
+            # Preguntamos por salida (permite auto-escritorio si se deja vacío)
+            out = filedialog.asksaveasfilename(
+                title="Guardar índice (XLSX/CSV)",
+                defaultextension=".xlsx",
+                filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
+            ) or None
+
+            self._append_msg("Exportación masiva iniciada…", "INFO")
+
+            def _work():
+                try:
+                    from massive_indexer import export_massive_index
+                    path = export_massive_index(str(base), out_path=out, prefer_xlsx=True)
+                    self.queue.put(("msg", (f"Exportación masiva completada → {path}", "OK")))
+                except Exception as e:
+                    self.queue.put(("msg", (f"ERROR exportando (masivo): {e}", "ERR")))
+
+            import threading
+            threading.Thread(target=_work, daemon=True).start()
+        except Exception as e:
+            messagebox.showerror("Exportar (masivo)", str(e))
+
     def _task_open(self, title: str, total: int):
         try:
-            self._task_win.destroy()
+             self._task_win.destroy()
         except Exception:
             pass
         self._task_total = max(1, int(total))
