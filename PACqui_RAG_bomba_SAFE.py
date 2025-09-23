@@ -1,7 +1,7 @@
 # __build__: IndexGenerator_PRO_v2_FIXED3 (2025-09-17)
 # -*- coding: utf-8 -*-
 r"""
-IndexGenerator – v3.2 (Scraper de palabras clave)
+IndexGenerator – v1.1.5 (Scraper de palabras clave)
 Novedades/Arreglos clave en esta revisión:
 - FIX: Método faltante `_load_config` causaba AttributeError en `__init__` → ahora está presente y probado.
 - FIX: Helpers SQLite (_db_*) ahora son métodos de la clase.
