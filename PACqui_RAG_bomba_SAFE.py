@@ -1,8 +1,7 @@
 # __build__: IndexGenerator_PRO_v2_FIXED3 (2025-09-17)
 # -*- coding: utf-8 -*-
 r"""
-IndexGenerator (PACqui)– v1.1.5 (Procesa carpetas hipermasivas pero no exporta excel)
-Novedades/Arreglos clave en esta revisión:
+IndexGenerator (PACqui)– v1.1.6 (Casi perfecto)
 - FIX: Método faltante `_load_config` causaba AttributeError en `__init__` → ahora está presente y probado.
 - FIX: Helpers SQLite (_db_*) ahora son métodos de la clase.
 - FIX: Búsqueda SQLite devolvía `mod` pero la UI esperaba `mod_str` → unificado a `mod_str`.
@@ -882,6 +881,27 @@ class OrganizadorFrame(ttk.Frame):
                 elif kind == "task_indet":
                     (msg,) = payload
                     self._task_set_indeterminate(msg)
+                elif kind == "task_total":
+                    # cambiamos a determinista con el máximo real
+                    try:
+                        self._task_total = max(1, int(payload))
+                        self._task_pb.configure(mode="determinate", maximum=self._task_total)
+                        self._task_lbl.configure(text=f"0 / {self._task_total}")
+                        self._task_win.update_idletasks()
+                    except Exception:
+                        pass
+
+                elif kind == "task_inc":
+                    try:
+                        self._task_update(step=int(payload))
+                    except Exception:
+                        pass
+
+                elif kind == "task_status":
+                    try:
+                        self._task_update(step=0, status=str(payload))
+                    except Exception:
+                        pass
                 elif kind == "task_close":
                     self._task_close()
         except queue.Empty:
@@ -1398,6 +1418,7 @@ class OrganizadorFrame(ttk.Frame):
         m.add_command(label='Exportar Excel (visibles, clásico)', command=lambda: self.cmd_exportar_excel(False))
         m.add_command(label='Exportar Excel (todo, clásico)', command=lambda: self.cmd_exportar_excel(True))
         self._export_menu = m
+
     def _exportar_masivo_directo(self):
         from tkinter import filedialog, messagebox
         try:
@@ -1406,24 +1427,37 @@ class OrganizadorFrame(ttk.Frame):
             )
             if not base:
                 return
-            # Preguntamos por salida (permite auto-escritorio si se deja vacío)
             out = filedialog.asksaveasfilename(
                 title="Guardar índice (XLSX/CSV)",
                 defaultextension=".xlsx",
                 filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
             ) or None
 
+            # Ventana de progreso (arranca en modo indeterminado)
+            self._task_open("Generando Excel…", total=100)
+            self._task_set_indeterminate("Contando ficheros…")
             self._append_msg("Exportación masiva iniciada…", "INFO")
 
+            import threading
             def _work():
                 try:
                     from massive_indexer import export_massive_index
-                    path = export_massive_index(str(base), out_path=out, prefer_xlsx=True)
+                    def _cb(event, value):
+                        if event == "total":
+                            # Cambiamos a modo determinista con el total real
+                            self.queue.put(("task_total", int(value)))
+                        elif event == "inc":
+                            self.queue.put(("task_inc", int(value)))
+                        elif event == "status":
+                            self.queue.put(("task_status", str(value)))
+
+                    path = export_massive_index(str(base), out_path=out, prefer_xlsx=True, progress_cb=_cb)
                     self.queue.put(("msg", (f"Exportación masiva completada → {path}", "OK")))
                 except Exception as e:
                     self.queue.put(("msg", (f"ERROR exportando (masivo): {e}", "ERR")))
+                finally:
+                    self.queue.put(("task_close", None))
 
-            import threading
             threading.Thread(target=_work, daemon=True).start()
         except Exception as e:
             messagebox.showerror("Exportar (masivo)", str(e))
