@@ -1,0 +1,4 @@
+
+# SQLite caches
+index_cache.sqlite*
+*.sqlite*
