@@ -1,4 +1,3 @@
-# massive_indexer.py
 from __future__ import annotations
 import os, csv, time
 from pathlib import Path
@@ -9,38 +8,26 @@ try:
 except Exception:
     xlsxwriter = None  # fallback a CSV
 
-from path_utils import norm_ext, file_url_windows as _fileurl_windows, rel_from_base  # :contentReference[oaicite:0]{index=0}
+from path_utils import norm_ext, file_url_windows as _fileurl_windows, rel_from_base
 
 Row = Tuple[str, str, int, float, str, str, str]  # (nombre, ext, size, mtime, carpeta, ruta_abs, localizacion)
 
 def _iter_files(base: Path) -> Iterable[Path]:
-    # Iterador no recursivo con scandir (rápido y memoria constante)
-    stack = [base]
-    while stack:
-        d = stack.pop()
-        try:
-            with os.scandir(d) as it:
-                for e in it:
-                    if e.is_dir(follow_symlinks=False):
-                        stack.append(Path(e.path))
-                    elif e.is_file(follow_symlinks=False):
-                        yield Path(e.path)
-        except PermissionError:
-            continue
-
-def _count_files(base: Path) -> int:
-    n = 0
-    for _ in _iter_files(base):
-        n += 1
-    return n
+    for root, dirs, files in os.walk(base):
+        for fn in files:
+            try:
+                yield Path(root) / fn
+            except Exception:
+                continue
 
 def _file_info(p: Path, base: Path) -> Row:
     try:
-        st = p.stat()
-        size = int(st.st_size)
-        mtime = float(st.st_mtime)
+        stat = p.stat()
+        size = int(getattr(stat, "st_size", 0) or 0)
+        mtime = float(getattr(stat, "st_mtime", 0.0) or 0.0)
     except Exception:
-        size, mtime = 0, 0.0
+        size = 0
+        mtime = 0.0
     nombre = p.name
     ext = norm_ext(nombre)
     carpeta = str(p.parent)
@@ -57,77 +44,43 @@ def _default_out_path(base: Path, prefer_xlsx: bool) -> Path:
 def export_massive_index(base_path: str | os.PathLike[str],
                          out_path: Optional[str] = None,
                          prefer_xlsx: bool = True,
-                         progress_cb: Optional[Callable[[str, object], None]] = None) -> str:
+                         meta_provider: Optional[Callable[[str], tuple[str, str]]] = None,
+                         progress_cb: Optional[Callable[[str, str], None]] = None,
+                         tick_every: int = 50) -> str:
     """
-    Recorre la carpeta base y exporta un índice masivo en XLSX (si hay xlsxwriter)
-    o CSV en su defecto. Devuelve la ruta del fichero generado.
+    Exporta un índice masivo a Excel (si hay xlsxwriter y prefer_xlsx=True) o CSV.
+    Añade SIEMPRE dos columnas nuevas al final:
+      - PALABRAS CLAVE
+      - OBSERVACIONES
+    Si se proporciona meta_provider(abs_path) -> (palabras_clave, observaciones),
+    las rellenará; en caso contrario, quedarán en blanco.
 
-    progress_cb(event, value):
-      - ("total", int)   -> número total de ficheros (estimado exacto)
-      - ("inc",   int)   -> incrementar progreso (típicamente 1)
-      - ("status", str)  -> texto de estado opcional
+    tick_every: cada cuántos ficheros se emite el progreso (por defecto 50).
     """
-    base = Path(base_path)
-    if not base.exists() or not base.is_dir():
-        raise ValueError(f"Carpeta base no válida: {base_path!r}")
-
-    out = Path(out_path) if out_path else _default_out_path(base, prefer_xlsx)
-    headers = ["NOMBRE", "EXT", "TAMAÑO", "MODIFICADO", "CARPETA", "RUTA", "LOCALIZACION"]
-
-    # 1) contamos primero para tener barra determinista
-    t0 = time.time()
-    total = _count_files(base)
-    if progress_cb:
-        progress_cb("total", total)
-        progress_cb("status", f"Encontrados {total:,} ficheros. Preparando salida…")
-
-    # 2) escritor segun formato
+    base = Path(base_path).resolve()
+    out = Path(out_path).resolve() if out_path else _default_out_path(base, prefer_xlsx)
     rows_iter = _iter_files(base)
 
-    def _emit_tick(n_done: int):
-        if progress_cb:
-            progress_cb("inc", 1)
-            if n_done % 2000 == 0:
-                elapsed = time.time() - t0
-                speed = (n_done / elapsed) if elapsed > 0 else 0.0
-                progress_cb("status", f"{n_done:,}/{total:,} · {speed:,.0f} filas/seg")
+    tick_every = max(1, int(tick_every or 50))
 
-    if xlsxwriter and prefer_xlsx and str(out).lower().endswith(".xlsx"):
+    def _emit_tick(n: int):
+        if progress_cb and (n % tick_every == 0):
+            progress_cb("progress", str(n))
+
+    headers = ["NOMBRE","EXT","TAMANO","MODIFICADO","CARPETA","RUTA","LOCALIZACION","PALABRAS CLAVE","OBSERVACIONES"]
+
+    if prefer_xlsx and xlsxwriter:
         wb = xlsxwriter.Workbook(str(out), {
             "constant_memory": True,
             "strings_to_numbers": False,
             "strings_to_formulas": False,
         })
-        ws = wb.add_worksheet("Índice")
         bold = wb.add_format({"bold": True})
         date_fmt = wb.add_format({"num_format": "yyyy-mm-dd hh:mm"})
-
+        ws = wb.add_worksheet("Índice")
         for col, h in enumerate(headers):
             ws.write(0, col, h, bold)
         ws.freeze_panes(1, 0)
-
-        row_idx = 1
-        for p in rows_iter:
-            nombre, ext, size, mtime, carpeta, ruta_abs, localizacion = _file_info(p, base)
-            ws.write(row_idx, 0, nombre)
-            ws.write(row_idx, 1, ext)
-            ws.write_number(row_idx, 2, size)
-            if mtime > 0:
-                from datetime import datetime
-                ws.write(row_idx, 3, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"), date_fmt)
-            else:
-                ws.write(row_idx, 3, "")
-            ws.write(row_idx, 4, carpeta)
-            try:
-                ws.write_url(row_idx, 5, _fileurl_windows(ruta_abs), string=ruta_abs)
-            except Exception:
-                ws.write(row_idx, 5, ruta_abs)
-            ws.write(row_idx, 6, localizacion)
-
-            row_idx += 1
-            _emit_tick(row_idx - 1)
-
-        # Anchos razonables
         ws.set_column(0, 0, 46)
         ws.set_column(1, 1, 8)
         ws.set_column(2, 2, 12)
@@ -135,26 +88,68 @@ def export_massive_index(base_path: str | os.PathLike[str],
         ws.set_column(4, 4, 48)
         ws.set_column(5, 5, 72)
         ws.set_column(6, 6, 40)
+        ws.set_column(7, 7, 36)
+        ws.set_column(8, 8, 42)
 
+        from datetime import datetime
+        row_idx = 1
+        for p in rows_iter:
+            nombre, ext, size, mtime, carpeta, ruta_abs, localizacion = _file_info(p, base)
+            mod = ""
+            if mtime > 0:
+                mod = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+
+            if meta_provider:
+                try:
+                    palabras, obs = meta_provider(ruta_abs) or ("","")
+                except Exception:
+                    palabras, obs = "",""
+            else:
+                palabras, obs = "",""
+
+            ws.write(row_idx, 0, nombre)
+            ws.write(row_idx, 1, ext)
+            ws.write_number(row_idx, 2, size)
+            ws.write(row_idx, 3, mod, date_fmt if mod else None)
+            ws.write(row_idx, 4, carpeta)
+            try:
+                ws.write_url(row_idx, 5, _fileurl_windows(ruta_abs), string=ruta_abs)
+            except Exception:
+                ws.write(row_idx, 5, ruta_abs)
+            ws.write(row_idx, 6, localizacion)
+            ws.write(row_idx, 7, palabras)
+            ws.write(row_idx, 8, obs)
+            row_idx += 1
+            _emit_tick(row_idx - 1)
+
+        try:
+            ws.autofilter(0, 0, max(1, row_idx-1), len(headers)-1)
+        except Exception:
+            pass
         wb.close()
         if progress_cb:
             progress_cb("status", f"Excel guardado en {out}")
         return str(out)
 
-    # CSV (fallback ultra-compatible)
-    if not str(out).lower().endswith(".csv"):
-        out = out.with_suffix(".csv")
-    with open(out, "w", newline="", encoding="utf-8") as f:
+    out = Path(out).with_suffix(".csv")
+    with open(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(headers)
         n = 0
+        from datetime import datetime
         for p in rows_iter:
             nombre, ext, size, mtime, carpeta, ruta_abs, localizacion = _file_info(p, base)
             mod = ""
             if mtime > 0:
-                from datetime import datetime
                 mod = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-            w.writerow([nombre, ext, size, mod, carpeta, ruta_abs, localizacion])
+            if meta_provider:
+                try:
+                    palabras, obs = meta_provider(ruta_abs) or ("","")
+                except Exception:
+                    palabras, obs = "",""
+            else:
+                palabras, obs = "",""
+            w.writerow([nombre, ext, size, mod, carpeta, ruta_abs, localizacion, palabras, obs])
             n += 1
             _emit_tick(n)
     if progress_cb:

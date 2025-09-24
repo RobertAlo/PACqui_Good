@@ -14,6 +14,8 @@ IndexGenerator (PACqui)– v1.1.6 (Casi perfecto)
 Requisitos opcionales:
   pip install openpyxl
 """
+from __future__ import annotations
+
 import os
 import sqlite3
 import sys
@@ -46,6 +48,272 @@ import math
 import zipfile
 import xml.etree.ElementTree as ET
 from massive_indexer import export_massive_index
+# massive_indexer.py — v1.2 (auto-keywords from SQLite)
+
+import os, csv, sqlite3
+from pathlib import Path
+from typing import Callable, Iterable, Optional, Tuple
+
+try:
+    import xlsxwriter  # pip install xlsxwriter
+except Exception:
+    xlsxwriter = None  # fallback a CSV
+
+from path_utils import norm_ext, file_url_windows as _fileurl_windows, rel_from_base
+
+Row = Tuple[str, str, int, float, str, str, str]  # (nombre, ext, size, mtime, carpeta, ruta_abs, localizacion)
+
+def _iter_files(base: Path) -> Iterable[Path]:
+    for root, _dirs, files in os.walk(base):
+        for fn in files:
+            try:
+                yield Path(root) / fn
+            except Exception:
+                continue
+
+def _file_info(p: Path, base: Path) -> Row:
+    try:
+        stat = p.stat()
+        size = int(getattr(stat, "st_size", 0) or 0)
+        mtime = float(getattr(stat, "st_mtime", 0.0) or 0.0)
+    except Exception:
+        size = 0
+        mtime = 0.0
+    nombre = p.name
+    ext = norm_ext(nombre)
+    carpeta = str(p.parent)
+    ruta_abs = str(p)
+    localizacion = f"<BASE>\\{rel_from_base(ruta_abs, str(base))}"
+    return (nombre, ext, size, mtime, carpeta, ruta_abs, localizacion)
+
+def _default_out_path(base: Path, prefer_xlsx: bool) -> Path:
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"Indice_{base.name}_{ts}" + (".xlsx" if (prefer_xlsx and xlsxwriter) else ".csv")
+    return Path.home() / "Desktop" / name
+
+# ------------------ AUTOFILL (SQLite) ------------------
+def _normpath_key(p: str) -> str:
+    try:
+        return os.path.normcase(os.path.normpath(p))
+    except Exception:
+        return p
+
+def _db_default_path() -> Path:
+    try:
+        here = Path(__file__).resolve().parent
+    except Exception:
+        here = Path.cwd()
+    return here / "index_cache.sqlite"
+
+def _build_default_meta_provider(base: Path) -> Callable[[str], tuple[str, str]]:
+    """
+    Carga en memoria {fullpath_normalizado -> 'kw1; kw2; ...'} desde 'doc_keywords'.
+    Opcionalmente lee 'doc_notes(fullpath, note)' para OBSERVACIONES.
+    Si la BD no existe o no tiene tablas, devuelve proveedor vacío.
+    Filtra por prefijo de la base exportada para acotar RAM y acelerar.
+    """
+    db_file = _db_default_path()
+    base_key = _normpath_key(str(base))
+    if not db_file.exists():
+        return lambda _abs: ("", "")
+
+    # Conexión read-only con tolerancia a bloqueo
+    try:
+        conn = sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True, check_same_thread=False)
+    except Exception:
+        try:
+            conn = sqlite3.connect(str(db_file), check_same_thread=False)
+        except Exception:
+            return lambda _abs: ("", "")
+    try:
+        conn.execute("PRAGMA busy_timeout=3000")
+    except Exception:
+        pass
+
+    def _has_table(name: str) -> bool:
+        try:
+            return bool(conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone())
+        except Exception:
+            return False
+
+    has_kw = _has_table("doc_keywords")
+    has_notes = _has_table("doc_notes")
+
+    kw_map: dict[str, list[str]] = {}
+    notes_map: dict[str, str] = {}
+
+    if has_kw:
+        try:
+            # Orden por ruta/keyword para stream estable y ligero de RAM
+            cur = conn.execute("SELECT fullpath, keyword FROM doc_keywords ORDER BY fullpath, keyword")
+            for fullpath, kw in cur:
+                if not fullpath or not kw:
+                    continue
+                k = _normpath_key(fullpath)
+                if not k.startswith(base_key):
+                    continue
+                arr = kw_map.get(k)
+                if arr is None:
+                    kw_map[k] = arr = []
+                if kw not in arr:  # sin duplicados
+                    arr.append(kw)
+        except Exception:
+            kw_map.clear()
+
+    if has_notes:
+        try:
+            cur = conn.execute("SELECT fullpath, note FROM doc_notes")
+            for fullpath, note in cur:
+                if not fullpath:
+                    continue
+                k = _normpath_key(fullpath)
+                if not k.startswith(base_key):
+                    continue
+                notes_map[k] = note or ""
+        except Exception:
+            notes_map.clear()
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+    def _provider(abs_path: str) -> tuple[str, str]:
+        key = _normpath_key(abs_path)
+        words = kw_map.get(key, [])
+        obs = notes_map.get(key, "")
+        if len(words) > 1:
+            s = "; ".join(words)
+        elif words:
+            s = words[0]
+        else:
+            s = ""
+        return (s, obs)
+
+    return _provider
+
+# ------------------ EXPORTACIÓN ------------------
+def export_massive_index(base_path: str | os.PathLike[str],
+                         out_path: Optional[str] = None,
+                         prefer_xlsx: bool = True,
+                         meta_provider: Optional[Callable[[str], tuple[str, str]]] = None,
+                         progress_cb: Optional[Callable[[str, str], None]] = None) -> str:
+    """
+    Exporta un índice masivo a Excel (si hay xlsxwriter y prefer_xlsx=True) o CSV.
+    Añade SIEMPRE:
+      - PALABRAS CLAVE (rellenadas desde SQLite, salvo que pases meta_provider)
+      - OBSERVACIONES (si existe doc_notes; en otro caso vacío)
+    """
+    base = Path(base_path).resolve()
+    out = Path(out_path).resolve() if out_path else _default_out_path(base, prefer_xlsx)
+    rows_iter = _iter_files(base)
+
+    # Si el llamador no pasa proveedor, usamos el de SQLite por defecto
+    if meta_provider is None:
+        try:
+            meta_provider = _build_default_meta_provider(base)
+        except Exception:
+            meta_provider = (lambda _abs: ("", ""))
+
+    def _emit_tick(n: int):
+        if progress_cb and (n % 1000 == 0):
+            try:
+                progress_cb("inc", 1000)
+            except Exception:
+                progress_cb("progress", str(n))
+
+    headers = ["NOMBRE","EXT","TAMANO","MODIFICADO","CARPETA","RUTA","LOCALIZACION","PALABRAS CLAVE","OBSERVACIONES"]
+
+    if prefer_xlsx and xlsxwriter:
+        wb = xlsxwriter.Workbook(str(out), {
+            "constant_memory": True,
+            "strings_to_numbers": False,
+            "strings_to_formulas": False,
+        })
+        bold = wb.add_format({"bold": True})
+        date_fmt = wb.add_format({"num_format": "yyyy-mm-dd hh:mm"})
+        ws = wb.add_worksheet("Índice")
+        for col, h in enumerate(headers):
+            ws.write(0, col, h, bold)
+        ws.freeze_panes(1, 0)
+        ws.set_column(0, 0, 46)  # NOMBRE
+        ws.set_column(1, 1, 8)   # EXT
+        ws.set_column(2, 2, 12)  # TAMANO
+        ws.set_column(3, 3, 18)  # MODIFICADO
+        ws.set_column(4, 4, 48)  # CARPETA
+        ws.set_column(5, 5, 72)  # RUTA
+        ws.set_column(6, 6, 40)  # LOCALIZACION
+        ws.set_column(7, 7, 36)  # PALABRAS CLAVE
+        ws.set_column(8, 8, 42)  # OBSERVACIONES
+
+        from datetime import datetime
+        row_idx = 1
+        for p in rows_iter:
+            nombre, ext, size, mtime, carpeta, ruta_abs, localizacion = _file_info(p, base)
+            mod = ""
+            if mtime > 0:
+                mod = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+
+            try:
+                palabras, obs = meta_provider(ruta_abs) or ("","")
+            except Exception:
+                palabras, obs = "",""
+
+            ws.write(row_idx, 0, nombre)
+            ws.write(row_idx, 1, ext)
+            ws.write_number(row_idx, 2, size)
+            ws.write(row_idx, 3, mod, date_fmt if mod else None)
+            ws.write(row_idx, 4, carpeta)
+            try:
+                ws.write_url(row_idx, 5, _fileurl_windows(ruta_abs), string=ruta_abs)
+            except Exception:
+                ws.write(row_idx, 5, ruta_abs)
+            ws.write(row_idx, 6, localizacion)
+            ws.write(row_idx, 7, palabras)
+            ws.write(row_idx, 8, obs)
+            row_idx += 1
+            _emit_tick(row_idx - 1)
+
+        try:
+            ws.autofilter(0, 0, max(1, row_idx-1), len(headers)-1)
+        except Exception:
+            pass
+        wb.close()
+        if progress_cb:
+            try:
+                progress_cb("status", f"Excel guardado en {out}")
+            except Exception:
+                pass
+        return str(out)
+
+    # Fallback CSV
+    out = out.with_suffix(".csv")
+    with open(out, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(headers)
+        n = 0
+        from datetime import datetime
+        for p in rows_iter:
+            nombre, ext, size, mtime, carpeta, ruta_abs, localizacion = _file_info(p, base)
+            mod = ""
+            if mtime > 0:
+                mod = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            try:
+                palabras, obs = meta_provider(ruta_abs) or ("","")
+            except Exception:
+                palabras, obs = "",""
+            w.writerow([nombre, ext, size, mod, carpeta, ruta_abs, localizacion, palabras, obs])
+            n += 1
+            _emit_tick(n)
+    if progress_cb:
+        try:
+            progress_cb("status", f"CSV guardado en {out}")
+        except Exception:
+            pass
+    return str(out)
 
 
 
@@ -1421,44 +1689,133 @@ class OrganizadorFrame(ttk.Frame):
 
     def _exportar_masivo_directo(self):
         from tkinter import filedialog, messagebox
+        import threading, os, time
+        from pathlib import Path
+
         try:
-            base = self.base_path or Path(
-                filedialog.askdirectory(title="Selecciona la CARPETA BASE (hipermasiva)")
-            )
+            # 1) Carpeta base
+            base = self.base_path
             if not base:
+                chosen = filedialog.askdirectory(title="Selecciona la CARPETA BASE (hipermasiva)")
+                if not chosen:
+                    return
+                base = Path(chosen)
+            else:
+                base = Path(base)
+
+            if not base.exists():
+                messagebox.showerror("Exportar (masivo)", f"La carpeta base no existe:\n{base}")
                 return
+
+            # 2) Archivo de salida (xlsx/csv)
             out = filedialog.asksaveasfilename(
                 title="Guardar índice (XLSX/CSV)",
                 defaultextension=".xlsx",
                 filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
             ) or None
+            if out:
+                out = str(out)  # normalizar a str para el indexador
 
-            # Ventana de progreso (arranca en modo indeterminado)
+            # 3) Ventana de progreso: arranca en indeterminado mientras contamos
             self._task_open("Generando Excel…", total=100)
             self._task_set_indeterminate("Contando ficheros…")
             self._append_msg("Exportación masiva iniciada…", "INFO")
 
-            import threading
             def _work():
                 try:
                     from massive_indexer import export_massive_index
-                    def _cb(event, value):
-                        if event == "total":
-                            # Cambiamos a modo determinista con el total real
-                            self.queue.put(("task_total", int(value)))
-                        elif event == "inc":
-                            self.queue.put(("task_inc", int(value)))
+                    from meta_store import MetaStore
+
+                    # --- Fase 1: PRE-CONTEO para tener barra determinada real ---
+                    total = 0
+                    # Conteo ligero (sin tocar disco más allá de listar)
+                    for _root, _dirs, files in os.walk(base):
+                        total += len(files)
+
+                    # Comunicar total a la UI (cambiar a barra determinada)
+                    self.queue.put(("task_total", int(total if total > 0 else 1)))
+                    # Si no hay archivos, salir con mensaje
+                    if total == 0:
+                        self.queue.put(("msg", ("No se han encontrado ficheros en la carpeta base.", "WARN")))
+                        return
+
+                    # --- Meta: keywords + notas desde SQLite ---
+                    # Usamos el mismo path que el app ya maneja
+                    store = MetaStore(self._db_path())
+
+                    def _meta_provider(abs_path: str):
+                        # Devuelve (palabras_clave, observaciones)
+                        try:
+                            kws_list = store.get_keywords(abs_path)  # lista
+                            note = store.get_note(abs_path) or ""
+                            return ("; ".join(kws_list), note)
+                        except Exception:
+                            return ("", "")
+
+                    # --- Mapeo de progreso del motor → nuestra barra ---
+                    # El motor emite "progress" (acumulado) y "status".
+                    last = 0
+
+                    def _cb(event: str, value: str):
+                        nonlocal last
+                        if event == "progress":
+                            try:
+                                n = int(value)
+                            except Exception:
+                                n = last
+                            inc = max(0, n - last)
+                            if inc:
+                                self.queue.put(("task_inc", inc))
+                                last = n
                         elif event == "status":
                             self.queue.put(("task_status", str(value)))
+                        elif event == "total":
+                            # Por compatibilidad si alguna versión lo emite
+                            try:
+                                t = int(value)
+                                self.queue.put(("task_total", t))
+                            except Exception:
+                                pass
+                        elif event == "inc":
+                            # Por compatibilidad si alguna versión lo emite
+                            try:
+                                self.queue.put(("task_inc", int(value)))
+                            except Exception:
+                                pass
 
-                    path = export_massive_index(str(base), out_path=out, prefer_xlsx=True, progress_cb=_cb)
-                    self.queue.put(("msg", (f"Exportación masiva completada → {path}", "OK")))
+                    # Preferencia de formato según extensión elegida
+                    prefer_xlsx = True
+                    if out and out.lower().endswith(".csv"):
+                        prefer_xlsx = False
+
+                    # --- Fase 2: Exportación ---
+                    start = time.time()
+                    try:
+                        path = export_massive_index(
+                            base_path=str(base),
+                            out_path=out,
+                            prefer_xlsx=prefer_xlsx,
+                            meta_provider=_meta_provider,
+                            progress_cb=_cb
+                        )
+                    except PermissionError as pe:
+                        # Sugerencia: ruta alternativa en Escritorio
+                        alt = str(Path.home() / "Desktop" / f"Indice_{base.name}_{int(time.time())}.xlsx")
+                        self.queue.put(("msg", (f"ERROR exportando (masivo): {pe}. "
+                                                f"Prueba a cerrar el fichero si está abierto o guardar en otra ruta.\n"
+                                                f"Sugerencia: {alt}", "ERR")))
+                        return
+
+                    elapsed = time.time() - start
+                    self.queue.put(("msg", (f"Exportación masiva completada → {path}  "
+                                            f"({total:,} ficheros en {elapsed:.1f}s)", "OK")))
                 except Exception as e:
                     self.queue.put(("msg", (f"ERROR exportando (masivo): {e}", "ERR")))
                 finally:
                     self.queue.put(("task_close", None))
 
             threading.Thread(target=_work, daemon=True).start()
+
         except Exception as e:
             messagebox.showerror("Exportar (masivo)", str(e))
 
