@@ -53,6 +53,9 @@ from massive_indexer import export_massive_index
 import os, csv, sqlite3
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Tuple
+from ui_fuentes import SourcesPanel
+import re  # si no estaba ya
+
 
 try:
     import xlsxwriter  # pip install xlsxwriter
@@ -1336,6 +1339,7 @@ class OrganizadorFrame(ttk.Frame):
         menu.add_command(label="Abrir carpeta", command=lambda: open_in_explorer(Path(carpeta)))
         menu.add_separator()
         menu.add_command(label="Ver palabras clave guardadas", command=lambda: self._show_keywords_for_file(ruta))
+        menu.add_command(label="Ver Observaciones", command=lambda: self._open_observaciones_for_file(ruta))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -2602,45 +2606,67 @@ class OrganizadorFrame(ttk.Frame):
         self._open_keywords_dialog(ruta, nombre, ext, freqs)
 
     def _open_keywords_dialog(self, fullpath: str, nombre: str, ext: str, freqs: dict):
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        try:
+            from meta_store import MetaStore
+        except Exception:
+            MetaStore = None  # seguirá funcionando el guardado de keywords
+
         dlg = tk.Toplevel(self)
         dlg.title(f"Scraper de palabras clave – {os.path.basename(fullpath)}")
-        dlg.minsize(560, 520)
+        dlg.minsize(760, 620)  # << más grande
         dlg.resizable(True, True)
-        # dlg.transient(self.winfo_toplevel())  # desactivado para permitir min/max
         dlg.grab_set()
-        frm_top = ttk.Frame(dlg, padding=(10,8)); frm_top.pack(fill="x")
+
+        # ---- Cabecera ----
+        frm_top = ttk.Frame(dlg, padding=(10, 8));
+        frm_top.pack(fill="x")
         ttk.Label(frm_top, text=os.path.basename(fullpath)).pack(side="left")
-        frm_ctrl = ttk.Frame(dlg, padding=(10,2)); frm_ctrl.pack(fill="x")
+
+        # ---- Controles / ordenación ----
+        frm_ctrl = ttk.Frame(dlg, padding=(10, 2));
+        frm_ctrl.pack(fill="x")
         var_umbral = tk.IntVar(value=2)
         ttk.Label(frm_ctrl, text="Umbral (freq ≥)").pack(side="left")
         spn = ttk.Spinbox(frm_ctrl, from_=1, to=10, width=4, textvariable=var_umbral)
-        spn.pack(side="left", padx=(6,12))
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4,4))
-        frm_add = ttk.Frame(dlg, padding=(10,2)); frm_add.pack(fill="x")
+        spn.pack(side="left", padx=(6, 12))
+
+        var_order = tk.StringVar(value="freq")  # "freq" | "alpha"
+        ttk.Label(frm_ctrl, text="Orden:").pack(side="left", padx=(12, 4))
+        ttk.Radiobutton(frm_ctrl, text="Frecuencia", value="freq", variable=var_order).pack(side="left")
+        ttk.Radiobutton(frm_ctrl, text="Alfabético", value="alpha", variable=var_order).pack(side="left",
+                                                                                                 padx=(6, 0))
+
+        ttk.Button(frm_ctrl, text="Maximizar", command=lambda: dlg.state("zoomed")).pack(side="right")
+        ttk.Button(frm_ctrl, text="Minimizar", command=dlg.iconify).pack(side="right", padx=(6, 0))
+        ttk.Button(frm_ctrl, text="Aplicar selección", command=lambda: apply_selection()).pack(side="left",
+                                                                                                   padx=(12, 0))
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4, 4))
+
+        # ---- Añadir palabra manual ----
+        frm_add = ttk.Frame(dlg, padding=(10, 2));
+        frm_add.pack(fill="x")
         ttk.Label(frm_add, text="Añadir palabra clave:").pack(side="left")
         var_add = tk.StringVar()
-        ent_add = ttk.Entry(frm_add, width=28, textvariable=var_add); ent_add.pack(side="left", padx=(6,6))
+        ent_add = ttk.Entry(frm_add, width=28, textvariable=var_add);
+        ent_add.pack(side="left", padx=(6, 6))
         ttk.Button(frm_add, text="Añadir", command=lambda: add_word()).pack(side="left")
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4,4))
-        # Ordenación
-        var_order = tk.StringVar(value="freq")  # "freq" (desc) | "alpha" (asc)
-        ttk.Label(frm_ctrl, text="Orden:").pack(side="left", padx=(12,4))
-        ttk.Radiobutton(frm_ctrl, text="Frecuencia", value="freq", variable=var_order).pack(side="left")
-        ttk.Radiobutton(frm_ctrl, text="Alfabético", value="alpha", variable=var_order).pack(side="left", padx=(6,0))
-        ttk.Button(frm_ctrl, text="Maximizar", command=lambda: dlg.state("zoomed")).pack(side="right")
-        ttk.Button(frm_ctrl, text="Minimizar", command=dlg.iconify).pack(side="right", padx=(0,6))
 
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4,4))
-        frm_list = ttk.Frame(dlg); frm_list.pack(fill="both", expand=True)
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4, 4))
+
+        # ---- Lista de palabras con scroll ----
+        frm_list = ttk.Frame(dlg);
+        frm_list.pack(fill="both", expand=True)
         canvas = tk.Canvas(frm_list, bd=0, highlightthickness=0)
         ysb = ttk.Scrollbar(frm_list, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=ysb.set)
         ysb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         inner = ttk.Frame(canvas)
-        winid = canvas.create_window((0,0), window=inner, anchor="nw")
+        winid = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        # Vars por palabra para preservar selección entre renderizados
         vars = {}
         widgets = {}
 
@@ -2650,35 +2676,57 @@ class OrganizadorFrame(ttk.Frame):
             return sorted(freqs.items(), key=lambda kv: (-kv[1], kv[0]))
 
         def render_items():
-            # Limpiar
             for child in list(inner.children.values()):
                 child.destroy()
-            # Pintar en el orden elegido
             for i, (w, f) in enumerate(get_sorted_items()):
                 if w not in vars:
                     vars[w] = tk.IntVar(value=1 if f >= var_umbral.get() else 0)
                 cb = ttk.Checkbutton(inner, text=f"{w} ({f})", variable=vars[w])
-                cb.grid(row=i, column=0, sticky="w", padx=(6,0), pady=2)
+                cb.grid(row=i, column=0, sticky="w", padx=(6, 0), pady=2)
                 widgets[w] = cb
             canvas.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         def on_configure(event):
-            # Estirar contenido al ancho disponible
             canvas.itemconfig(winid, width=event.width)
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", on_configure)
 
-        # Botonera inferior
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4,4))
-        frm_btns = ttk.Frame(dlg, padding=(10,8)); frm_btns.pack(fill="x")
+        # ---- Observaciones (TextArea) ----
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(6, 6))
+        frm_obs = ttk.Frame(dlg, padding=(10, 4));
+        frm_obs.pack(fill="both", expand=False)
+        ttk.Label(frm_obs, text="Observaciones (se volcarán en la Excel):").grid(row=0, column=0, sticky="w",
+                                                                                     pady=(0, 4))
+        txt_obs = tk.Text(frm_obs, height=6, wrap="word")
+        txt_obs.grid(row=1, column=0, sticky="nsew")
+        vsb_obs = ttk.Scrollbar(frm_obs, orient="vertical", command=txt_obs.yview)
+        vsb_obs.grid(row=1, column=1, sticky="ns", padx=(6, 0))
+        txt_obs.configure(yscrollcommand=vsb_obs.set)
+        frm_obs.columnconfigure(0, weight=1)
+
+        # Carga de nota previa (si existe)
+        if MetaStore is not None:
+            try:
+                note0 = MetaStore(self._db_path()).get_note(fullpath) or ""
+                txt_obs.insert("1.0", note0)
+            except Exception:
+                pass
+
+        # ---- Botonera inferior ----
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", pady=(4, 4))
+        frm_btns = ttk.Frame(dlg, padding=(10, 8));
+        frm_btns.pack(fill="x")
+
         def select_all(v=1):
             for k in vars: vars[k].set(v)
+
         ttk.Button(frm_btns, text="Todos", command=lambda: select_all(1)).pack(side="left")
-        ttk.Button(frm_btns, text="Ninguno", command=lambda: select_all(0)).pack(side="left", padx=(6,0))
-        status = ttk.Label(frm_btns, text=""); status.pack(side="left", padx=(14,0))
+        ttk.Button(frm_btns, text="Ninguno", command=lambda: select_all(0)).pack(side="left", padx=(6, 0))
+        status = ttk.Label(frm_btns, text="");
+        status.pack(side="left", padx=(14, 0))
 
         def apply_selection():
             umbral = var_umbral.get()
@@ -2692,13 +2740,10 @@ class OrganizadorFrame(ttk.Frame):
                 selected += want
             status.config(text=f"Seleccionadas: {selected}")
 
-        ttk.Button(frm_ctrl, text="Aplicar selección", command=apply_selection).pack(side="left", padx=(0,6))
-
         def add_word():
             w = var_add.get().strip().lower()
             if not w:
                 return
-            # si no existe, crea con freq 1
             if w not in freqs:
                 freqs[w] = 1
             vars.setdefault(w, tk.IntVar(value=1)).set(1)
@@ -2706,19 +2751,27 @@ class OrganizadorFrame(ttk.Frame):
             render_items()
 
         def guardar():
-            kw = [w for w,v in vars.items() if v.get()==1]
+            # 1) Palabras clave
+            kw = [w for w, v in vars.items() if v.get() == 1]
             self._save_keywords(fullpath, nombre, ext, kw, freqs)
+
+            # 2) Observaciones
+            note = (txt_obs.get("1.0", "end-1c") or "").strip()
+            if MetaStore is not None:
+                try:
+                    MetaStore(self._db_path()).set_note(fullpath, note)
+                except Exception as e:
+                    self._append_msg(f"Error guardando observaciones: {e}", "WARN")
+
             self._append_msg(f"Palabras clave guardadas para {nombre}: {', '.join(kw)}", "OK")
             messagebox.showinfo(APP_NAME, "Guardado con éxito")
             dlg.destroy()
 
         ttk.Button(frm_btns, text="Guardar", command=guardar).pack(side="right")
-        ttk.Button(frm_btns, text="Cancelar", command=dlg.destroy).pack(side="right", padx=(6,0))
+        ttk.Button(frm_btns, text="Cancelar", command=dlg.destroy).pack(side="right", padx=(6, 0))
 
-        # Re-render al cambiar orden
+        # Re-render inicial + reorden
         var_order.trace_add("write", lambda *args: render_items())
-
-        # Render inicial
         render_items()
 
     def _save_keywords(self, fullpath: str, nombre: str, ext: str, keywords: list[str], freqs: dict):
@@ -2729,13 +2782,28 @@ class OrganizadorFrame(ttk.Frame):
             cur.execute("DELETE FROM doc_keywords WHERE fullpath = ?", (fullpath,))
             for k in keywords:
                 cur.execute("INSERT INTO doc_keywords(fullpath, name, ext, keyword, freq) VALUES (?,?,?,?,?)",
-                            (fullpath, nombre, ext, k, int(freqs.get(k, 1))))
+                        (fullpath, nombre, ext, k, int(freqs.get(k, 1))))
             conn.commit()
             conn.close()
         except Exception as e:
             self._append_msg(f"Error guardando keywords: {e}", "WARN")
 
-    # ============================ EXPORTACIÓN RÁPIDA (STREAMING, THREAD) ============================
+    def _open_observaciones_for_file(self, ruta: str):
+        from tkinter import messagebox
+        try:
+            from ui_observaciones import ObservacionesDialog
+            ObservacionesDialog(self.master, self._db_path(), ruta)
+        except Exception as e:
+            # Fallback simple: mostrar la nota si el diálogo no está disponible
+            try:
+                from meta_store import MetaStore
+                note = MetaStore(self._db_path()).get_note(ruta) or "(sin observaciones)"
+                messagebox.showinfo("Observaciones", note, parent=self)
+            except Exception:
+                messagebox.showerror("Observaciones", f"No se pudo abrir el editor de observaciones:\n{e}",
+                                        parent=self)
+
+        # ============================ EXPORTACIÓN RÁPIDA (STREAMING, THREAD) ============================
     def cmd_exportar_excel_rapido(self):
         """Exporta TODO el índice usando openpyxl en modo write_only y en un hilo de fondo.
         Ideal para 100k–200k archivos."""
@@ -3361,6 +3429,8 @@ class LLMChatDialog(tk.Toplevel):
         self.transient(master); self.resizable(True, True); self.grab_set()
         self.geometry("860x680")
         self.app = app
+        self._fuentes_panel = None
+        self._fuentes_count = 0
 
         # Estado LLM
         self.model = None
@@ -3375,41 +3445,66 @@ class LLMChatDialog(tk.Toplevel):
 
     # ---------------- UI ----------------
     def _build_ui(self):
-        root = ttk.Frame(self, padding=10); root.pack(fill="both", expand=True)
+        from pathlib import Path  # por si no está en el ámbito del módulo
+
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill="both", expand=True)
 
         # Línea de carga de modelo
-        top = ttk.Frame(root); top.pack(fill="x")
+        top = ttk.Frame(root);
+        top.pack(fill="x")
         ttk.Label(top, text="Modelo GGUF:").pack(side="left")
         self.var_path = tk.StringVar(value=self.model_path)
         ent = ttk.Entry(top, textvariable=self.var_path)
         ent.pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(top, text="Elegir…", command=self._choose_model).pack(side="left")
         self.btn_cargar = ttk.Button(top, text="Cargar", command=self._load_model)
-        self.btn_cargar.pack(side="left", padx=(6,0))
-        self.lbl_status = ttk.Label(top, text="(sin cargar)"); self.lbl_status.pack(side="left", padx=(8,0))
+        self.btn_cargar.pack(side="left", padx=(6, 0))
+        self.lbl_status = ttk.Label(top, text="(sin cargar)")
+        self.lbl_status.pack(side="left", padx=(8, 0))
 
         # Parámetros
-        opts = ttk.Frame(root); opts.pack(fill="x", pady=(8,4))
-        ttk.Label(opts, text="Temperatura:").pack(side="left"); self.var_temp = tk.DoubleVar(value=0.4)
-        ttk.Entry(opts, width=5, textvariable=self.var_temp).pack(side="left", padx=(4,10))
-        ttk.Label(opts, text="Máx. tokens:").pack(side="left"); self.var_maxtok = tk.IntVar(value=512)
-        ttk.Entry(opts, width=6, textvariable=self.var_maxtok).pack(side="left", padx=(4,10))
-        ttk.Label(opts, text="Contexto:").pack(side="left"); self.var_ctx = tk.IntVar(value=2048)
-        ttk.Entry(opts, width=7, textvariable=self.var_ctx).pack(side="left", padx=(4,10))
+        opts = ttk.Frame(root);
+        opts.pack(fill="x", pady=(8, 4))
+        ttk.Label(opts, text="Temperatura:").pack(side="left")
+        self.var_temp = tk.DoubleVar(value=0.4)
+        ttk.Entry(opts, width=5, textvariable=self.var_temp).pack(side="left", padx=(4, 10))
+
+        ttk.Label(opts, text="Máx. tokens:").pack(side="left")
+        self.var_maxtok = tk.IntVar(value=512)
+        ttk.Entry(opts, width=6, textvariable=self.var_maxtok).pack(side="left", padx=(4, 10))
+
+        ttk.Label(opts, text="Contexto:").pack(side="left")
+        self.var_ctx = tk.IntVar(value=2048)
+        ttk.Entry(opts, width=7, textvariable=self.var_ctx).pack(side="left", padx=(4, 10))
+
+        # ----- Índice externo (Excel/CSV) + Panel de fuentes -----
+        idxf = ttk.Frame(root);
+        idxf.pack(fill="x", pady=(4, 4))
+        ttk.Label(idxf, text="Índice (Excel/CSV):").pack(side="left")
+        ttk.Button(idxf, text="Cargar índice…", command=self._ui_import_index).pack(side="left", padx=(6, 0))
+        self.btn_fuentes = ttk.Button(idxf, text="Fuentes (0)", command=self._toggle_fuentes_panel)
+        self.btn_fuentes.pack(side="left", padx=(8, 0))
+        self.lbl_idx = ttk.Label(idxf, text="", foreground="#666")
+        self.lbl_idx.pack(side="left", padx=(8, 0))
 
         # System
-        sysf = ttk.LabelFrame(root, text="System"); sysf.pack(fill="x")
+        sysf = ttk.LabelFrame(root, text="System");
+        sysf.pack(fill="x")
         self.txt_sys = ScrolledText(sysf, height=3, wrap="word")
         self.txt_sys.insert("1.0", "Soy PACqui, asistente de documentación para la PAC. Encantada de saludarte.")
         self.txt_sys.pack(fill="x")
 
         # Conversación
-        chatf = ttk.LabelFrame(root, text="Conversación"); chatf.pack(fill="both", expand=True, pady=(8,0))
+        chatf = ttk.LabelFrame(root, text="Conversación");
+        chatf.pack(fill="both", expand=True, pady=(8, 0))
         self.txt_chat = ScrolledText(chatf, wrap="word")
-        self.txt_chat.pack(fill="both", expand=True); self.txt_chat.configure(state="disabled")
+        self.txt_chat.pack(fill="both", expand=True)
+        self.txt_chat.configure(state="disabled")
 
         # Entrada usuario
-        bot = ttk.Frame(root); bot.pack(fill="x", pady=(8,0))
+        bot = ttk.Frame(root);
+        bot.pack(fill="x", pady=(8, 0))
         self.var_user = tk.StringVar()
         ent_u = ttk.Entry(bot, textvariable=self.var_user)
         ent_u.pack(side="left", fill="x", expand=True)
@@ -3435,6 +3530,33 @@ class LLMChatDialog(tk.Toplevel):
         self.txt_chat.see("end")
         self.txt_chat.configure(state="disabled")
 
+    def _open_file_os(self, path: str):
+        try:
+            if hasattr(self.app, "open_in_explorer"):
+                self.app.open_in_explorer(path);
+                return
+            import subprocess, os
+            if os.name == "nt":
+                os.startfile(path)  # type: ignore
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Abrir", f"No se pudo abrir:\n{path}\n\n{e}", parent=self)
+
+    def _open_folder_os(self, path: str):
+        import os
+        carpeta = os.path.dirname(path)
+        self._open_file_os(carpeta)
+
+    def _show_observaciones_for(self, path: str):
+        # Usa tu diálogo existente si está disponible:
+        if hasattr(self, "_open_observaciones_for_file"):
+            self._open_observaciones_for_file(path)
+            return
+        from tkinter import messagebox
+        messagebox.showinfo("Observaciones", "(sin observaciones)", parent=self)
+
     def _append_stream_text(self, txt, end_turn=False):
         # Normaliza secuencias "\n" literales y otros saltos antes de insertar
         try:
@@ -3452,6 +3574,63 @@ class LLMChatDialog(tk.Toplevel):
         self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
         self.txt_chat.see("end")
         self.txt_chat.configure(state="disabled")
+
+    def _ensure_fuentes_panel(self):
+        if self._fuentes_panel and tk.Toplevel.winfo_exists(self._fuentes_panel):
+            return self._fuentes_panel
+        self._fuentes_panel = SourcesPanel(
+            self,
+            on_open_file=self._open_file_os,
+            on_open_folder=self._open_folder_os,
+            on_show_observaciones=self._show_observaciones_for
+        )
+        return self._fuentes_panel
+
+    def _toggle_fuentes_panel(self):
+        pan = self._ensure_fuentes_panel()
+        try:
+            pan.deiconify()
+            pan.lift()
+        except Exception:
+            pass
+
+    def _update_fuentes_panel(self, sources: list[dict]):
+        self._fuentes_count = len(sources or [])
+        try:
+            self.btn_fuentes.configure(text=f"Fuentes ({self._fuentes_count})")
+        except Exception:
+            pass
+        if not sources:
+            # no lo abrimos si no hay resultados
+            return
+        pan = self._ensure_fuentes_panel()
+        pan.update_sources(sources)
+
+    def _collect_index_hits(self, user_text: str, top_k: int = 8) -> list[dict]:
+        """Busca por keywords del índice y devuelve lista de dicts con path,name,score,keywords,note."""
+        try:
+            from meta_store import MetaStore
+            store = MetaStore(self.app._db_path())
+        except Exception:
+            return []
+        toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", user_text or "")]
+        if not toks:
+            return []
+        from collections import defaultdict
+        hits = defaultdict(int)
+        for t in toks:
+            for fp, _kw in store.search_by_keyword(t, limit=1000):
+                hits[os.path.normcase(os.path.normpath(fp))] += 1
+        if not hits:
+            return []
+        top = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, int(top_k))]
+        results = []
+        for fp, score in top:
+            name = os.path.basename(fp)
+            kws = "; ".join(store.get_keywords(fp)) or ""
+            note = store.get_note(fp) or ""
+            results.append({"path": fp, "name": name, "score": score, "keywords": kws, "note": note})
+        return results
 
     def _build_instruct_prompt(self, system_text: str, user_text: str) -> str:
         system_text = (system_text or "").strip()
@@ -3475,6 +3654,56 @@ class LLMChatDialog(tk.Toplevel):
                 if sys_text:
                     self.messages.append({"role": "system", "content": sys_text})
 
+            # --- Contexto desde el índice (keywords/observaciones) + RAG ---
+            # 1) Fuentes del índice -> panel + bloque de contexto
+            sources = self._collect_index_hits(text)
+            self._update_fuentes_panel(sources)
+
+            # 2) Si ya estabas montando un bloque de contexto (RAG + índice), puedes seguir así:
+            idx_ctx_lines = []
+            for s in sources:
+                note = s.get("note", "")
+                if len(note) > 480: note = note[:480] + "…"
+                idx_ctx_lines.append(
+                    f"- {s['name']}  ·  {s['path']}\n  Palabras clave: {s['keywords']}\n  Observaciones: {note}")
+            idx_ctx = "Documentos sugeridos (por palabras clave del índice):\n" + "\n".join(
+                idx_ctx_lines) if idx_ctx_lines else ""
+
+            rag_ctx = ""
+            try:
+                if hasattr(self.app, "_retrieve_context"):
+                    rag_ctx = self.app._retrieve_context(text, k=6)
+            except Exception:
+                pass
+
+            sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
+            extra = []
+            if idx_ctx: extra.append("## Contexto (índice)\n" + idx_ctx)
+            if rag_ctx: extra.append("## Fragmentos del corpus (RAG)\n" + rag_ctx)
+            if extra:
+                sys_text = (sys_text + "\n\n" + "\n\n".join(extra)).strip()
+
+            prompt = self._build_instruct_prompt(system_text=sys_text, user_text=text)
+
+            idx_ctx = self._gather_index_context(text)
+            rag_ctx = ""
+            try:
+                if hasattr(self.app, "_retrieve_context"):
+                    rag_ctx = self.app._retrieve_context(text, k=6)
+            except Exception:
+                pass
+
+            # Empaquetamos en el system del turno (sin tocar lo que ya escribas en la caja System)
+            sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
+            extra = []
+            if idx_ctx: extra.append("## Contexto (índice)\n" + idx_ctx)
+            if rag_ctx: extra.append("## Fragmentos del corpus (RAG)\n" + rag_ctx)
+            if extra:
+                sys_text = (sys_text + "\n\n" + "\n\n".join(extra)).strip()
+
+            # Usa sys_text cuando construyas tu prompt
+            prompt = self._build_instruct_prompt(system_text=sys_text, user_text=text)
+
             # Añadir turno de usuario
             self.messages.append({"role": "user", "content": text})
             self._append_chat("Tú", self.app._normalize_text(text) if hasattr(self.app, "_normalize_text") else text)
@@ -3494,6 +3723,65 @@ class LLMChatDialog(tk.Toplevel):
             self.lbl_status.configure(text=s); self.update_idletasks()
         except Exception:
             pass
+
+    def _ui_import_index(self):
+        from tkinter import filedialog, messagebox
+        try:
+            from meta_store import MetaStore
+        except Exception as e:
+            messagebox.showerror("PACqui", f"No se pudo importar MetaStore:\n{e}", parent=self)
+            return
+        path = filedialog.askopenfilename(
+            title="Selecciona el índice (Excel/CSV)",
+            filetypes=[("Excel/CSV", "*.xlsx;*.csv"), ("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
+        )
+        if not path:
+            return
+        replace = messagebox.askyesno("Importar índice",
+                                      "¿Quieres REEMPLAZAR las keywords previas de cada documento?\n"
+                                      "Sí = replace · No = merge (añadir sin duplicar)")
+        try:
+            store = MetaStore(self.app._db_path())
+            stats = store.import_index_sheet(path, replace_mode=("replace" if replace else "merge"))
+            self.lbl_idx.configure(
+                text=f"Índice importado: {stats['docs']} docs, {stats['kws_added']} kws, {stats['notes_set']} notas")
+            messagebox.showinfo("PACqui", f"Importación completada.\n\n"
+                                          f"Filas: {stats['rows']}\nDocs: {stats['docs']}\n"
+                                          f"Keywords añadidas: {stats['kws_added']}\nNotas establecidas: {stats['notes_set']}",
+                                parent=self)
+        except Exception as e:
+            messagebox.showerror("PACqui", f"Error importando índice:\n{e}", parent=self)
+
+    def _gather_index_context(self, user_text: str, top_k: int = 6) -> str:
+        """Busca en SQLite por keywords contenidas en la consulta y arma un bloque contextual."""
+        try:
+            from meta_store import MetaStore
+            store = MetaStore(self.app._db_path())
+        except Exception:
+            return ""
+        # tokens sencillos (min 3 chars)
+        toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", user_text or "")]
+        if not toks:
+            return ""
+        # cuenta por documento
+        from collections import defaultdict
+        hits = defaultdict(int)
+        for t in toks:
+            for fp, _kw in store.search_by_keyword(t, limit=1000):
+                hits[os.path.normcase(os.path.normpath(fp))] += 1
+        if not hits:
+            return ""
+        # top por nº de coincidencias
+        top = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, int(top_k))]
+        lines = []
+        for fp, score in top:
+            kws = "; ".join(store.get_keywords(fp)) or ""
+            note = store.get_note(fp) or ""
+            name = os.path.basename(fp)
+            # recorta observación para no inflar el prompt
+            if len(note) > 480: note = note[:480] + "…"
+            lines.append(f"- {name}  ·  {fp}\n  Palabras clave: {kws}\n  Observaciones: {note}")
+        return "Documentos sugeridos (por palabras clave del índice):\n" + "\n".join(lines)
 
     # ---------------- Modelo ----------------
     def _load_model(self):

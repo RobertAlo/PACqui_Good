@@ -44,6 +44,91 @@ class MetaStore:
             pass
         return conn
 
+    # --- NUEVO: importar índice Excel/CSV ---
+    def import_index_sheet(self, sheet_path: str, replace_mode: str = "merge") -> dict:
+        """
+        Importa un índice (XLSX o CSV) con columnas al menos:
+          - RUTA            (ruta absoluta)
+          - PALABRAS CLAVE  (separadas por ; , o saltos de línea)
+          - OBSERVACIONES   (texto libre)
+        replace_mode: "merge" (no borra; dedup por (ruta,keyword)) o "replace" (borra keywords previas del doc).
+        Devuelve stats con contadores.
+        """
+        from pathlib import Path
+        import csv
+        sheet = Path(sheet_path)
+        if not sheet.exists():
+            raise FileNotFoundError(sheet)
+
+        def _norm_header(s: str) -> str:
+            return (s or "").strip().lower()
+
+        def _split_kws(s: str) -> list[str]:
+            if not s: return []
+            s = s.replace("\n", ";").replace(",", ";")
+            return [x.strip() for x in s.split(";") if x.strip()]
+
+        stats = {"rows": 0, "docs": 0, "kws_added": 0, "notes_set": 0, "replaced_docs": 0}
+        seen_docs = set()
+
+        def _upsert_row(ruta: str, kws_str: str, note: str):
+            nonlocal stats
+            if not ruta: return
+            ruta = os.path.normcase(os.path.normpath(ruta))
+            kws = _split_kws(kws_str)
+            if replace_mode == "replace" and ruta not in seen_docs:
+                self.clear_keywords(ruta)  # borra keywords previas sólo 1 vez por doc
+                stats["replaced_docs"] += 1
+            if kws:
+                stats["kws_added"] += self.add_keywords(ruta, kws, source="xlsx", replace=False)
+            if note and note.strip():
+                self.set_note(ruta, note.strip())
+                stats["notes_set"] += 1
+            if ruta not in seen_docs:
+                stats["docs"] += 1
+                seen_docs.add(ruta)
+
+        if sheet.suffix.lower() == ".xlsx":
+            try:
+                import openpyxl  # lectura streaming si está disponible
+            except Exception as e:
+                raise RuntimeError(f"Para .xlsx necesitas openpyxl: {e}")
+            wb = openpyxl.load_workbook(str(sheet), read_only=True, data_only=True)
+            ws = wb.active
+            headers = [_norm_header(str(c.value or "")) for c in next(ws.iter_rows(min_row=1, max_row=1))]
+            idx = {h: i for i, h in enumerate(headers)}
+
+            def _get(row, name):
+                i = idx.get(_norm_header(name))
+                if i is None: return ""
+                v = row[i].value
+                return "" if v is None else str(v)
+
+            for row in ws.iter_rows(min_row=2, values_only=False):
+                ruta = _get(row, "ruta") or _get(row, "RUTA")
+                palabras = _get(row, "palabras clave")
+                obs = _get(row, "observaciones")
+                if ruta:
+                    _upsert_row(ruta, palabras, obs)
+                    stats["rows"] += 1
+        else:
+            # CSV; autodetecta ; o , y utf-8-sig
+            with open(sheet, "r", encoding="utf-8-sig", newline="") as f:
+                sample = f.read(4096);
+                f.seek(0)
+                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+                r = csv.DictReader(f, dialect=dialect)
+                # normaliza claves a minúsculas
+                for rec in r:
+                    rec_l = {_norm_header(k): (v or "") for k, v in rec.items()}
+                    ruta = rec_l.get("ruta", "") or rec_l.get("path", "")
+                    palabras = rec_l.get("palabras clave", "")
+                    obs = rec_l.get("observaciones", "")
+                    if ruta:
+                        _upsert_row(ruta, palabras, obs)
+                        stats["rows"] += 1
+        return stats
+
     def _ensure_schema(self) -> None:
         with self._lock, self._connect() as conn:
             c = conn.cursor()
