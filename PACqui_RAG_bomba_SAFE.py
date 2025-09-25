@@ -2471,15 +2471,11 @@ class OrganizadorFrame(ttk.Frame):
     def _open_help(self, event=None):
         HelpDialog(self.master, APP_NAME, APP_VERSION)
 
-
-
-    
-
-
     def _ensure_kw_schema(self, conn):
         try:
             c = conn.cursor()
-            c.execute("""                CREATE TABLE IF NOT EXISTS doc_keywords(
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS doc_keywords(
                     id INTEGER PRIMARY KEY,
                     fullpath TEXT NOT NULL,
                     name TEXT,
@@ -2488,7 +2484,12 @@ class OrganizadorFrame(ttk.Frame):
                     freq INTEGER DEFAULT 1,
                     created_at TEXT DEFAULT (datetime('now'))
                 )
-            """ )
+            """)
+            # MIGRACIÓN: columna usada por MetaStore para provenance
+            cols = {row[1] for row in c.execute("PRAGMA table_info(doc_keywords)")}
+            if "source" not in cols:
+                c.execute("ALTER TABLE doc_keywords ADD COLUMN source TEXT DEFAULT ''")
+
             c.execute("CREATE INDEX IF NOT EXISTS idx_kw_path ON doc_keywords(fullpath)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_kw_kw ON doc_keywords(keyword)")
             conn.commit()
@@ -3034,6 +3035,32 @@ class OrganizadorFrame(ttk.Frame):
         wb.save(save_path)
         self._append_msg(f"Excel guardado en: {save_path}", "OK")
         messagebox.showinfo(APP_NAME, f"Excel generado:\n{save_path}")
+
+# --- PROGRESS DIALOG (genérico) ---
+class ProgressDialog(tk.Toplevel):
+    def __init__(self, master, title="Procesando…"):
+        super().__init__(master)
+        self.title(title); self.resizable(False, False); self.transient(master); self.grab_set()
+        frm = ttk.Frame(self, padding=12); frm.pack(fill="both", expand=True)
+        self.lbl = ttk.Label(frm, text="Preparando…"); self.lbl.pack(fill="x")
+        self.pb = ttk.Progressbar(frm, mode="determinate", length=420, maximum=100)
+        self.pb.pack(fill="x", pady=(8, 0))
+        self.pb["value"] = 0
+
+    def set_total(self, total:int):
+        self.pb.configure(maximum=max(1, int(total))); self.update_idletasks()
+
+    def set_value(self, value:int):
+        self.pb["value"] = min(int(value), int(self.pb["maximum"])); self.update_idletasks()
+
+    def set_text(self, text:str):
+        self.lbl.configure(text=text); self.update_idletasks()
+
+    def close(self):
+        try: self.grab_release()
+        except Exception: pass
+        self.destroy()
+
 
 class HelpDialog(tk.Toplevel):
     def __init__(self, master, app_name: str, version: str):
@@ -3725,32 +3752,68 @@ class LLMChatDialog(tk.Toplevel):
             pass
 
     def _ui_import_index(self):
+        import threading
         from tkinter import filedialog, messagebox
         try:
             from meta_store import MetaStore
         except Exception as e:
-            messagebox.showerror("PACqui", f"No se pudo importar MetaStore:\n{e}", parent=self)
+            messagebox.showerror("PACqui", f"No se pudo importar MetaStore:\n{e}", parent=self);
             return
+
         path = filedialog.askopenfilename(
             title="Selecciona el índice (Excel/CSV)",
             filetypes=[("Excel/CSV", "*.xlsx;*.csv"), ("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
         )
-        if not path:
-            return
+        if not path: return
+
         replace = messagebox.askyesno("Importar índice",
                                       "¿Quieres REEMPLAZAR las keywords previas de cada documento?\n"
                                       "Sí = replace · No = merge (añadir sin duplicar)")
-        try:
-            store = MetaStore(self.app._db_path())
-            stats = store.import_index_sheet(path, replace_mode=("replace" if replace else "merge"))
-            self.lbl_idx.configure(
-                text=f"Índice importado: {stats['docs']} docs, {stats['kws_added']} kws, {stats['notes_set']} notas")
-            messagebox.showinfo("PACqui", f"Importación completada.\n\n"
-                                          f"Filas: {stats['rows']}\nDocs: {stats['docs']}\n"
-                                          f"Keywords añadidas: {stats['kws_added']}\nNotas establecidas: {stats['notes_set']}",
-                                parent=self)
-        except Exception as e:
-            messagebox.showerror("PACqui", f"Error importando índice:\n{e}", parent=self)
+
+        # diálogo de progreso
+        pd = ProgressDialog(self, title="Importando índice…")
+        pd.set_text("Contando filas…")
+
+        def run():
+            try:
+                store = MetaStore(self.app._db_path())
+
+                # callback seguro hacia el hilo UI
+                def progress(ev, **kw):
+                    if ev == "total":
+                        total = kw.get("total", 0)
+                        self.after(0, lambda: (pd.set_total(total),
+                                               pd.set_text(f"Filas totales: {total}")))
+                    elif ev == "tick":
+                        done = kw.get("done", 0)
+                        self.after(0, lambda: pd.set_value(done))
+                    elif ev == "text":
+                        msg = kw.get("text", "")
+                        self.after(0, lambda: pd.set_text(msg))
+
+                stats = store.import_index_sheet(
+                    path,
+                    replace_mode=("replace" if replace else "merge"),
+                    progress=progress,
+                    progress_every=200  # ajusta si quieres informes más/menos frecuentes
+                )
+
+                def done_ok():
+                    pd.close()
+                    self.lbl_idx.configure(
+                        text=f"Índice importado: {stats['docs']} docs, {stats['kws_added']} kws, {stats['notes_set']} notas")
+                    messagebox.showinfo("PACqui",
+                                        f"Importación completada.\n\n"
+                                        f"Filas: {stats['rows']}\nDocs: {stats['docs']}\n"
+                                        f"Keywords añadidas: {stats['kws_added']}\nNotas establecidas: {stats['notes_set']}",
+                                        parent=self)
+
+                self.after(0, done_ok)
+            except Exception as e:
+                self.after(0, lambda: (pd.close(),
+                                       messagebox.showerror("PACqui", f"Error importando índice:\n{e}", parent=self)))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _gather_index_context(self, user_text: str, top_k: int = 6) -> str:
         """Busca en SQLite por keywords contenidas en la consulta y arma un bloque contextual."""

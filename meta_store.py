@@ -45,17 +45,26 @@ class MetaStore:
         return conn
 
     # --- NUEVO: importar índice Excel/CSV ---
-    def import_index_sheet(self, sheet_path: str, replace_mode: str = "merge") -> dict:
+
+    def import_index_sheet(self, sheet_path: str, replace_mode: str = "merge",
+                           progress=None, progress_every: int = 200) -> dict:
         """
-        Importa un índice (XLSX o CSV) con columnas al menos:
+        Importa un índice (XLSX o CSV) con columnas:
           - RUTA            (ruta absoluta)
           - PALABRAS CLAVE  (separadas por ; , o saltos de línea)
           - OBSERVACIONES   (texto libre)
-        replace_mode: "merge" (no borra; dedup por (ruta,keyword)) o "replace" (borra keywords previas del doc).
-        Devuelve stats con contadores.
+        replace_mode: "merge" | "replace"
+        progress(ev, **kw): callback opcional con ev in {"total","tick","text"}.
         """
         from pathlib import Path
         import csv
+
+        def emit(ev, **kw):
+            try:
+                if progress: progress(ev, **kw)
+            except Exception:
+                pass
+
         sheet = Path(sheet_path)
         if not sheet.exists():
             raise FileNotFoundError(sheet)
@@ -77,7 +86,7 @@ class MetaStore:
             ruta = os.path.normcase(os.path.normpath(ruta))
             kws = _split_kws(kws_str)
             if replace_mode == "replace" and ruta not in seen_docs:
-                self.clear_keywords(ruta)  # borra keywords previas sólo 1 vez por doc
+                self.clear_keywords(ruta)
                 stats["replaced_docs"] += 1
             if kws:
                 stats["kws_added"] += self.add_keywords(ruta, kws, source="xlsx", replace=False)
@@ -88,13 +97,18 @@ class MetaStore:
                 stats["docs"] += 1
                 seen_docs.add(ruta)
 
+        # ---------- XLSX ----------
         if sheet.suffix.lower() == ".xlsx":
+            emit("text", text="Abriendo Excel…")
             try:
-                import openpyxl  # lectura streaming si está disponible
+                import openpyxl
             except Exception as e:
                 raise RuntimeError(f"Para .xlsx necesitas openpyxl: {e}")
             wb = openpyxl.load_workbook(str(sheet), read_only=True, data_only=True)
             ws = wb.active
+            # total de filas (sin cabecera)
+            total = max(0, int((ws.max_row or 1) - 1))
+            emit("total", total=total)
             headers = [_norm_header(str(c.value or "")) for c in next(ws.iter_rows(min_row=1, max_row=1))]
             idx = {h: i for i, h in enumerate(headers)}
 
@@ -104,6 +118,8 @@ class MetaStore:
                 v = row[i].value
                 return "" if v is None else str(v)
 
+            done = 0
+            emit("text", text="Importando filas…")
             for row in ws.iter_rows(min_row=2, values_only=False):
                 ruta = _get(row, "ruta") or _get(row, "RUTA")
                 palabras = _get(row, "palabras clave")
@@ -111,28 +127,46 @@ class MetaStore:
                 if ruta:
                     _upsert_row(ruta, palabras, obs)
                     stats["rows"] += 1
-        else:
-            # CSV; autodetecta ; o , y utf-8-sig
-            with open(sheet, "r", encoding="utf-8-sig", newline="") as f:
-                sample = f.read(4096);
-                f.seek(0)
-                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-                r = csv.DictReader(f, dialect=dialect)
-                # normaliza claves a minúsculas
-                for rec in r:
-                    rec_l = {_norm_header(k): (v or "") for k, v in rec.items()}
-                    ruta = rec_l.get("ruta", "") or rec_l.get("path", "")
-                    palabras = rec_l.get("palabras clave", "")
-                    obs = rec_l.get("observaciones", "")
-                    if ruta:
-                        _upsert_row(ruta, palabras, obs)
-                        stats["rows"] += 1
+                    done += 1
+                    if done % max(1, progress_every) == 0:
+                        emit("tick", done=done)
+            emit("tick", done=done)
+            return stats
+
+        # ---------- CSV ----------
+        emit("text", text="Contando filas (CSV)…")
+        # cuenta líneas (sin cabecera)
+        with open(sheet, "r", encoding="utf-8-sig", newline="") as f:
+            total = sum(1 for _ in f)
+        total = max(0, total - 1)
+        emit("total", total=total)
+
+        emit("text", text="Importando filas (CSV)…")
+        with open(sheet, "r", encoding="utf-8-sig", newline="") as f:
+            sample = f.read(4096);
+            f.seek(0)
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+            r = csv.DictReader(f, dialect=dialect)
+            done = 0
+            for rec in r:
+                rec_l = {_norm_header(k): (v or "") for k, v in rec.items()}
+                ruta = rec_l.get("ruta", "") or rec_l.get("path", "")
+                palabras = rec_l.get("palabras clave", "")
+                obs = rec_l.get("observaciones", "")
+                if ruta:
+                    _upsert_row(ruta, palabras, obs)
+                    stats["rows"] += 1
+                    done += 1
+                    if done % max(1, progress_every) == 0:
+                        emit("tick", done=done)
+            emit("tick", done=done)
         return stats
 
     def _ensure_schema(self) -> None:
         with self._lock, self._connect() as conn:
             c = conn.cursor()
-            # Palabras clave
+
+            # Base (se crea si no existe; no rompe si ya existe con más columnas)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS doc_keywords (
                     fullpath   TEXT NOT NULL,
@@ -141,16 +175,29 @@ class MetaStore:
                     created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now','localtime'))
                 )
             """)
-            # índices + unicidad (case-insensitive) vía índice único por expresión
+
+            # --- MIGRACIÓN: añadir columnas que falten en BDs antiguas ---
+            cols = {row[1].lower() for row in c.execute("PRAGMA table_info(doc_keywords)")}
+            if "source" not in cols:
+                c.execute("ALTER TABLE doc_keywords ADD COLUMN source TEXT DEFAULT ''")
+            if "created_at" not in cols:
+                c.execute("""ALTER TABLE doc_keywords
+                             ADD COLUMN created_at TEXT
+                             DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now','localtime'))""")
+
+            # Índices (case-insensitive). El UNIQUE puede fallar si ya hay duplicados → fallback no único.
             c.execute("CREATE INDEX IF NOT EXISTS idx_doc_keywords_fp ON doc_keywords(fullpath)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_doc_keywords_kw ON doc_keywords(keyword)")
-            # UNIQUE por (lower(fullpath), lower(keyword))
-            c.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_keywords_u_expr
-                ON doc_keywords( lower(fullpath), lower(keyword) )
-            """)
+            try:
+                c.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_doc_keywords_u_expr
+                    ON doc_keywords( lower(fullpath), lower(keyword) )
+                """)
+            except sqlite3.OperationalError:
+                # Si existen duplicados ya, al menos dejamos un índice normal para acelerar
+                c.execute("CREATE INDEX IF NOT EXISTS idx_doc_keywords_fp_kw ON doc_keywords(fullpath, keyword)")
 
-            # Observaciones (nota libre por documento)
+            # Observaciones
             c.execute("""
                 CREATE TABLE IF NOT EXISTS doc_notes (
                     fullpath   TEXT PRIMARY KEY,
