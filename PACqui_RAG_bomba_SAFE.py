@@ -3450,25 +3450,20 @@ class LLMChatDialog(tk.Toplevel):
     - Streaming con fallbacks.
     - Inyección de contexto RAG (self.app._retrieve_context) en cada turno.
     """
-    def __init__(self, master, app):
+
+    def __init__(self, master, app=None):
         super().__init__(master)
-        self.title("PACqui — Asistente LLM (local)")
-        self.transient(master); self.resizable(True, True); self.grab_set()
-        self.geometry("860x680")
-        self.app = app
-        self._fuentes_panel = None
-        self._fuentes_count = 0
-
-        # Estado LLM
-        self.model = None
-        self.model_path = getattr(app, "llm_model_path", "") or ""
-        self.stop_event = threading.Event()
-        self._stream_thread = None
-
-        self.messages = []
-        self._in_stream = False
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        try:
+            self.withdraw()
+        except Exception:
+            pass
+        messagebox.showinfo(APP_NAME,
+                            "El Asistente LLM ahora está integrado en:\n\nAdmin → Asistente (backend)\n\n"
+                            "Usa esa pestaña para chatear, cargar índice y gestionar fuentes.")
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     # ---------------- UI ----------------
     def _build_ui(self):

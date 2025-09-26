@@ -2,6 +2,9 @@
 import os, json, threading, tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
+from meta_store import MetaStore
+from ui_fuentes import SourcesPanel
+
 
 from PACqui_FrontApp_v1b import (
     APP_NAME, DEFAULT_DB, DataAccess, ChatFrame,
@@ -87,6 +90,46 @@ class AdminPanel(ttk.Notebook):
         ttk.Label(t1, text="Panel de administración", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Button(t1, text="Abrir herramientas clásicas (Carpeta base…)", command=self._open_legacy).pack(anchor="w", pady=(6,0))
 
+        # --- NUEVA PESTAÑA: Asistente (backend) ---
+        tA = ttk.Frame(self, padding=12)
+        self.add(tA, text="Asistente (backend)")
+
+        # Barra superior: cargar índice + abrir fuentes
+        bar = ttk.Frame(tA); bar.pack(fill="x")
+        ttk.Button(bar, text="Cargar índice (Excel/CSV)…", command=self._import_index_sheet).pack(side="left")
+        self.btn_fuentes = ttk.Button(bar, text="Fuentes (0)", command=self._open_fuentes_panel, state="disabled")
+        self.btn_fuentes.pack(side="left", padx=8)
+
+        # Asistente embebido (reutiliza ChatWithLLM con el modelo backend)
+        self.asst = ChatWithLLM(tA, self.app.data, self.app.llm)
+        self.asst.pack(fill="both", expand=True)
+        # --- NUEVO: cargar chips al abrir la pestaña y sincronizar el botón "Fuentes (n)" también para búsquedas por chip ---
+        try:
+            self.asst._load_chips()  # rellena los chips a la izquierda con las keywords del índice
+        except Exception:
+            pass
+
+        # Cuando el usuario usa chips o "Buscar palabra clave…", se llama a _populate_sources:
+        if hasattr(self.asst, "_populate_sources"):
+            _orig_pop = self.asst._populate_sources
+            def _pop_and_update(text: str):
+                _orig_pop(text)
+                hits = getattr(self.asst, "_hits", []) or []
+                n = len(hits)
+                self.btn_fuentes.configure(text=f"Fuentes ({n})", state=("normal" if n else "disabled"))
+            self.asst._populate_sources = _pop_and_update
+
+
+        # Al enviar, refrescamos el contador de fuentes (n) del botón
+        _orig_send = self.asst._send_llm
+        def _send_and_update():
+            _orig_send()
+            hits = getattr(self.asst, "_hits", []) or []
+            n = len(hits)
+            self.btn_fuentes.configure(text=f"Fuentes ({n})", state=("normal" if n else "disabled"))
+        self.asst._send_llm = _send_and_update
+
+
         # Tab modelo backend
         t2 = ttk.Frame(self, padding=12); self.add(t2, text="Modelo (backend)")
         frm = ttk.Frame(t2); frm.pack(anchor="w", fill="x")
@@ -135,6 +178,165 @@ class AdminPanel(ttk.Notebook):
         except Exception as e:
             messagebox.showerror(APP_NAME, f"No se pudo cargar el modelo:\n{e}")
 
+
+    # --- ÍNDICE: importar Excel/CSV a SQLite (doc_keywords + doc_notes) ---
+    def _import_index_sheet(self):
+        from meta_store import MetaStore
+        from tkinter import filedialog, messagebox, ttk
+        import tkinter as tk
+
+        p = filedialog.askopenfilename(
+            parent=self,
+            title="Importar índice (Excel/CSV)",
+            filetypes=[("Excel/CSV", "*.xlsx *.csv"), ("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
+        )
+        if not p:
+            return
+
+        # Merge vs Replace
+        r = messagebox.askyesnocancel(
+            APP_NAME,
+            "¿Quieres REEMPLAZAR (Sí) las palabras clave/observaciones de los documentos que aparezcan en el archivo,\n"
+            "o MEZCLAR (No) añadiendo las nuevas sin borrar las existentes?\n\n"
+            "Sí = REEMPLAZAR  ·  No = MEZCLAR  ·  Cancelar = Abortar",
+            parent=self
+        )
+        if r is None:
+            return
+        replace_mode = "replace" if r else "merge"
+
+        # Diálogo de progreso
+        top = tk.Toplevel(self); top.title("Importando índice…")
+        top.transient(self); top.grab_set()
+        frm = ttk.Frame(top, padding=12); frm.pack(fill="both", expand=True)
+        lbl = ttk.Label(frm, text="Preparando…"); lbl.pack(anchor="w")
+        pb = ttk.Progressbar(frm, mode="indeterminate", length=380); pb.pack(fill="x", pady=(8, 0))
+        pb.start(12)
+        top.update_idletasks()
+
+        # --- helpers definidos ANTES del worker ---
+        def _close_top():
+            try: pb.stop()
+            except Exception: pass
+            try: top.destroy()
+            except Exception: pass
+
+        def _progress(ev, **kw):
+            # callbacks de MetaStore.import_index_sheet
+            if ev == "text":
+                lbl.config(text=str(kw.get("text", "")))
+            elif ev == "total":
+                try:
+                    total = int(kw.get("total") or 0)
+                    if total > 0:
+                        pb.config(mode="determinate", maximum=total, value=0)
+                        lbl.config(text="Importando filas…")
+                except Exception:
+                    pass
+            elif ev == "tick":
+                try:
+                    pb.config(mode="determinate")
+                    pb["value"] = int(kw.get("done") or 0)
+                except Exception:
+                    pass
+
+        # --- IMPORTACIÓN EN HILO: capturamos TODO como args por defecto ---
+        def worker(replace_mode=replace_mode, progress_cb=_progress, close_top=_close_top, path=p):
+            try:
+                store = MetaStore(self.app.data.db_path)
+                stats = store.import_index_sheet(path, replace_mode=replace_mode,
+                                                 progress=progress_cb, progress_every=250)
+
+                # 1) refrescar chips
+                self.after(0, lambda: getattr(self, "asst", None) and self.asst._load_chips())
+
+                # 2) auto-demo: lanzar primera keyword top para ver Fuentes al instante
+                def _auto_demo():
+                    try:
+                        klist = self.app.data.keywords_top(limit=1)
+                        if klist:
+                            self.asst._chip_click(klist[0][0])
+                    except Exception:
+                        pass
+                self.after(0, _auto_demo)
+
+                # 3) pie de estado + aviso
+                self.after(0, self.app._refresh_footer)
+                self.after(0, lambda: messagebox.showinfo(
+                    APP_NAME,
+                    "Índice importado correctamente.\n\n"
+                    f"Filas: {stats.get('rows',0)}  ·  Docs: {stats.get('docs',0)}  ·  "
+                    f"Kws añadidas: {stats.get('kws_added',0)}  ·  Notas: {stats.get('notes_set',0)}",
+                    parent=self
+                ))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error importando índice:\n{e}", parent=self))
+            finally:
+                self.after(0, close_top)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+
+    # --- ÍNDICE: exportar Excel/CSV masivo desde una carpeta base ---
+    def _export_index(self):
+        from export_massive import run_export_ui
+        from tkinter import filedialog, messagebox
+
+        base = filedialog.askdirectory(parent=self, title="Selecciona la CARPETA BASE a exportar", mustexist=True)
+        if not base:
+            return
+
+        ok, out_path = run_export_ui(self, base_path=base, db_path=self.app.data.db_path, prefer_xlsx=True)
+        if ok:
+            messagebox.showinfo(APP_NAME, f"Índice exportado a:\n{out_path}", parent=self)
+        else:
+            messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{out_path}", parent=self)
+
+    def _open_fuentes_panel(self):
+        """Abre la ventana de Fuentes con los últimos hits del asistente embebido."""
+        hits = getattr(self.asst, "_hits", []) or []
+        if not hits:
+            messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.",
+                                parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Fuentes — PACqui")
+        win.geometry("980x640")
+
+        try:
+            pan = SourcesPanel(win, db_path=str(self.app.data.db_path))
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudo abrir el panel de fuentes:\n{e}", parent=self)
+            win.destroy()
+            return
+
+        pan.pack(fill="both", expand=True)
+
+        # Intento principal
+        try:
+            pan.update_sources(hits)
+            return
+        except Exception:
+            pass
+
+        # Fallback si la estructura de 'hits' difiere
+        safe = []
+        for h in hits:
+            safe.append({
+                "path": h.get("path", ""),
+                "name": h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)",
+                "note": h.get("note", ""),
+                "keywords": h.get("keywords", "")
+            })
+        try:
+            pan.update_sources(safe)
+        except Exception:
+            # Si aun así falla, no rompemos la ventana
+            pass
+
+
 class ChatWithLLM(ChatFrame):
     def __init__(self, master, data: DataAccess, llm: LLMService):
         self.llm = llm
@@ -167,6 +369,84 @@ class ChatWithLLM(ChatFrame):
                 pass
         except Exception:
             pass
+
+    def _import_index_sheet(self):
+        """Importa un índice Excel/CSV a SQLite (doc_keywords/doc_notes)."""
+        p = filedialog.askopenfilename(
+            title="Importar índice (Excel/CSV)",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("CSV", "*.csv"), ("Todos", "*.*")]
+        )
+        if not p:
+            return
+        # Pequeña ventana de progreso indeterminado
+        top = tk.Toplevel(self); top.title("Importando índice…")
+        ttk.Label(top, text="Importando índice a la base de datos…").pack(padx=12, pady=(12, 6))
+        pb = ttk.Progressbar(top, mode="indeterminate"); pb.pack(fill="x", padx=12, pady=(0, 12)); pb.start(60)
+        top.update_idletasks()
+
+        def worker():
+            try:
+                store = MetaStore(self.app.data.db_path)
+                stats = store.import_index_sheet(p, replace_mode=replace_mode, progress=_progress, progress_every=250)
+
+                # --- NUEVO: refrescar chips tras importar
+                self.after(0, lambda: getattr(self, "asst", None) and self.asst._load_chips())
+
+                # --- NUEVO: auto-demo → lanza la primera keyword top para rellenar 'Fuentes sugeridas'
+                def _auto_demo():
+                    try:
+                        klist = self.app.data.keywords_top(limit=1)
+                        if klist:
+                            # simula un clic de chip → rellena tabla de la derecha y actualiza "Fuentes (n)"
+                            self.asst._chip_click(klist[0][0])
+                    except Exception:
+                        pass
+                self.after(0, _auto_demo)
+
+                # refresca pie y avisa
+                self.after(0, self.app._refresh_footer)
+                self.after(0, lambda: messagebox.showinfo(
+                    APP_NAME,
+                    "Índice importado correctamente.\n\n"
+                    f"Filas: {stats.get('rows',0)}  ·  Docs: {stats.get('docs',0)}  ·  "
+                    f"Kws añadidas: {stats.get('kws_added',0)}  ·  Notas: {stats.get('notes_set',0)}",
+                    parent=self
+                ))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error importando índice:\n{e}", parent=self))
+            finally:
+                self.after(0, _close_top)
+
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_fuentes_panel(self):
+        """Abre la ventana de Fuentes usando los hits de ESTE chat."""
+        hits = getattr(self, "_hits", []) or []
+        if not hits:
+            messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.")
+            return
+        win = tk.Toplevel(self)
+        win.title("Fuentes — PACqui")
+        win.geometry("980x640")
+        pan = SourcesPanel(win, db_path=str(getattr(self.data, "db_path", "") or ""))  # usa self.data
+        pan.pack(fill="both", expand=True)
+
+        try:
+            pan.update_sources(hits)
+        except Exception:
+            safe = []
+            for h in hits or []:
+                safe.append({
+                    "path": h.get("path", ""),
+                    "name": h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)",
+                    "note": h.get("note", ""),
+                    "keywords": h.get("keywords", "")
+                })
+            try:
+                pan.update_sources(safe)
+            except Exception:
+                pass
 
     def _spinner_stop(self):
         try:

@@ -80,22 +80,57 @@ class MetaStore:
         stats = {"rows": 0, "docs": 0, "kws_added": 0, "notes_set": 0, "replaced_docs": 0}
         seen_docs = set()
 
+        # --- AUTOKW: genera palabras clave a partir de la ruta si no vienen en el Excel/CSV ---
+        import re as _re
+        def _auto_kws_from_path(ruta: str) -> list[str]:
+            try:
+                base = os.path.splitext(os.path.basename(ruta))[0]
+                folder = os.path.basename(os.path.dirname(ruta))
+                toks = set()
+                for s in (base, folder):
+                    for t in _re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", s or ""):
+                        toks.add(t.lower())
+                toks = [t for t in toks if len(t) >= 3]
+                # Limita a 12 términos útiles para no ensuciar la DB
+                return toks[:12]
+            except Exception:
+                return []
+
+
         def _upsert_row(ruta: str, kws_str: str, note: str):
             nonlocal stats
-            if not ruta: return
+            if not ruta:
+                return
             ruta = os.path.normcase(os.path.normpath(ruta))
+
+            # 1) keywords del Excel/CSV
             kws = _split_kws(kws_str)
+
+            # 2) si no hay, AUTOKW por nombre de archivo/carpeta
+            from_excel = bool(kws)
+            if not kws:
+                kws = _auto_kws_from_path(ruta)
+
+            # 3) replace_mode → borra previas solo 1ª vez que aparece el doc
             if replace_mode == "replace" and ruta not in seen_docs:
                 self.clear_keywords(ruta)
                 stats["replaced_docs"] += 1
+
+            # 4) inserta keywords (marca origen)
             if kws:
-                stats["kws_added"] += self.add_keywords(ruta, kws, source="xlsx", replace=False)
-            if note and note.strip():
-                self.set_note(ruta, note.strip())
+                src = "import" + (":excel" if from_excel else ":auto")
+                stats["kws_added"] += self.add_keywords(ruta, kws, source=src, replace=False)
+
+            # 5) observaciones
+            if note and str(note).strip():
+                self.set_note(ruta, str(note).strip())
                 stats["notes_set"] += 1
+
+            # 6) contadores de docs únicos
             if ruta not in seen_docs:
                 stats["docs"] += 1
                 seen_docs.add(ruta)
+
 
         # ---------- XLSX ----------
         if sheet.suffix.lower() == ".xlsx":
