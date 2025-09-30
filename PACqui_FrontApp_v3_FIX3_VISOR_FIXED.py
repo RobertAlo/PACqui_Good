@@ -1,5 +1,7 @@
 
 import os, json, threading, tkinter as tk
+import time
+from datetime import datetime
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from meta_store import MetaStore
@@ -189,33 +191,72 @@ def _save_cfg(d: dict):
     CONFIG_PATH.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
 
 class AppRoot(tk.Tk):
+
     def __init__(self, db_path=None):
         super().__init__()
         self.title(f"{APP_NAME} — PAC QUestioning Inference")
         self.geometry("1180x760")
-        try: self.call("tk", "scaling", 1.25)
-        except Exception: pass
+        try:
+            self.call("tk", "scaling", 1.25)
+        except Exception:
+            pass
 
         self._is_admin = False
         self.data = DataAccess(db_path or DEFAULT_DB)
         self.llm = LLMService(self.data.db_path)
 
-        top = ttk.Frame(self, padding=(10,10,10,6)); top.pack(fill="x")
-        ttk.Label(top, text="PACqui", font=("Segoe UI", 16, "bold")).pack(side="left")
-        self.lbl_model = ttk.Label(top, text="Modelo: (no cargado)"); self.lbl_model.pack(side="right")
-        self.btn_lock = ttk.Button(top, text="🔒 Admin", command=self._toggle_admin); self.btn_lock.pack(side="right", padx=(0,8))
-        ttk.Button(top, text="Visor", command=self._open_viewer).pack(side="right", padx=(0,8))
-        ttk.Button(top, text="Ayuda", command=lambda: messagebox.showinfo(APP_NAME, "El modelo se gestiona en Admin › Modelo (backend).")).pack(side="right", padx=(0,8))
+        # --- Event bus (ring buffer de 500 eventos) ---
+        self._events = []
+        self._event_listeners = []
 
-        self.stack = ttk.Frame(self); self.stack.pack(fill="both", expand=True)
-        self.chat = ChatWithLLM(self.stack, self.data, self.llm); self.chat.pack(fill="both", expand=True)
+        # --- UI PRINCIPAL (estaba dentro de subscribe_events por error) ---
+        top = ttk.Frame(self, padding=(10, 10, 10, 6))
+        top.pack(fill="x")
+        ttk.Label(top, text="PACqui", font=("Segoe UI", 16, "bold")).pack(side="left")
+        self.lbl_model = ttk.Label(top, text="Modelo: (no cargado)")
+        self.lbl_model.pack(side="right")
+        self.btn_lock = ttk.Button(top, text="🔒 Admin", command=self._toggle_admin)
+        self.btn_lock.pack(side="right", padx=(0, 8))
+        ttk.Button(top, text="Visor", command=self._open_viewer).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            top, text="Ayuda",
+            command=lambda: messagebox.showinfo(
+                APP_NAME, "El modelo se gestiona en Admin › Modelo (backend)."
+            )
+        ).pack(side="right", padx=(0, 8))
+
+        self.stack = ttk.Frame(self)
+        self.stack.pack(fill="both", expand=True)
+
+        # Nota: pasamos app=self (aunque tu __init__ ya hace fallback al toplevel)
+        self.chat = ChatWithLLM(self.stack, self.data, self.llm, app=self)
+        self.chat.pack(fill="both", expand=True)
         self.admin = None
 
-        self.footer = ttk.Label(self, anchor="w"); self.footer.pack(fill="x", padx=10, pady=(4,6))
+        self.footer = ttk.Label(self, anchor="w")
+        self.footer.pack(fill="x", padx=10, pady=(4, 6))
         self._refresh_footer()
 
         ensure_admin_password(self)
         self._autoload_model()
+
+    def _log(self, typ: str, **data):
+        ev = {"ts": time.time(), "type": typ}
+        ev.update(data or {})
+        self._events.append(ev)
+        self._events = self._events[-500:]
+        for fn in list(self._event_listeners):
+            try:
+                fn(ev)
+            except Exception:
+                pass
+
+    def events_snapshot(self):
+        return list(self._events)
+
+    def subscribe_events(self, callback):
+        self._event_listeners.append(callback)
+
 
     def _autoload_model(self):
         cfg = _load_cfg()
@@ -403,12 +444,180 @@ class AdminPanel(ttk.Notebook):
         frm.columnconfigure(1, weight=1)
 
         # Tab logs
-        t3 = ttk.Frame(self, padding=12); self.add(t3, text="Logs y estado")
-        ttk.Label(t3, text="(Próximo) Estado del índice y RAG.").pack(anchor="w")
+        # Tab logs
+        t3 = ttk.Frame(self, padding=10); self.add(t3, text="Logs y estado")
+        self._build_logs_tab(t3)
 
         # Tab zona peligrosa
         t4 = ttk.Frame(self, padding=12); self.add(t4, text="Zona peligrosa")
         ttk.Label(t4, text="(Próximo) Reset de configuración, vaciados, etc.").pack(anchor="w")
+
+    # ---------- LOGS TAB ----------
+    def _build_logs_tab(self, parent):
+        root = self.app
+
+        cols = ttk.Panedwindow(parent, orient="horizontal"); cols.pack(fill="both", expand=True)
+
+        # IZQUIERDA: Estado índice + modelo + top keywords
+        left = ttk.Frame(cols, padding=6); cols.add(left, weight=1)
+        ttk.Label(left, text="Estado del índice", style="Header.TLabel").pack(anchor="w")
+        self.lbl_idx = ttk.Label(left, text="–"); self.lbl_idx.pack(anchor="w", pady=(0,6))
+
+        ttk.Label(left, text="Estado del modelo", style="Header.TLabel").pack(anchor="w", pady=(6,0))
+        self.lbl_llm = ttk.Label(left, text="–"); self.lbl_llm.pack(anchor="w", pady=(0,6))
+
+        ttk.Label(left, text="Top keywords", style="Header.TLabel").pack(anchor="w", pady=(6,0))
+        self.tv_top = ttk.Treeview(left, columns=("kw","cnt"), show="headings", height=10)
+        self.tv_top.heading("kw", text="keyword"); self.tv_top.heading("cnt", text="n")
+        self.tv_top.column("kw", width=220); self.tv_top.column("cnt", width=40, anchor="e")
+        self.tv_top.pack(fill="both", expand=False, pady=(2,6))
+
+        # CENTRO: consola de eventos
+        center = ttk.Frame(cols, padding=6); cols.add(center, weight=3)
+        bar = ttk.Frame(center); bar.pack(fill="x")
+        ttk.Button(bar, text="Refrescar", command=self._refresh_logs_tab).pack(side="left")
+        ttk.Button(bar, text="Exportar log…", command=self._export_log).pack(side="left", padx=6)
+        ttk.Button(bar, text="Limpiar", command=self._clear_log).pack(side="left")
+        self.txt_log = tk.Text(center, height=20, wrap="none", font=("Consolas", 10))
+        vs = ttk.Scrollbar(center, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=vs.set)
+        self.txt_log.pack(side="left", fill="both", expand=True); vs.pack(side="left", fill="y")
+
+        # DERECHA: diagnóstico RAG
+        right = ttk.Frame(cols, padding=6); cols.add(right, weight=1)
+        ttk.Label(right, text="Diagnóstico rápido", style="Header.TLabel").pack(anchor="w")
+        self.var_diag = tk.StringVar()
+        ttk.Entry(right, textvariable=self.var_diag, width=28).pack(anchor="w", pady=(2,4))
+        ttk.Button(right, text="Probar recuperación", command=self._run_diag).pack(anchor="w")
+
+        ttk.Label(right, text="Huecos del índice", style="Header.TLabel").pack(anchor="w", pady=(10,0))
+        ttk.Button(right, text="Docs sin observaciones", command=self._list_docs_without_notes).pack(anchor="w")
+
+        # Suscripción a eventos
+        try:
+            root.subscribe_events(self.on_new_event)
+        except Exception:
+            pass
+
+        self._refresh_logs_tab()
+
+    def _refresh_logs_tab(self):
+        # 1) Estado del índice
+        try:
+            tables, kw, notes = self.app.data.stats()
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                cur.execute("SELECT COUNT(DISTINCT lower(fullpath)) FROM doc_keywords")
+                docs_kw = cur.fetchone()[0] or 0
+                cur.execute("SELECT COUNT(DISTINCT lower(fullpath)) FROM doc_notes")
+                docs_note = cur.fetchone()[0] or 0
+            cov = f"{(100.0*docs_note/max(1,docs_kw)):.1f}%"
+            self.lbl_idx.config(text=f"tablas={tables} · keywords={kw} · notas={notes} · docs_kw={docs_kw} · docs_con_nota={docs_note} ({cov})")
+        except Exception as e:
+            self.lbl_idx.config(text=f"(error índice: {e})")
+
+        # 2) Estado del modelo
+        try:
+            llm = self.app.llm
+            if llm and llm.is_loaded():
+                mp = Path(getattr(llm, "model_path", "") or "").name
+                self.lbl_llm.config(text=f"{mp or '(desconocido)'} · ctx={llm.ctx} · th={llm.threads} · batch={llm.n_batch}")
+            else:
+                self.lbl_llm.config(text="(no cargado)")
+        except Exception as e:
+            self.lbl_llm.config(text=f"(error modelo: {e})")
+
+        # 3) Top keywords
+        for iid in self.tv_top.get_children():
+            self.tv_top.delete(iid)
+        try:
+            for kw, cnt in (self.app.data.keywords_top(limit=20) or []):
+                self.tv_top.insert("", "end", values=(kw, cnt))
+        except Exception:
+            pass
+
+        # 4) Volcar eventos actuales
+        self._reload_console(self.app.events_snapshot())
+
+    def _reload_console(self, events):
+        self.txt_log.config(state="normal"); self.txt_log.delete("1.0","end")
+        for ev in events[-200:]:
+            self._append_console_line(ev)
+        self.txt_log.config(state="disabled"); self.txt_log.see("end")
+
+    def on_new_event(self, ev):
+        try:
+            self.txt_log.config(state="normal")
+            self._append_console_line(ev)
+            self.txt_log.config(state="disabled"); self.txt_log.see("end")
+        except Exception:
+            pass
+
+    def _append_console_line(self, ev):
+        ts = datetime.fromtimestamp(ev.get("ts", time.time())).strftime("%H:%M:%S")
+        typ = ev.get("type","evt")
+        detail = {k:v for k,v in ev.items() if k not in ("ts","type")}
+        self.txt_log.insert("end", f"[{ts}] {typ}: {detail}\n")
+
+    def _export_log(self):
+        p = filedialog.asksaveasfilename(parent=self, title="Exportar log", defaultextension=".txt",
+                                         filetypes=[("Texto","*.txt"),("Todos","*.*")])
+        if not p: return
+        try:
+            with open(p,"w",encoding="utf-8") as f:
+                for ev in self.app.events_snapshot():
+                    ts = datetime.fromtimestamp(ev.get("ts", time.time())).isoformat(timespec="seconds")
+                    f.write(f"{ts}  {ev.get('type')}  { {k:v for k,v in ev.items() if k not in ('ts','type')} }\n")
+            messagebox.showinfo(APP_NAME, f"Log exportado a:\n{p}", parent=self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{e}", parent=self)
+
+    def _clear_log(self):
+        self.app._events.clear()
+        self._reload_console([])
+
+    def _run_diag(self):
+        q = (self.var_diag.get() or "").strip()
+        if not q:
+            messagebox.showinfo(APP_NAME, "Escribe una consulta de prueba.", parent=self); return
+        t0 = time.time()
+        try:
+            hits = self.app.llm._index_hits(q, top_k=8, max_note_chars=240) or []
+        except Exception as e:
+            hits = []
+            messagebox.showerror(APP_NAME, f"Error en recuperación:\n{e}", parent=self)
+        dt = time.time() - t0
+        con_nota = sum(1 for h in hits if (h.get("note") or "").strip())
+        self.app._log("diag", query=q, hits=len(hits), con_nota=con_nota, ms=int(dt*1000))
+        self._refresh_logs_tab()
+
+    def _list_docs_without_notes(self):
+        rows=[]
+        try:
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                cur.execute("""
+                    SELECT lower(k.fullpath) AS path, MIN(k.keyword)
+                    FROM doc_keywords k
+                    LEFT JOIN doc_notes n ON lower(n.fullpath)=lower(k.fullpath)
+                    WHERE n.fullpath IS NULL
+                    GROUP BY lower(k.fullpath)
+                    ORDER BY path
+                    LIMIT 500
+                """)
+                rows = cur.fetchall()
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"SQL error:\n{e}", parent=self); return
+        if not rows:
+            messagebox.showinfo(APP_NAME, "¡Todo tiene observaciones! 💪", parent=self); return
+        top = tk.Toplevel(self); top.title("Docs sin observaciones"); top.geometry("900x500")
+        tv = ttk.Treeview(top, columns=("path","kw"), show="headings")
+        tv.heading("path","text"); tv.heading("kw","text")
+        tv.column("path", width=700); tv.column("kw", width=160)
+        tv.pack(fill="both", expand=True)
+        for path, kw in rows:
+            tv.insert("", "end", values=(path, kw or ""))
+
 
     def _open_legacy(self):
         try:
@@ -445,6 +654,12 @@ class AdminPanel(ttk.Notebook):
             self.app.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
             cfg = _load_cfg(); cfg["model_path"]=mp; cfg["model_ctx"]=ctx; _save_cfg(cfg)
             messagebox.showinfo(APP_NAME, "Modelo cargado en backend.")
+            self.app._log("model_loaded",
+                          model=os.path.basename(mp),
+                          ctx=ctx,
+                          threads=self.app.llm.threads,
+                          batch=self.app.llm.n_batch)
+
         except Exception as e:
             messagebox.showerror(APP_NAME, f"No se pudo cargar el modelo:\n{e}")
 
@@ -529,6 +744,19 @@ class AdminPanel(ttk.Notebook):
                     except Exception:
                         pass
                 self.after(0, _auto_demo)
+                # 2.5) logging del evento de importación
+                try:
+                    self.app._log(
+                        "index_import",
+                        path=path,
+                        rows=stats.get("rows", 0),
+                        docs=stats.get("docs", 0),
+                        kws_added=stats.get("kws_added", 0),
+                        notes_set=stats.get("notes_set", 0)
+                    )
+                except Exception:
+                    pass
+
 
                 # 3) pie de estado + aviso
                 self.after(0, self.app._refresh_footer)
@@ -614,10 +842,10 @@ class AdminPanel(ttk.Notebook):
             # Si aun así falla, no rompemos la ventana
             pass
 
-
 class ChatWithLLM(ChatFrame):
-    def __init__(self, master, data: DataAccess, llm: LLMService):
+    def __init__(self, master, data: DataAccess, llm: LLMService, app=None):
         self.llm = llm
+        self.app = app or master.winfo_toplevel()  # <— referencia al AppRoot
         self.notes_only = False  # usamos saludo LLM + observaciones/rutas deterministas
         super().__init__(master, data)
 
@@ -880,6 +1108,28 @@ class ChatWithLLM(ChatFrame):
             self._fill_sources_tree(hits)
         except Exception:
             pass
+
+        # --- LOG de la consulta del asistente (hits, hits con nota, tokens usuario, ctx, etc.) ---
+        try:
+            tok_user = self.llm.count_tokens(text)
+        except Exception:
+            tok_user = len(text)
+
+        try:
+            # self.app se añade en el punto 5
+            if getattr(self, "app", None):
+                self.app._log(
+                    "assistant_reply",
+                    query=text,
+                    hits=len(hits or []),
+                    hits_con_nota=sum(1 for h in (hits or []) if (h.get('note') or '').strip()),
+                    tok_user=tok_user,
+                    ctx=self.llm.ctx,
+                    llm=self.llm.is_loaded()
+                )
+        except Exception:
+            pass
+
 
         # 2) Construye bloques deterministas (observaciones + rutas)
         obs_block, rutas_block, used_hits = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
