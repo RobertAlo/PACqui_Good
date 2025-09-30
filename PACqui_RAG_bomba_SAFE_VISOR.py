@@ -517,9 +517,10 @@ class OrganizadorFrame(ttk.Frame):
                 pass
 
     # ============================ INIT ============================
-    def __init__(self, master):
+    def __init__(self, master, visor_mode: bool = False):
         super().__init__(master)
         self.master = master
+        self.visor_mode = bool(visor_mode)
 
         # Estado
         self.queue = queue.Queue()
@@ -533,6 +534,18 @@ class OrganizadorFrame(ttk.Frame):
         # Carga configuración y UI
         self._load_config()
         self._make_layout()
+        # aplica modo visor si procede
+        if getattr(self, 'visor_mode', False):
+            for _name in ('btn_llm','btn_scraper','chk_dry_bot'):
+                try:
+                    _w = getattr(self, _name, None)
+                    if _w:
+                        if hasattr(_w, 'grid_remove'):
+                            _w.grid_remove()
+                        elif hasattr(_w, 'pack_forget'):
+                            _w.pack_forget()
+                except Exception:
+                    pass
         self._update_buttons_state()
 
         # Eventos

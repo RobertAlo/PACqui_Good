@@ -11,6 +11,169 @@ from PACqui_FrontApp_v1b import (
     ensure_admin_password, admin_login
 )
 from pacqui_llm_service_FIX3 import LLMService
+# --- Robust import of organizer module + auto-patch index-context ---
+
+# ---- Carga del Organizador por ruta fija (sin ruidos) ----
+def _import_organizador():
+    """
+    Carga el módulo del Visor aceptando dos nombres:
+    - PACqui_RAG_bomba_SAFE.py
+    - PACqui_RAG_bomba_SAFE_VISOR.py
+    Busca junto al front y en la carpeta padre, archivo .py o paquete (__init__.py).
+    """
+    import importlib, importlib.util, sys, os
+
+    primary = "PACqui_RAG_bomba_SAFE"
+    alt = "PACqui_RAG_bomba_SAFE_VISOR"
+
+    # 1) Import normal por nombre de módulo (por si ya está en sys.path)
+    for name in (primary, alt):
+        try:
+            return importlib.import_module(name)
+        except Exception:
+            pass
+
+    # 2) Búsqueda controlada en ubicaciones conocidas (sin escanear disco)
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [here, os.path.dirname(here)]
+    candidates = []
+    for root in roots:
+        for base in (primary, alt):
+            candidates.append(os.path.join(root, f"{base}.py"))
+            candidates.append(os.path.join(root, base, "__init__.py"))
+
+    # 3) Cargar por ruta si existe alguno
+    for path in candidates:
+        if os.path.exists(path):
+            name = alt if "SAFE_VISOR" in os.path.basename(path) else primary
+            spec = importlib.util.spec_from_file_location(name, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)  # type: ignore
+            return mod
+
+    # 4) Error claro si no se encontró ninguno
+    raise ImportError(
+        "No encontré el visor: acepta 'PACqui_RAG_bomba_SAFE.py' o 'PACqui_RAG_bomba_SAFE_VISOR.py' "
+        "en esta carpeta o en la carpeta padre (también vale como paquete con __init__.py)."
+    )
+
+
+# ---- Carga del patch del índice y log “RAG monkey…” ----
+def _import_rag_patch():
+    """
+    Importa pacqui_index_context_patch desde módulo o por ruta (junto al front o en la carpeta padre).
+    El módulo se auto-aplica al importar. Imprime el log de compatibilidad.
+    """
+    import importlib, importlib.util, sys, os
+    name = "pacqui_index_context_patch"
+    try:
+        mod = importlib.import_module(name)
+        print("RAG monkey-patch listo: OK")
+        return mod
+    except Exception:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [here, os.path.dirname(here)]
+    for root in roots:
+        path = os.path.join(root, "pacqui_index_context_patch.py")
+        if os.path.exists(path):
+            spec = importlib.util.spec_from_file_location(name, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)  # type: ignore
+            print("RAG monkey-patch listo: OK")
+            return mod
+
+    # Si no existe, no bloqueamos el visor
+    print("RAG monkey-patch: SKIPPED (no encontrado)")
+    return None
+
+# --- Activación diferida del RAG monkey-patch (solo cuando haga falta) ---
+_RAG_READY = False
+
+def _ensure_rag_patch():
+    """Activa el RAG monkey-patch solo una vez y solo cuando se necesite."""
+    global _RAG_READY
+    if _RAG_READY:
+        return
+    try:
+        _import_rag_patch()
+        _RAG_READY = True
+    except Exception as e:
+        print(f"[PACqui] RAG monkey-patch omitido: {e}")
+
+
+def _ensure_organizador_loaded():
+    """
+    Carga PACqui_RAG_bomba_SAFE sin escanear todo el disco:
+    - Import directo si ya está en sys.path
+    - Busca SOLO en ubicaciones conocidas (env var + script dir + cwd + hasta 3 padres)
+      en formato archivo (.py) o paquete (__init__.py).
+    - Si no se encuentra, añade esas raíces a sys.path y reintenta.
+    """
+    import importlib, importlib.util, sys, os
+
+    modname = "PACqui_RAG_bomba_SAFE"
+
+    # 1) Intento directo
+    try:
+        return importlib.import_module(modname)
+    except Exception:
+        pass
+
+    # 2) Raíces candidatas (no recursivo para evitar cuelgues)
+    roots = []
+    env = os.getenv("PACQUI_ORG_PATH")
+    if env and os.path.exists(env):
+        roots.append(env)
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots.append(here)
+    roots.append(os.getcwd())
+    # hasta 3 padres
+    p = here
+    for _ in range(3):
+        p = os.path.dirname(p)
+        if p and p not in roots:
+            roots.append(p)
+
+    # 3) Probar archivos directos
+    # 3) Probar archivos directos
+    candidates = []
+    for root in roots:
+        for rel in (
+            "PACqui_RAG_bomba_SAFE.py",
+            os.path.join("PACqui_RAG_bomba_SAFE", "__init__.py"),
+            "PACqui_RAG_bomba_SAFE_VISOR.py",
+            os.path.join("PACqui_RAG_bomba_SAFE_VISOR", "__init__.py"),
+        ):
+            cand = os.path.join(root, rel)
+            if os.path.exists(cand):
+                candidates.append(cand)
+
+
+    for cand in candidates:
+        try:
+            spec = importlib.util.spec_from_file_location(modname, cand)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[modname] = mod
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)  # type: ignore
+            return mod
+        except Exception:
+            continue
+
+    # 4) Último intento: añadir raíces al sys.path y reimportar
+    for root in roots:
+        if root not in sys.path:
+            sys.path.append(root)
+    return importlib.import_module(modname)  # si falla, lanzará ImportError con detalle
+# Preload organizer and apply the index-context patch
+
 
 CONFIG_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "PACqui"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,6 +204,7 @@ class AppRoot(tk.Tk):
         ttk.Label(top, text="PACqui", font=("Segoe UI", 16, "bold")).pack(side="left")
         self.lbl_model = ttk.Label(top, text="Modelo: (no cargado)"); self.lbl_model.pack(side="right")
         self.btn_lock = ttk.Button(top, text="🔒 Admin", command=self._toggle_admin); self.btn_lock.pack(side="right", padx=(0,8))
+        ttk.Button(top, text="Visor", command=self._open_viewer).pack(side="right", padx=(0,8))
         ttk.Button(top, text="Ayuda", command=lambda: messagebox.showinfo(APP_NAME, "El modelo se gestiona en Admin › Modelo (backend).")).pack(side="right", padx=(0,8))
 
         self.stack = ttk.Frame(self); self.stack.pack(fill="both", expand=True)
@@ -55,13 +219,32 @@ class AppRoot(tk.Tk):
 
     def _autoload_model(self):
         cfg = _load_cfg()
-        mp = cfg.get("model_path"); ctx = int(cfg.get("model_ctx") or 2048)
-        if mp and Path(mp).exists():
-            try:
-                self.llm.load(mp, ctx=ctx)
-                self.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
-            except Exception as e:
-                messagebox.showwarning(APP_NAME, f"No pude auto-cargar el modelo:\n{e}")
+        mp = cfg.get("model_path")
+        try:
+            ctx = int(cfg.get("model_ctx") or 2048)
+        except Exception:
+            ctx = 2048
+
+        # No hay modelo configurado o no existe
+        if not mp or not Path(mp).exists():
+            return
+
+        # Si no está instalado llama_cpp en este intérprete, no molestamos al usuario
+        try:
+            import importlib.util
+            if importlib.util.find_spec("llama_cpp") is None:
+                print("Auto-carga omitida: 'llama_cpp' no está instalado en este intérprete.")
+                return
+        except Exception:
+            # Si el check falla por cualquier motivo, seguimos con el intento normal
+            pass
+
+        try:
+            self.llm.load(mp, ctx=ctx)
+            self.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
+        except Exception as e:
+            # Log a consola en vez de popup
+            print(f"No pude auto-cargar el modelo: {e}")
 
     def _toggle_admin(self):
         if not self._is_admin:
@@ -78,10 +261,86 @@ class AppRoot(tk.Tk):
             self.chat.pack(fill="both", expand=True)
         self._refresh_footer()
 
-    def _refresh_footer(self):
-        tables, kw, notes = self.data.stats()
-        self.footer.config(text=f"Índice: {Path(self.data.db_path).name} (tablas: {tables}; keywords: {kw}; notas: {notes}) | Admin: {'activo' if self._is_admin else 'bloqueado'}")
+    def _open_viewer(self):
+        """Abre el organizador en modo cliente (búsqueda/árbol/preview) y deshabilita 3 controles."""
+        import tkinter as tk
+        from tkinter import messagebox
 
+        try:
+            base = _import_organizador()
+            OrganizadorFrame = getattr(base, "OrganizadorFrame")
+            # (opcional) aplicar el patch de índice si está presente
+            # Aplica el patch (si está); busca junto al front o en la carpeta padre
+
+
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No puedo abrir el Visor:\n{e}")
+            return
+
+        top = tk.Toplevel(self)
+        top.title("PACqui — Visor")
+        top.geometry("1400x820")
+        visor = OrganizadorFrame(top)
+        visor.pack(fill="both", expand=True)
+
+        # Deshabilitar: “PACqui (Asistente)”, “Scraper”, “Simular (dry-run)”
+        for name in ("btn_llm", "btn_scraper", "chk_dry_bot"):
+            w = getattr(visor, name, None)
+            if not w:
+                continue
+            try:
+                w.configure(state="disabled")
+            except Exception:
+                # Por si no soporta 'state', los ocultamos sin romper layout
+                try:
+                    w.grid_remove()
+                except Exception:
+                    try:
+                        w.pack_forget()
+                    except Exception:
+                        pass
+
+        # --- Fallback: desactivar por texto visible (por si cambian los nombres de widget) ---
+        try:
+            import tkinter as _tk
+
+            def _walk(w):
+                for ch in w.winfo_children():
+                    yield ch
+                    yield from _walk(ch)
+
+            to_disable_btn = ("escanear", "seleccionar carpeta", "eliminar carpeta", "exportar")
+            to_disable_chk = ("buscar también en ruta", "dry")
+
+            for w in _walk(visor):
+                cls = w.__class__.__name__.lower()
+                if "button" in cls:
+                    try:
+                        txt = (w.cget("text") or "").strip().lower()
+                        if any(kw in txt for kw in to_disable_btn):
+                            w.configure(state="disabled")
+                    except Exception:
+                        pass
+                elif "checkbutton" in cls:
+                    try:
+                        txt = (w.cget("text") or "").strip().lower()
+                        if any(kw in txt for kw in to_disable_chk):
+                            w.configure(state="disabled")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+        try:
+            top.title("PACqui — Visor (cliente)")
+        except Exception:
+            pass
+
+    def _refresh_footer(self):
+            tables, kw, notes = self.data.stats()
+            self.footer.config(text=f"Índice: {Path(self.data.db_path).name} (tablas: {tables}; keywords: {kw}; notas: {notes}) | Admin: {'activo' if self._is_admin else 'bloqueado'}")
+    
 class AdminPanel(ttk.Notebook):
     def __init__(self, master, app: AppRoot):
         super().__init__(master); self.app = app
@@ -153,11 +412,22 @@ class AdminPanel(ttk.Notebook):
 
     def _open_legacy(self):
         try:
-            import PACqui_RAG_bomba_SAFE as base
+            base = _import_organizador()
         except Exception as e:
-            messagebox.showerror(APP_NAME, f"No puedo abrir Admin (Organizador):\n{e}"); return
-        top = tk.Toplevel(self); top.title("PACqui — Admin (privado)"); top.geometry("1400x820")
-        app = base.OrganizadorFrame(top); app.pack(fill="both", expand=True)
+            messagebox.showerror(APP_NAME, f"No puedo abrir Admin (Organizador):\n{e}")
+            return
+
+        # (opcional) aplicar el mismo patch aquí también
+        try:
+            _import_rag_patch()
+        except Exception:
+            pass
+
+        top = tk.Toplevel(self)
+        top.title("PACqui — Admin (privado)")
+        top.geometry("1400x820")
+        app = base.OrganizadorFrame(top)
+        app.pack(fill="both", expand=True)
         top.protocol("WM_DELETE_WINDOW", top.destroy)
 
     def _choose_model(self):
@@ -294,25 +564,33 @@ class AdminPanel(ttk.Notebook):
             messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{out_path}", parent=self)
 
     def _open_fuentes_panel(self):
-        """Abre la ventana de Fuentes con los últimos hits del asistente embebido."""
-        hits = getattr(self.asst, "_hits", []) or []
+        """Abre la ventana de Fuentes usando los hits de ESTE chat."""
+        hits = getattr(self, "_hits", []) or []
         if not hits:
-            messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.",
-                                parent=self)
+            messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.")
             return
-
-        win = tk.Toplevel(self)
-        win.title("Fuentes — PACqui")
-        win.geometry("980x640")
 
         try:
-            pan = SourcesPanel(win, db_path=str(self.app.data.db_path))
+            pan = SourcesPanel(self)
         except Exception as e:
-            messagebox.showerror(APP_NAME, f"No se pudo abrir el panel de fuentes:\n{e}", parent=self)
-            win.destroy()
+            messagebox.showerror(APP_NAME, f"No se pudo abrir el panel de fuentes:\n{e}")
             return
 
-        pan.pack(fill="both", expand=True)
+        try:
+            pan.update_sources(hits)
+        except Exception:
+            safe = []
+            for h in hits or []:
+                safe.append({
+                    "path": h.get("path", ""),
+                    "name": h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)",
+                    "note": h.get("note", ""),
+                    "keywords": h.get("keywords", "")
+                })
+            try:
+                pan.update_sources(safe)
+            except Exception:
+                pass
 
         # Intento principal
         try:
@@ -426,11 +704,28 @@ class ChatWithLLM(ChatFrame):
         if not hits:
             messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.")
             return
-        win = tk.Toplevel(self)
-        win.title("Fuentes — PACqui")
-        win.geometry("980x640")
-        pan = SourcesPanel(win, db_path=str(getattr(self.data, "db_path", "") or ""))  # usa self.data
-        pan.pack(fill="both", expand=True)
+
+        try:
+            pan = SourcesPanel(self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudo abrir el panel de fuentes:\n{e}")
+            return
+
+        try:
+            pan.update_sources(hits)
+        except Exception:
+            safe = []
+            for h in hits or []:
+                safe.append({
+                    "path": h.get("path", ""),
+                    "name": h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)",
+                    "note": h.get("note", ""),
+                    "keywords": h.get("keywords", "")
+                })
+            try:
+                pan.update_sources(safe)
+            except Exception:
+                pass
 
         try:
             pan.update_sources(hits)
@@ -575,6 +870,8 @@ class ChatWithLLM(ChatFrame):
         # Echo del usuario
         self._append_chat("Tú", text)
         self.ent_input.delete(0, "end")
+
+        _ensure_rag_patch()  # activa el monkey-patch si aún no está activo
 
         # 1) Recupera hits ya (y pinta el panel)
         hits = self._collect_hits(text, top_k=5, note_chars=240)
