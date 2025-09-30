@@ -471,12 +471,14 @@ class AdminPanel(ttk.Notebook):
         self.tv_top.heading("kw", text="keyword"); self.tv_top.heading("cnt", text="n")
         self.tv_top.column("kw", width=220); self.tv_top.column("cnt", width=40, anchor="e")
         self.tv_top.pack(fill="both", expand=False, pady=(2,6))
+        self.tv_top.bind("<Double-1>", lambda e: self._open_kw_from_top())
 
         # CENTRO: consola de eventos
         center = ttk.Frame(cols, padding=6); cols.add(center, weight=3)
         bar = ttk.Frame(center); bar.pack(fill="x")
         ttk.Button(bar, text="Refrescar", command=self._refresh_logs_tab).pack(side="left")
         ttk.Button(bar, text="Exportar log…", command=self._export_log).pack(side="left", padx=6)
+        ttk.Button(bar, text="Exportar .jsonl", command=self._export_log_jsonl).pack(side="left", padx=6)
         ttk.Button(bar, text="Limpiar", command=self._clear_log).pack(side="left")
         self.txt_log = tk.Text(center, height=20, wrap="none", font=("Consolas", 10))
         vs = ttk.Scrollbar(center, orient="vertical", command=self.txt_log.yview)
@@ -489,6 +491,10 @@ class AdminPanel(ttk.Notebook):
         self.var_diag = tk.StringVar()
         ttk.Entry(right, textvariable=self.var_diag, width=28).pack(anchor="w", pady=(2,4))
         ttk.Button(right, text="Probar recuperación", command=self._run_diag).pack(anchor="w")
+        # ---- Auto refresh ----
+        self.var_auto_logs = tk.BooleanVar(value=True)
+        ttk.Checkbutton(right, text="Auto", variable=self.var_auto_logs).pack(anchor="w", pady=(8, 0))
+        self.after(2000, self._tick_logs)  # primer “tick” a los 2s
 
         ttk.Label(right, text="Huecos del índice", style="Header.TLabel").pack(anchor="w", pady=(10,0))
         ttk.Button(right, text="Docs sin observaciones", command=self._list_docs_without_notes).pack(anchor="w")
@@ -501,6 +507,31 @@ class AdminPanel(ttk.Notebook):
 
         self._refresh_logs_tab()
 
+    def _export_log_jsonl(self):
+        p = filedialog.asksaveasfilename(parent=self, title="Exportar log (.jsonl)",
+                                         defaultextension=".jsonl",
+                                         filetypes=[("JSONL", "*.jsonl"), ("Todos", "*.*")])
+        if not p:
+            return
+        try:
+            import json
+            with open(p, "w", encoding="utf-8") as f:
+                for ev in self.app.events_snapshot():
+                    ev2 = dict(ev)
+                    ev2["ts_iso"] = datetime.fromtimestamp(ev["ts"]).isoformat(timespec="seconds")
+                    f.write(json.dumps(ev2, ensure_ascii=False) + "\n")
+            messagebox.showinfo(APP_NAME, f"JSONL exportado en:\n{p}", parent=self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{e}", parent=self)
+
+    def _tick_logs(self):
+        try:
+            if self.var_auto_logs.get():
+                self._refresh_logs_tab()
+        finally:
+            # reprograma el siguiente tick aunque haya habido excepción
+            self.after(2000, self._tick_logs)
+
     def _refresh_logs_tab(self):
         # 1) Estado del índice
         try:
@@ -511,8 +542,13 @@ class AdminPanel(ttk.Notebook):
                 docs_kw = cur.fetchone()[0] or 0
                 cur.execute("SELECT COUNT(DISTINCT lower(fullpath)) FROM doc_notes")
                 docs_note = cur.fetchone()[0] or 0
-            cov = f"{(100.0*docs_note/max(1,docs_kw)):.1f}%"
-            self.lbl_idx.config(text=f"tablas={tables} · keywords={kw} · notas={notes} · docs_kw={docs_kw} · docs_con_nota={docs_note} ({cov})")
+            cov_pct = 100.0 * docs_note / max(1, docs_kw)
+            cov = f"{cov_pct:.1f}%"
+            self.lbl_idx.config(
+                text=f"tablas={tables} · keywords={kw} · notas={notes} · docs_kw={docs_kw} · docs_con_nota={docs_note} ({cov})",
+                foreground=("red" if cov_pct < 30 else "orange" if cov_pct < 60 else "green")
+            )
+
         except Exception as e:
             self.lbl_idx.config(text=f"(error índice: {e})")
 
@@ -590,6 +626,18 @@ class AdminPanel(ttk.Notebook):
         con_nota = sum(1 for h in hits if (h.get("note") or "").strip())
         self.app._log("diag", query=q, hits=len(hits), con_nota=con_nota, ms=int(dt*1000))
         self._refresh_logs_tab()
+
+    def _open_kw_from_top(self):
+        sel = self.tv_top.selection()
+        if not sel:
+            return
+        kw = self.tv_top.item(sel[0], "values")[0]
+        try:
+            # abre la búsqueda en el asistente backend del panel
+            self.asst._chip_click(kw)
+            self.app._log("diag_kw_open", kw=kw)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No pude abrir la keyword:\n{e}", parent=self)
 
     def _list_docs_without_notes(self):
         rows=[]
