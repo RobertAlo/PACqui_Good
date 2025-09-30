@@ -239,6 +239,7 @@ class AppRoot(tk.Tk):
 
         ensure_admin_password(self)
         self._autoload_model()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _log(self, typ: str, **data):
         ev = {"ts": time.time(), "type": typ}
@@ -248,6 +249,29 @@ class AppRoot(tk.Tk):
         for fn in list(self._event_listeners):
             try:
                 fn(ev)
+            except Exception:
+                pass
+
+    def _on_close(self):
+        try:
+            # Cierra modelo LLM si está cargado (libera recursos nativos)
+            try:
+                mdl = getattr(self.llm, "model", None)
+                if mdl is not None:
+                    close = getattr(mdl, "close", None)
+                    if callable(close):
+                        close()
+            except Exception:
+                pass
+            try:
+                # Por si acaso, suelta la referencia
+                if hasattr(self.llm, "model"):
+                    self.llm.model = None
+            except Exception:
+                pass
+        finally:
+            try:
+                self.destroy()
             except Exception:
                 pass
 
@@ -387,8 +411,31 @@ class AdminPanel(ttk.Notebook):
         super().__init__(master); self.app = app
         # Tab índice
         t1 = ttk.Frame(self, padding=12); self.add(t1, text="Índice y herramientas")
-        ttk.Label(t1, text="Panel de administración", font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        ttk.Button(t1, text="Abrir herramientas clásicas (Carpeta base…)", command=self._open_legacy).pack(anchor="w", pady=(6,0))
+        # === EMBED: Herramientas clásicas dentro de "Índice y herramientas" ===
+        try:
+            base = _import_organizador()     # Carga módulo del Organizador
+            try:
+                _import_rag_patch()          # Activa RAG monkey-patch (si está)
+            except Exception:
+                pass
+
+            # El Organizador espera 'protocol' (propio de Toplevel). Si no existe,
+            # le damos uno inofensivo o reutilizamos el del toplevel.
+            # El Organizador espera 'protocol' pero t1 no es un Toplevel → no-op
+            if not hasattr(t1, "protocol"):
+                def _noop_protocol(*_a, **_k):
+                    return None
+
+                t1.protocol = _noop_protocol
+
+            # Contenedor y creación del Organizador "versión backend" embebido
+            self.organizador_embed = base.OrganizadorFrame(t1, visor_mode=False)
+            self.organizador_embed.pack(fill="both", expand=True, pady=(8, 0))
+
+        except Exception as e:
+            # Si algo falla, no bloqueamos la app; mostramos el error.
+            messagebox.showerror(APP_NAME, f"No se pudo embeber el Organizador en la pestaña:\n{e}", parent=self)
+
 
         # --- NUEVA PESTAÑA: Asistente (backend) ---
         tA = ttk.Frame(self, padding=12)
