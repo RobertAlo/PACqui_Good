@@ -334,6 +334,12 @@ class AppRoot(tk.Tk):
         try:
             base = _import_organizador()
             OrganizadorFrame = getattr(base, "OrganizadorFrame")
+            # Aplica el patch del índice (no bloquea si no está)
+            try:
+                _import_rag_patch()
+            except Exception:
+                pass
+
             # (opcional) aplicar el patch de índice si está presente
             # Aplica el patch (si está); busca junto al front o en la carpeta padre
 
@@ -490,14 +496,14 @@ class AdminPanel(ttk.Notebook):
         ttk.Button(frm, text="Cargar modelo (backend)", command=self._load_model).grid(row=1, column=2, padx=4)
         frm.columnconfigure(1, weight=1)
 
-        # Tab logs
+
         # Tab logs
         t3 = ttk.Frame(self, padding=10); self.add(t3, text="Logs y estado")
         self._build_logs_tab(t3)
 
         # Tab zona peligrosa
         t4 = ttk.Frame(self, padding=12); self.add(t4, text="Zona peligrosa")
-        ttk.Label(t4, text="(Próximo) Reset de configuración, vaciados, etc.").pack(anchor="w")
+        self._build_danger_tab(t4)
 
     # ---------- LOGS TAB ----------
     def _build_logs_tab(self, parent):
@@ -553,6 +559,997 @@ class AdminPanel(ttk.Notebook):
             pass
 
         self._refresh_logs_tab()
+
+    # ---------- ZONA PELIGROSA ----------
+    def _build_danger_tab(self, parent):
+        info = ttk.Label(parent, text="Herramientas avanzadas. ¡Pueden borrar datos! Haz copia antes.", foreground="#a61b29")
+        info.pack(anchor="w", pady=(0,8))
+
+        cols = ttk.Panedwindow(parent, orient="horizontal"); cols.pack(fill="both", expand=True)
+
+        # Columna izquierda: backups / resets
+        left = ttk.Labelframe(cols, text="Backups y resets", padding=8)
+        cols.add(left, weight=1)
+
+        ttk.Button(left, text="Hacer copia del índice (SQLite)…", command=self._danger_backup_db).pack(anchor="w", pady=2)
+        ttk.Button(left, text="Restaurar índice desde copia…", command=self._danger_restore_db).pack(anchor="w", pady=2)
+
+        ttk.Separator(left).pack(fill="x", pady=(8,4))
+
+        ttk.Button(left, text="Vaciar PALABRAS CLAVE (doc_keywords)…", command=self._danger_wipe_keywords).pack(anchor="w", pady=2)
+        ttk.Button(left, text="Vaciar OBSERVACIONES (doc_notes)…", command=self._danger_wipe_notes).pack(anchor="w", pady=2)
+
+        # Columna central: reparación / mantenimiento
+        right = ttk.Labelframe(cols, text="Reparación y mantenimiento", padding=8)
+        cols.add(right, weight=1)
+
+
+        ttk.Button(right, text="Eliminar entradas HUÉRFANAS (ficheros que ya no existen)…", command=self._danger_cleanup_orphans).pack(anchor="w", pady=2)
+        ttk.Button(right, text="Rebase de rutas… (cambia prefijo de carpeta base)",
+                   command=self._danger_rebase_paths).pack(anchor="w", pady=2)
+
+        ttk.Button(right, text="Simular limpieza HUÉRFANAS (preview)…", command=self._danger_orphans_preview).pack(
+            anchor="w", pady=2)  # <— NUEVO
+        ttk.Button(right, text="Deduplicar OBSERVACIONES (misma ruta)",
+                   command=self._danger_dedupe_notes).pack(anchor="w", pady=2)
+
+        ttk.Button(right, text="Crear índices recomendados", command=self._danger_create_indices).pack(anchor="w",
+                                                                                                       pady=2)
+
+        ttk.Separator(right).pack(fill="x", pady=(8,4))
+        ttk.Button(right, text="PRAGMA integrity_check + VACUUM", command=self._danger_integrity_vacuum).pack(anchor="w", pady=2)
+
+        # Columna derecha: BANCO DE PRUEBAS
+        tests = ttk.Labelframe(cols, text="Banco de pruebas (índice/RAG)", padding=8)
+        cols.add(tests, weight=1)
+
+        row = ttk.Frame(tests); row.pack(fill="x", pady=(0,6))
+        ttk.Label(row, text="k (top-k):").pack(side="left")
+        self.var_bp_topk = tk.IntVar(value=5)
+        ttk.Spinbox(row, from_=1, to=20, textvariable=self.var_bp_topk, width=5).pack(side="left", padx=(6,0))
+        ttk.Button(row, text="Listar casos", command=self._bp_list_cases).pack(side="right")
+        ttk.Button(row, text="Añadir caso…", command=self._bp_add_case).pack(side="right", padx=6)
+
+        ttk.Button(tests, text="Importar casos (JSON)…", command=self._bp_import_cases).pack(anchor="w", pady=2)
+        ttk.Button(tests, text="Exportar casos (JSON)…", command=self._bp_export_cases).pack(anchor="w", pady=2)
+
+        ttk.Separator(tests).pack(fill="x", pady=(8,4))
+        ttk.Button(tests, text="Ejecutar evaluación (todos)", command=self._bp_run_all).pack(anchor="w", pady=2)
+        ttk.Button(tests, text="Ejecutar evaluación (seleccionados)…", command=self._bp_run_selected).pack(anchor="w",
+                                                                                                           pady=2)
+
+        ttk.Button(tests, text="Ver últimos resultados…", command=self._bp_show_last_results).pack(anchor="w", pady=2)
+        ttk.Button(tests, text="Ver detalles (último run)…", command=self._bp_show_last_details).pack(anchor="w",
+                                                                                                      pady=2)
+
+        ttk.Button(tests, text="Comparar runs…", command=self._bp_compare_runs).pack(anchor="w", pady=2)
+        ttk.Button(tests, text="Exportar últimos resultados (CSV)…", command=self._bp_export_last_results_csv).pack(
+            anchor="w", pady=2)  # <— NUEVO
+
+        # Garantiza tablas de pruebas
+        try:
+            self._bp_ensure_tables()
+        except Exception:
+            pass
+
+
+    # ---- Helpers de confirmación y SQL ----
+    def _danger_confirm(self, title: str, msg: str, must_type: str | None = None) -> bool:
+        from tkinter import simpledialog, messagebox
+        if not messagebox.askyesno(title, msg + ("\n\n¿Continuar?" if not must_type else "")):
+            return False
+        if must_type:
+            typed = simpledialog.askstring(title, f"Escribe {must_type} para continuar:")
+            if (typed or "").strip().upper() != must_type.upper():
+                messagebox.showinfo(title, "Operación cancelada.")
+                return False
+        return True
+
+    def _danger_create_indices(self):
+        from tkinter import messagebox
+        try:
+            with self.app.data._connect() as con:
+                con.execute("CREATE INDEX IF NOT EXISTS idx_kw_path ON doc_keywords(lower(fullpath))")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_kw_kw   ON doc_keywords(lower(keyword))")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_no_path ON doc_notes(lower(fullpath))")
+                con.commit()
+            self.app._log("danger_create_indices")
+            messagebox.showinfo("Índices", "Índices creados o ya existentes.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Índices", f"Error creando índices:\n{e}", parent=self)
+
+    def _danger_sql(self, sql: str, params: tuple = ()):
+        with self.app.data._connect() as con:
+            cur = con.cursor()
+            cur.execute(sql, params)
+            con.commit()
+
+    # ---- Backups / Restaurar ----
+    def _danger_backup_db(self):
+        from tkinter import filedialog, messagebox
+        import shutil, time, os
+        src = self.app.data.db_path
+        if not src or not os.path.exists(src):
+            messagebox.showerror("Backup", "No se encontró el archivo SQLite del índice."); return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        dst = filedialog.asksaveasfilename(parent=self, title="Guardar copia del índice",
+                                           defaultextension=".sqlite",
+                                           initialfile=f"pacqui_index_backup_{ts}.sqlite",
+                                           filetypes=[("SQLite","*.sqlite;*.db"),("Todos","*.*")])
+        if not dst: return
+        try:
+            shutil.copy2(src, dst)
+            self.app._log("danger_backup", src=src, dst=dst)
+            messagebox.showinfo("Backup", f"Copia guardada en:\n{dst}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Backup", f"No se pudo copiar:\n{e}", parent=self)
+
+    def _danger_restore_db(self):
+        from tkinter import filedialog, messagebox
+        import shutil, os
+        dst = self.app.data.db_path
+        src = filedialog.askopenfilename(parent=self, title="Selecciona copia de índice",
+                                         filetypes=[("SQLite","*.sqlite;*.db"),("Todos","*.*")])
+        if not src: return
+        if not self._danger_confirm("Restaurar índice",
+                                    f"Se sobrescribirá el índice actual:\n{dst}\n\nOrigen:\n{src}",
+                                    must_type="RESTAURAR"):
+            return
+        try:
+            # Asegura que no quedan handles abiertos (conexión por operación)
+            shutil.copy2(src, dst)
+            self.app._log("danger_restore", src=src, dst=dst)
+            messagebox.showinfo("Restaurar", "Índice restaurado.\nReabre la pestaña si no ves los cambios.", parent=self)
+            self.app._refresh_footer()
+        except Exception as e:
+            messagebox.showerror("Restaurar", f"No se pudo restaurar:\n{e}", parent=self)
+
+    # ---- Resets ----
+    def _danger_wipe_keywords(self):
+        from tkinter import messagebox
+        if not self._danger_confirm("Vaciar keywords",
+                                    "Vas a BORRAR TODAS las palabras clave (doc_keywords).",
+                                    must_type="BORRAR"):
+            return
+        try:
+            self._danger_sql("DELETE FROM doc_keywords")
+            self.app._log("danger_wipe_keywords")
+            messagebox.showinfo("Vaciar", "Palabras clave eliminadas.", parent=self)
+            self.app._refresh_footer()
+        except Exception as e:
+            messagebox.showerror("Vaciar", f"Error:\n{e}", parent=self)
+
+    def _danger_wipe_notes(self):
+        from tkinter import messagebox
+        if not self._danger_confirm("Vaciar observaciones",
+                                    "Vas a BORRAR TODAS las observaciones (doc_notes).",
+                                    must_type="BORRAR"):
+            return
+        try:
+            self._danger_sql("DELETE FROM doc_notes")
+            self.app._log("danger_wipe_notes")
+            messagebox.showinfo("Vaciar", "Observaciones eliminadas.", parent=self)
+            self.app._refresh_footer()
+        except Exception as e:
+            messagebox.showerror("Vaciar", f"Error:\n{e}", parent=self)
+
+    # ---- Reparaciones ----
+    def _danger_rebase_paths(self):
+        from tkinter import filedialog, messagebox, simpledialog
+        import os
+        old_prefix = filedialog.askdirectory(parent=self, title="Prefijo ACTUAL (carpeta base antigua) o su carpeta raíz")
+        if not old_prefix: return
+        new_prefix = filedialog.askdirectory(parent=self, title="Prefijo NUEVO (carpeta base nueva)")
+        if not new_prefix: return
+
+        old_prefix = os.path.normpath(old_prefix)
+        new_prefix = os.path.normpath(new_prefix)
+        if not self._danger_confirm("Rebase de rutas",
+                                    f"Reemplazar prefijo:\n\n{old_prefix}\n→\n{new_prefix}\n\nen doc_keywords y doc_notes.",
+                                    must_type="REBASE"):
+            return
+
+        try:
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                for tbl in ("doc_keywords", "doc_notes"):
+                    cur.execute(f"UPDATE {tbl} SET fullpath = REPLACE(fullpath, ?, ?)", (old_prefix, new_prefix))
+                con.commit()
+            self.app._log("danger_rebase_paths", old=old_prefix, new=new_prefix)
+            messagebox.showinfo("Rebase", "Rutas actualizadas.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Rebase", f"Error:\n{e}", parent=self)
+
+    def _danger_cleanup_orphans(self):
+        from tkinter import messagebox
+        import os, threading, time
+        if not self._danger_confirm("Eliminar huérfanos",
+                                    "Se eliminarán filas cuyo fichero ya NO exista en disco.\n"
+                                    "Afecta a doc_keywords y doc_notes.",
+                                    must_type="LIMPIAR"):
+            return
+
+        def worker():
+            removed_kw = removed_no = 0
+            paths = set()
+            try:
+                with self.app.data._connect() as con:
+                    cur = con.cursor()
+                    for tbl in ("doc_keywords","doc_notes"):
+                        rows = cur.execute(f"SELECT DISTINCT fullpath FROM {tbl}").fetchall()
+                        for (p,) in rows:
+                            if p: paths.add(p)
+                # Chequeo disco
+                to_remove = [p for p in paths if not os.path.exists(p)]
+                with self.app.data._connect() as con:
+                    cur = con.cursor()
+                    for p in to_remove:
+                        removed_kw += cur.execute("DELETE FROM doc_keywords WHERE fullpath=?", (p,)).rowcount
+                        removed_no += cur.execute("DELETE FROM doc_notes WHERE fullpath=?", (p,)).rowcount
+                    con.commit()
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Huérfanos", f"Error:\n{e}", parent=self)); return
+            self.app._log("danger_cleanup_orphans", removed_kw=removed_kw, removed_no=removed_no)
+            self.after(0, lambda: (self.app._refresh_footer(),
+                                   messagebox.showinfo("Huérfanos",
+                                                       f"Eliminadas {removed_kw} keywords y {removed_no} notas huérfanas.",
+                                                       parent=self)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _danger_orphans_preview(self):
+        """Muestra una vista previa (paths y nº de filas afectadas) antes de borrar huérfanos."""
+        from tkinter import messagebox
+        import os, csv
+
+        # 1) Recolecta paths distintos que estén en doc_keywords/doc_notes
+        paths = set();
+        stats_by_path = {}
+        try:
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                for tbl in ("doc_keywords", "doc_notes"):
+                    rows = cur.execute(f"SELECT DISTINCT fullpath FROM {tbl}").fetchall()
+                    for (p,) in rows:
+                        if p:
+                            paths.add(p)
+            to_remove = [p for p in paths if not os.path.exists(p)]
+            if not to_remove:
+                messagebox.showinfo("Simular huérfanos", "No se han encontrado huérfanos. ¡Todo OK!", parent=self)
+                return
+
+            # 2) Cuenta filas afectadas por tabla y por ruta
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                for p in to_remove:
+                    kw = cur.execute("SELECT COUNT(*) FROM doc_keywords WHERE fullpath=?", (p,)).fetchone()[0] or 0
+                    no = cur.execute("SELECT COUNT(*) FROM doc_notes    WHERE fullpath=?", (p,)).fetchone()[0] or 0
+                    stats_by_path[p] = (kw, no)
+
+        except Exception as e:
+            messagebox.showerror("Simular huérfanos", f"Error preparando preview:\n{e}", parent=self)
+            return
+
+        # 3) Ventana de preview
+        top = tk.Toplevel(self);
+        top.title("Preview: huérfanos a eliminar");
+        top.geometry("1000x560")
+        bar = ttk.Frame(top);
+        bar.pack(fill="x", padx=8, pady=6)
+
+        total_kw = sum(v[0] for v in stats_by_path.values())
+        total_no = sum(v[1] for v in stats_by_path.values())
+        ttk.Label(bar,
+                  text=f"Rutas huérfanas: {len(stats_by_path)}  ·  Filas doc_keywords: {total_kw}  ·  Filas doc_notes: {total_no}").pack(
+            side="left")
+
+        def _export_csv():
+            p = filedialog.asksaveasfilename(parent=top, title="Guardar lista (CSV)", defaultextension=".csv",
+                                             filetypes=[("CSV", "*.csv"), ("Todos", "*.*")])
+            if not p: return
+            try:
+                with open(p, "w", encoding="utf-8", newline="") as f:
+                    w = csv.writer(f);
+                    w.writerow(["fullpath", "rows_doc_keywords", "rows_doc_notes"])
+                    for path, (kwc, noc) in stats_by_path.items():
+                        w.writerow([path, kwc, noc])
+                messagebox.showinfo("Exportado", f"CSV guardado en:\n{p}", parent=top)
+            except Exception as e:
+                messagebox.showerror("Exportado", f"No se pudo exportar:\n{e}", parent=top)
+
+        def _delete_now():
+            if not self._danger_confirm("Eliminar huérfanos",
+                                        "Se eliminarán TODAS las filas mostradas en la tabla (doc_keywords y doc_notes).",
+                                        must_type="LIMPIAR"):
+                return
+            removed_kw = removed_no = 0
+            try:
+                with self.app.data._connect() as con:
+                    cur = con.cursor()
+                    for p in stats_by_path.keys():
+                        removed_kw += cur.execute("DELETE FROM doc_keywords WHERE fullpath=?", (p,)).rowcount
+                        removed_no += cur.execute("DELETE FROM doc_notes    WHERE fullpath=?", (p,)).rowcount
+                    con.commit()
+                self.app._log("danger_cleanup_orphans", removed_kw=removed_kw, removed_no=removed_no)
+                messagebox.showinfo("Huérfanos", f"Eliminadas {removed_kw} keywords y {removed_no} notas.", parent=top)
+                try:
+                    self.app._refresh_footer()
+                except Exception:
+                    pass
+                top.destroy()
+            except Exception as e:
+                messagebox.showerror("Huérfanos", f"Error al eliminar:\n{e}", parent=top)
+
+        ttk.Button(bar, text="Eliminar ahora…", command=_delete_now).pack(side="right")
+        ttk.Button(bar, text="Guardar lista (CSV)…", command=_export_csv).pack(side="right", padx=(0, 6))
+
+        tv = ttk.Treeview(top, columns=("path", "kw", "no"), show="headings")
+        tv.heading("path", text="Ruta");
+        tv.heading("kw", text="doc_keywords");
+        tv.heading("no", text="doc_notes")
+        tv.column("path", width=780);
+        tv.column("kw", width=110, anchor="e");
+        tv.column("no", width=110, anchor="e")
+        tv.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # Ordena por “filas totales” descendente y limita a 10k por seguridad visual
+        ordered = sorted(stats_by_path.items(), key=lambda kv: kv[1][0] + kv[1][1], reverse=True)[:10000]
+        for path, (kwc, noc) in ordered:
+            tv.insert("", "end", values=(path, kwc, noc))
+
+    def _danger_dedupe_keywords(self):
+        from tkinter import messagebox
+        sql = """
+            DELETE FROM doc_keywords
+            WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY lower(fullpath), lower(keyword)
+                               ORDER BY rowid
+                           ) AS rn
+                    FROM doc_keywords
+                ) t WHERE t.rn > 1
+            )
+        """
+        try:
+            with self.app.data._connect() as con:
+                con.execute("PRAGMA foreign_keys=ON")
+                con.execute(sql)
+                con.commit()
+            self.app._log("danger_dedupe_keywords")
+            messagebox.showinfo("Deduplicar", "Duplicados eliminados en doc_keywords.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Deduplicar", f"Error:\n{e}", parent=self)
+
+    def _danger_dedupe_notes(self):
+        from tkinter import messagebox
+        sql = """
+            DELETE FROM doc_notes
+            WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY lower(fullpath)
+                               ORDER BY rowid DESC
+                           ) AS rn
+                    FROM doc_notes
+                ) t WHERE t.rn > 1
+            )
+        """
+        try:
+            with self.app.data._connect() as con:
+                con.execute(sql)
+                con.commit()
+            self.app._log("danger_dedupe_notes")
+            messagebox.showinfo("Deduplicar", "Duplicados eliminados en doc_notes (por ruta).", parent=self)
+        except Exception as e:
+            messagebox.showerror("Deduplicar", f"Error:\n{e}", parent=self)
+
+    def _danger_integrity_vacuum(self):
+        from tkinter import messagebox
+        try:
+            with self.app.data._connect() as con:
+                ok = (con.execute("PRAGMA integrity_check").fetchone() or [""])[0]
+            with self.app.data._connect() as con:
+                con.execute("VACUUM")
+            self.app._log("danger_integrity_vacuum", result=ok)
+            messagebox.showinfo("Integridad/VACUUM", f"integrity_check → {ok}\n\nVACUUM ejecutado.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Integridad/VACUUM", f"Error:\n{e}", parent=self)
+
+    # ---------- BANCO DE PRUEBAS ----------
+    def _bp_ensure_tables(self):
+        with self.app.data._connect() as con:
+            cur = con.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS test_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    q TEXT NOT NULL,
+                    expected_json TEXT NOT NULL,
+                    top_k INTEGER DEFAULT 5,
+                    notes TEXT,
+                    created_at TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS test_results (
+                    ts TEXT NOT NULL,
+                    case_id INTEGER NOT NULL,
+                    top_k INTEGER NOT NULL,
+                    hits INTEGER NOT NULL,
+                    expected INTEGER NOT NULL,
+                    found INTEGER NOT NULL,
+                    precision REAL NOT NULL,
+                    recall REAL NOT NULL,
+                    mrr REAL NOT NULL,
+                    first_hit_rank INTEGER,
+                    dt_ms INTEGER NOT NULL,
+                    details_json TEXT,
+                    PRIMARY KEY (ts, case_id)
+                )
+            """)
+            con.commit()
+
+    def _bp_add_case(self):
+        from tkinter import simpledialog, filedialog, messagebox
+        q = simpledialog.askstring("Nuevo caso", "Escribe la consulta:")
+        if not q: return
+        paths = filedialog.askopenfilenames(parent=self, title="Selecciona los ficheros esperados (puedes marcar varios)")
+        if not paths: return
+        k = int(self.var_bp_topk.get() or 5)
+        rec = {
+            "q": q.strip(),
+            "expected": [os.path.normpath(p) for p in paths],
+            "top_k": k,
+            "notes": ""
+        }
+        try:
+            self._bp_ensure_tables()
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                cur.execute(
+                    "INSERT INTO test_cases(q, expected_json, top_k, notes, created_at) VALUES(?,?,?,?,datetime('now'))",
+                    (rec["q"], json.dumps(rec["expected"], ensure_ascii=False), int(rec["top_k"]), rec["notes"])
+                )
+                con.commit()
+            self.app._log("bp_add_case", q=rec["q"], n=len(rec["expected"]), k=k)
+            messagebox.showinfo("Banco de pruebas", f"Caso añadido ({len(rec['expected'])} esperados).", parent=self)
+        except Exception as e:
+            messagebox.showerror("Banco de pruebas", f"No se pudo guardar el caso:\n{e}", parent=self)
+
+    def _bp_export_last_results_csv(self):
+        from tkinter import messagebox
+        import csv
+        self._bp_ensure_tables()
+        with self.app.data._connect() as con:
+            row = con.execute("SELECT MAX(ts) FROM test_results").fetchone()
+            last = row[0] if row else None
+            if not last:
+                messagebox.showinfo("Exportar CSV", "No hay ejecuciones registradas.", parent=self);
+                return
+            rows = con.execute("""SELECT c.id, c.q, r.top_k, r.hits, r.expected, r.found, r.precision, r.recall,
+                                         r.mrr, r.first_hit_rank, r.dt_ms
+                                  FROM test_results r
+                                  JOIN test_cases c ON c.id=r.case_id
+                                  WHERE r.ts=? ORDER BY c.id""", (last,)).fetchall()
+        p = filedialog.asksaveasfilename(parent=self, title="Guardar CSV (últimos resultados)",
+                                         defaultextension=".csv",
+                                         filetypes=[("CSV", "*.csv"), ("Todos", "*.*")])
+        if not p: return
+        try:
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(
+                    ["ts", "case_id", "query", "top_k", "hits", "expected", "found", "precision", "recall", "mrr",
+                     "first_hit_rank", "dt_ms"])
+                for (cid, q, k, hits, exp, found, pv, rv, mrr, fr, ms) in rows:
+                    w.writerow(
+                        [last, cid, q, k, hits, exp, found, f"{pv:.4f}", f"{rv:.4f}", f"{mrr:.4f}", fr or "", ms])
+            messagebox.showinfo("Exportado", f"CSV guardado en:\n{p}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Exportado", f"No se pudo exportar:\n{e}", parent=self)
+
+    def _bp_list_cases(self):
+        from tkinter import messagebox
+        self._bp_ensure_tables()
+        rows=[]
+        with self.app.data._connect() as con:
+            rows = con.execute("SELECT id, q, top_k, expected_json, created_at FROM test_cases ORDER BY id").fetchall()
+        top = tk.Toplevel(self); top.title("Casos de prueba"); top.geometry("900x480")
+        bar = ttk.Frame(top); bar.pack(fill="x")
+        ttk.Button(bar, text="Eliminar seleccionado", command=lambda:self._bp_delete_selected(tv)).pack(side="right")
+        tv = ttk.Treeview(top, columns=("id","q","k","exp","ts"), show="headings")
+        for c,t,w in (("id","ID",60),("q","Consulta",520),("k","k",40),("exp","Esperados",90),("ts","Creado",140)):
+            tv.heading(c, text=t); tv.column(c, width=w, anchor="w")
+        tv.pack(fill="both", expand=True)
+        for (cid,q,k,js,ts) in rows:
+            try: exp = len(json.loads(js))
+            except Exception: exp = "?"
+            tv.insert("", "end", values=(cid, q, k, exp, ts or ""))
+        tv.focus_set()
+
+    def _bp_delete_selected(self, tv):
+        from tkinter import messagebox
+        sel = tv.selection()
+        if not sel: return
+        cid = tv.item(sel[0], "values")[0]
+        if not messagebox.askyesno("Eliminar", f"¿Borrar el caso {cid}?"): return
+        with self.app.data._connect() as con:
+            con.execute("DELETE FROM test_cases WHERE id=?", (cid,))
+            con.commit()
+        self.app._log("bp_del_case", id=cid)
+        tv.delete(sel[0])
+
+    def _bp_import_cases(self):
+        from tkinter import filedialog, messagebox
+        p = filedialog.askopenfilename(parent=self, title="Importar JSON de casos",
+                                       filetypes=[("JSON","*.json"),("Todos","*.*")])
+        if not p: return
+        try:
+            arr = json.loads(Path(p).read_text(encoding="utf-8"))
+            self._bp_ensure_tables()
+            n=0
+            with self.app.data._connect() as con:
+                cur = con.cursor()
+                for rec in arr:
+                    q = (rec.get("q") or "").strip()
+                    if not q: continue
+                    exp = rec.get("expected") or []
+                    k = int(rec.get("top_k") or self.var_bp_topk.get() or 5)
+                    cur.execute(
+                        "INSERT INTO test_cases(q, expected_json, top_k, notes, created_at) VALUES(?,?,?,?,datetime('now'))",
+                        (q, json.dumps(exp, ensure_ascii=False), k, rec.get("notes") or "")
+                    )
+                    n+=1
+                con.commit()
+            self.app._log("bp_import", n=n, path=p)
+            messagebox.showinfo("Importar", f"Importados {n} casos.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Importar", f"No se pudo importar:\n{e}", parent=self)
+
+    def _bp_export_cases(self):
+        from tkinter import filedialog, messagebox
+        p = filedialog.asksaveasfilename(parent=self, title="Exportar JSON de casos",
+                                         defaultextension=".json",
+                                         filetypes=[("JSON","*.json"),("Todos","*.*")])
+        if not p: return
+        try:
+            with self.app.data._connect() as con:
+                rows = con.execute("SELECT q, expected_json, top_k, notes FROM test_cases ORDER BY id").fetchall()
+            arr = []
+            for q, js, k, notes in rows:
+                try: exp = json.loads(js)
+                except Exception: exp = []
+                arr.append({"q": q, "expected": exp, "top_k": k, "notes": notes or ""})
+            Path(p).write_text(json.dumps(arr, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.app._log("bp_export", n=len(arr), path=p)
+            messagebox.showinfo("Exportar", f"Exportados {len(arr)} casos a:\n{p}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Exportar", f"No se pudo exportar:\n{e}", parent=self)
+
+    def _bp_run_all(self):
+        from tkinter import messagebox
+        import math
+
+        self._bp_ensure_tables()
+        with self.app.data._connect() as con:
+            cases = con.execute("SELECT id, q, top_k, expected_json FROM test_cases ORDER BY id").fetchall()
+        if not cases:
+            messagebox.showinfo("Banco de pruebas", "No hay casos definidos."); return
+
+        # Ventana de progreso + tabla live
+        top = tk.Toplevel(self); top.title("Ejecutando evaluación…"); top.geometry("980x520")
+        lab = ttk.Label(top, text="Preparando…"); lab.pack(anchor="w", padx=10, pady=(10,6))
+        pb = ttk.Progressbar(top, mode="determinate", maximum=len(cases)); pb.pack(fill="x", padx=10)
+        tv = ttk.Treeview(top, columns=("id","ok","p","r","mrr","rank","ms","hits","exp","q"), show="headings", height=16)
+        headers = [("id","ID",50),("ok","OK",50),("p","Prec@",70),("r","Rec@",70),("mrr","MRR",70),
+                   ("rank","1ª pos",70),("ms","ms",70),("hits","hits",60),("exp","exp",60),("q","Consulta",500)]
+        for c,t,w in headers:
+            tv.heading(c, text=t); tv.column(c, width=w, anchor=("e" if c in ("p","r","mrr","rank","ms","hits","exp") else "w"))
+        tv.pack(fill="both", expand=True, padx=10, pady=8)
+
+        ts = datetime.now().isoformat(timespec="seconds")
+        k_global = int(self.var_bp_topk.get() or 5)
+
+        def norm(p):
+            return os.path.normcase(os.path.normpath(p or ""))
+
+        def worker():
+            done = 0
+            acc_p = acc_r = acc_mrr = 0.0
+            try:
+                with self.app.data._connect() as con:
+                    cur = con.cursor()
+                    for (cid, q, k_case, js) in cases:
+                        k = int(k_case or k_global or 5)
+                        try: expected = [norm(p) for p in json.loads(js)]
+                        except Exception: expected = []
+                        t0 = time.time()
+                        try:
+                            hits = self.app.llm._index_hits(q, top_k=k, max_note_chars=220) or []
+                        except Exception:
+                            hits = []
+                        dt_ms = int((time.time() - t0)*1000)
+
+                        got = [norm(h.get("path")) for h in hits if h.get("path")]
+                        found_set = set(expected).intersection(set(got))
+                        found = len(found_set)
+
+                        # rank del primer acierto y MRR
+                        first_rank = None
+                        for idx, p in enumerate(got, start=1):
+                            if p in expected:
+                                first_rank = idx; break
+                        mrr = (1.0/first_rank) if first_rank else 0.0
+                        precision = (found / max(1, k))
+                        recall = (found / max(1, len(expected)))
+                        ok = 1 if found > 0 else 0
+
+                        # Persistir resultado
+                        det = {"expected": expected, "hits": got}
+                        cur.execute("""INSERT OR REPLACE INTO test_results
+                                       (ts, case_id, top_k, hits, expected, found, precision, recall, mrr, first_hit_rank, dt_ms, details_json)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (ts, cid, k, len(got), len(expected), found, precision, recall, mrr, first_rank, dt_ms,
+                                     json.dumps(det, ensure_ascii=False)))
+                        con.commit()
+
+                        acc_p += precision; acc_r += recall; acc_mrr += mrr
+                        done += 1
+                        # pinta fila live
+                        self.after(0, lambda cid=cid, ok=ok, p=precision, r=recall, mrr=mrr, fr=first_rank, ms=dt_ms, h=len(got), e=len(expected), q=q:
+                                   tv.insert("", "end", values=(cid, "✓" if ok else "✗", f"{p:.2f}", f"{r:.2f}", f"{mrr:.2f}", fr or "-", ms, h, e, q)))
+                        self.after(0, lambda: (pb.config(value=done), lab.config(text=f"Ejecutando… {done}/{len(cases)}")))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Evaluación", f"Error: {e}", parent=self))
+                return
+
+            # Resumen
+            n = max(1, len(cases))
+            mean_p = acc_p/n; mean_r = acc_r/n; mean_mrr = acc_mrr/n
+            self.app._log("bp_eval_run", ts=ts, n=n, p=round(mean_p,3), r=round(mean_r,3), mrr=round(mean_mrr,3), k=k_global)
+            self.after(0, lambda: lab.config(text=f"Finalizado. Prec@k={mean_p:.2f} · Rec@k={mean_r:.2f} · MRR={mean_mrr:.2f} (n={n})"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _bp_run_selected(self):
+        """Permite elegir casos y ejecutar la evaluación SOLO para esos casos."""
+        from tkinter import messagebox
+
+        self._bp_ensure_tables()
+        with self.app.data._connect() as con:
+            cases = con.execute("SELECT id, q, top_k, expected_json FROM test_cases ORDER BY id").fetchall()
+        if not cases:
+            messagebox.showinfo("Banco de pruebas", "No hay casos definidos.", parent=self);
+            return
+
+        # Ventana de selección (multi-selección)
+        top = tk.Toplevel(self);
+        top.title("Selecciona casos a evaluar");
+        top.geometry("900x520")
+        bar = ttk.Frame(top);
+        bar.pack(fill="x", padx=8, pady=6)
+        ttk.Label(bar, text="Mantén Ctrl/Shift para seleccionar varios.").pack(side="left")
+        tv = ttk.Treeview(top, columns=("id", "q", "k", "nexp"), show="headings", selectmode="extended", height=18)
+        for c, t, w in (("id", "ID", 60), ("q", "Consulta", 560), ("k", "k", 40), ("nexp", "Esperados", 90)):
+            tv.heading(c, text=t);
+            tv.column(c, width=w, anchor=("w" if c in ("id", "q") else "e"))
+        tv.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        for cid, q, k, js in cases:
+            try:
+                nexp = len(json.loads(js))
+            except Exception:
+                nexp = "?"
+            tv.insert("", "end", values=(cid, q, int(k or self.var_bp_topk.get() or 5), nexp))
+
+        def run_now():
+            sel = tv.selection()
+            if not sel:
+                messagebox.showinfo("Banco de pruebas", "Selecciona al menos un caso.", parent=top);
+                return
+            sel_ids = [int(tv.item(i, "values")[0]) for i in sel]
+            top.destroy()
+
+            # Reutiliza la lógica de _bp_run_all, pero filtrando por ids
+            ts = datetime.now().isoformat(timespec="seconds")
+            k_global = int(self.var_bp_topk.get() or 5)
+
+            def norm(p):
+                return os.path.normcase(os.path.normpath(p or ""))
+
+            # Ventana de progreso
+            win = tk.Toplevel(self);
+            win.title("Ejecutando evaluación (seleccionados)…");
+            win.geometry("980x520")
+            lab = ttk.Label(win, text="Preparando…");
+            lab.pack(anchor="w", padx=10, pady=(10, 6))
+            pb = ttk.Progressbar(win, mode="determinate", maximum=len(sel_ids));
+            pb.pack(fill="x", padx=10)
+            tv2 = ttk.Treeview(win, columns=("id", "ok", "p", "r", "mrr", "rank", "ms", "hits", "exp", "q"),
+                               show="headings", height=16)
+            for c, t, w in (
+            ("id", "ID", 50), ("ok", "OK", 50), ("p", "Prec@", 70), ("r", "Rec@", 70), ("mrr", "MRR", 70),
+            ("rank", "1ª pos", 70), ("ms", "ms", 70), ("hits", "hits", 60), ("exp", "exp", 60), ("q", "Consulta", 500)):
+                tv2.heading(c, text=t);
+                tv2.column(c, width=w, anchor=("e" if c in ("p", "r", "mrr", "rank", "ms", "hits", "exp") else "w"))
+            tv2.pack(fill="both", expand=True, padx=10, pady=8)
+
+            def worker():
+                acc_p = acc_r = acc_mrr = 0.0;
+                done = 0
+                try:
+                    with self.app.data._connect() as con:
+                        cur = con.cursor()
+                        qmap = {cid: (q, k, js) for cid, q, k, js in cases}
+                        for cid in sel_ids:
+                            q, k_case, js = qmap[cid]
+                            k = int(k_case or k_global or 5)
+                            try:
+                                expected = [norm(p) for p in json.loads(js)]
+                            except Exception:
+                                expected = []
+                            t0 = time.time()
+                            try:
+                                hits = self.app.llm._index_hits(q, top_k=k, max_note_chars=220) or []
+                            except Exception:
+                                hits = []
+                            dt_ms = int((time.time() - t0) * 1000)
+
+                            got = [norm(h.get("path")) for h in hits if h.get("path")]
+                            found = len(set(expected).intersection(set(got)))
+                            first_rank = next((i for i, p in enumerate(got, start=1) if p in expected), None)
+                            mrr = (1.0 / first_rank) if first_rank else 0.0
+                            precision = (found / max(1, k))
+                            recall = (found / max(1, len(expected)))
+                            ok = 1 if found > 0 else 0
+
+                            det = {"expected": expected, "hits": got}
+                            cur.execute("""INSERT OR REPLACE INTO test_results
+                                           (ts, case_id, top_k, hits, expected, found, precision, recall, mrr, first_hit_rank, dt_ms, details_json)
+                                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        (ts, cid, k, len(got), len(expected), found, precision, recall, mrr, first_rank,
+                                         dt_ms,
+                                         json.dumps(det, ensure_ascii=False)))
+                            con.commit()
+
+                            acc_p += precision;
+                            acc_r += recall;
+                            acc_mrr += mrr;
+                            done += 1
+                            self.after(0,
+                                       lambda cid=cid, ok=ok, p=precision, r=recall, mrr=mrr, fr=first_rank, ms=dt_ms,
+                                              h=len(got), e=len(expected), q=q:
+                                       tv2.insert("", "end", values=(
+                                       cid, "✓" if ok else "✗", f"{p:.2f}", f"{r:.2f}", f"{mrr:.2f}", fr or "-", ms, h,
+                                       e, q)))
+                            self.after(0, lambda: (
+                            pb.config(value=done), lab.config(text=f"Ejecutando… {done}/{len(sel_ids)}")))
+                except Exception as e:
+                    self.after(0, lambda: messagebox.showerror("Evaluación", f"Error: {e}", parent=win));
+                    return
+
+                n = max(1, len(sel_ids))
+                mean_p = acc_p / n;
+                mean_r = acc_r / n;
+                mean_mrr = acc_mrr / n
+                self.app._log("bp_eval_run", ts=ts, n=n, p=round(mean_p, 3), r=round(mean_r, 3), mrr=round(mean_mrr, 3),
+                              k=k_global)
+                self.after(0, lambda: lab.config(
+                    text=f"Finalizado. Prec@k={mean_p:.2f} · Rec@k={mean_r:.2f} · MRR={mean_mrr:.2f} (n={n})"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        ttk.Button(bar, text="Ejecutar", command=run_now).pack(side="right")
+
+    def _bp_show_last_results(self):
+        from tkinter import messagebox
+        self._bp_ensure_tables()
+        with self.app.data._connect() as con:
+            row = con.execute("SELECT MAX(ts) FROM test_results").fetchone()
+            last = row[0] if row else None
+            if not last:
+                messagebox.showinfo("Resultados", "No hay ejecuciones registradas.", parent=self); return
+            rows = con.execute("""SELECT c.id, c.q, r.top_k, r.hits, r.expected, r.found, r.precision, r.recall,
+                                         r.mrr, r.first_hit_rank, r.dt_ms
+                                  FROM test_results r
+                                  JOIN test_cases c ON c.id=r.case_id
+                                  WHERE r.ts=? ORDER BY c.id""", (last,)).fetchall()
+
+        top = tk.Toplevel(self); top.title(f"Resultados: {last}"); top.geometry("1000x540")
+        tv = ttk.Treeview(top, columns=("id","p","r","mrr","rank","ms","hits","exp","found","q"), show="headings")
+        for c,t,w in (("id","ID",50),("p","Prec@",70),("r","Rec@",70),("mrr","MRR",70),("rank","1ª pos",70),
+                      ("ms","ms",70),("hits","hits",60),("exp","exp",60),("found","aciertos",80),("q","Consulta",560)):
+            tv.heading(c, text=t); tv.column(c, width=w, anchor=("e" if c not in ("id","q") else "w"))
+        tv.pack(fill="both", expand=True)
+
+        acc_p=acc_r=acc_mrr=0.0
+        for (cid,q,k,hits,exp,found,p,r,mrr,fr,ms) in rows:
+            acc_p+=p; acc_r+=r; acc_mrr+=mrr
+            tv.insert("", "end", values=(cid, f"{p:.2f}", f"{r:.2f}", f"{mrr:.2f}", fr or "-", ms, hits, exp, found, q))
+
+        n = max(1, len(rows))
+        lab = ttk.Label(top, text=f"Medias  Prec@k={acc_p/n:.2f} · Rec@k={acc_r/n:.2f} · MRR={acc_mrr/n:.2f}  (n={n}, k variable por caso)")
+        lab.pack(anchor="w", padx=8, pady=6)
+
+    def _bp_compare_runs(self):
+        from tkinter import messagebox
+        self._bp_ensure_tables()
+        with self.app.data._connect() as con:
+            tss = [r[0] for r in con.execute("SELECT DISTINCT ts FROM test_results ORDER BY ts DESC").fetchall()]
+        if len(tss) < 2:
+            messagebox.showinfo("Comparar runs", "Necesitas al menos dos ejecuciones para comparar.", parent=self);
+            return
+
+        # UI selección de ts
+        top = tk.Toplevel(self);
+        top.title("Comparar runs");
+        top.geometry("1040x560")
+        row = ttk.Frame(top);
+        row.pack(fill="x", padx=8, pady=8)
+        ttk.Label(row, text="Run A:").pack(side="left");
+        cbA = ttk.Combobox(row, values=tss, state="readonly", width=24);
+        cbA.current(0);
+        cbA.pack(side="left", padx=(6, 20))
+        ttk.Label(row, text="Run B:").pack(side="left");
+        cbB = ttk.Combobox(row, values=tss, state="readonly", width=24);
+        cbB.current(1);
+        cbB.pack(side="left", padx=(6, 20))
+        out = ttk.Label(row, text="");
+        out.pack(side="left", padx=10)
+        tv = ttk.Treeview(top, columns=(
+        "id", "pA", "pB", "dP", "rA", "rB", "dR", "mA", "mB", "dM", "rankA", "rankB", "dRank", "q"), show="headings",
+                          height=18)
+        headers = [("id", "ID", 50), ("pA", "PrecA", 70), ("pB", "PrecB", 70), ("dP", "ΔPrec", 70),
+                   ("rA", "RecA", 70), ("rB", "RecB", 70), ("dR", "ΔRec", 70),
+                   ("mA", "MRRA", 70), ("mB", "MRRB", 70), ("dM", "ΔMRR", 70),
+                   ("rankA", "1ªA", 60), ("rankB", "1ªB", 60), ("dRank", "Δ1ª", 60),
+                   ("q", "Consulta", 520)]
+        for c, t, w in headers:
+            tv.heading(c, text=t);
+            tv.column(c, width=w, anchor=("e" if c not in ("id", "q") else "w"))
+        tv.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def run_diff():
+            tsA, tsB = cbA.get(), cbB.get()
+            if not tsA or not tsB or tsA == tsB:
+                messagebox.showinfo("Comparar runs", "Elige dos runs distintos.", parent=top);
+                return
+            with self.app.data._connect() as con:
+                A = {r[0]: r for r in con.execute(
+                    """SELECT c.id, c.q, r.precision, r.recall, r.mrr, r.first_hit_rank
+                       FROM test_results r JOIN test_cases c ON c.id=r.case_id WHERE r.ts=?""", (tsA,)).fetchall()}
+                B = {r[0]: r for r in con.execute(
+                    """SELECT c.id, c.q, r.precision, r.recall, r.mrr, r.first_hit_rank
+                       FROM test_results r JOIN test_cases c ON c.id=r.case_id WHERE r.ts=?""", (tsB,)).fetchall()}
+            for iid in tv.get_children(): tv.delete(iid)
+
+            # acumula medias de deltas
+            dP = dR = dM = dRank = 0.0;
+            n = 0
+            for cid in sorted(set(A.keys()) | set(B.keys())):
+                qa = A.get(cid);
+                qb = B.get(cid)
+                q = (qa or qb)[1]
+                pA, rA, mA, rkA = (qa[2], qa[3], qa[4], qa[5]) if qa else (0.0, 0.0, 0.0, None)
+                pB, rB, mB, rkB = (qb[2], qb[3], qb[4], qb[5]) if qb else (0.0, 0.0, 0.0, None)
+                d_p = (pB - pA);
+                d_r = (rB - rA);
+                d_m = (mB - mA)
+                # Δ rank (positivo = mejora si B tiene rank menor que A)
+                if rkA and rkB:
+                    d_rank = (rkA - rkB)
+                elif rkA and not rkB:
+                    d_rank = -rkA
+                elif rkB and not rkA:
+                    d_rank = rkB
+                else:
+                    d_rank = 0
+                tv.insert("", "end", values=(cid, f"{pA:.2f}", f"{pB:.2f}", f"{d_p:+.2f}",
+                                             f"{rA:.2f}", f"{rB:.2f}", f"{d_r:+.2f}",
+                                             f"{mA:.2f}", f"{mB:.2f}", f"{d_m:+.2f}",
+                                             rkA or "-", rkB or "-",
+                                             f"{d_rank:+d}" if isinstance(d_rank, int) else d_rank, q))
+                dP += d_p;
+                dR += d_r;
+                dM += d_m
+                try:
+                    dRank += (d_rank if isinstance(d_rank, (int, float)) else 0)
+                except Exception:
+                    pass
+                n += 1
+            if n:
+                out.config(
+                    text=f"ΔMedias  Prec={dP / n:+.3f} · Rec={dR / n:+.3f} · MRR={dM / n:+.3f} · Δ1ªpos={(dRank / n):+.2f }  (A→B)")
+            else:
+                out.config(text="(sin datos)")
+
+        ttk.Button(row, text="Comparar", command=run_diff).pack(side="right")
+
+    def _bp_show_last_details(self):
+        from tkinter import messagebox
+        import sys, subprocess
+
+        self._bp_ensure_tables()
+        with self.app.data._connect() as con:
+            row = con.execute("SELECT MAX(ts) FROM test_results").fetchone()
+            last = row[0] if row else None
+            if not last:
+                messagebox.showinfo("Detalles", "No hay ejecuciones registradas.", parent=self);
+                return
+            rows = con.execute("""SELECT c.id, c.q, r.details_json
+                                  FROM test_results r
+                                  JOIN test_cases c ON c.id=r.case_id
+                                  WHERE r.ts=? ORDER BY c.id""", (last,)).fetchall()
+
+        top = tk.Toplevel(self);
+        top.title(f"Detalles del run: {last}");
+        top.geometry("1100x620")
+        left = ttk.Frame(top, padding=6);
+        left.pack(side="left", fill="y")
+        ttk.Label(left, text="Casos").pack(anchor="w")
+        tv = ttk.Treeview(left, columns=("id", "q"), show="headings", height=22)
+        tv.heading("id", text="ID");
+        tv.heading("q", text="Consulta")
+        tv.column("id", width=60);
+        tv.column("q", width=340)
+        tv.pack(fill="y", expand=False)
+
+        mid = ttk.Frame(top, padding=6);
+        mid.pack(side="left", fill="both", expand=True)
+        ttk.Label(mid, text="Esperados").pack(anchor="w")
+        tv_exp = ttk.Treeview(mid, columns=("p",), show="headings", height=12)
+        tv_exp.heading("p", text="Ruta");
+        tv_exp.column("p", width=450)
+        tv_exp.pack(fill="x", expand=False, pady=(0, 8))
+        ttk.Label(mid, text="Hits").pack(anchor="w")
+        tv_hit = ttk.Treeview(mid, columns=("p",), show="headings", height=12)
+        tv_hit.heading("p", text="Ruta");
+        tv_hit.column("p", width=450)
+        tv_hit.pack(fill="x", expand=False)
+
+        bar = ttk.Frame(top, padding=6);
+        bar.pack(side="right", fill="y")
+
+        def _open_selected(tree):
+            sel = tree.selection()
+            if not sel: return
+            p = tree.item(sel[0], "values")[0]
+            try:
+                if os.name == "nt":
+                    os.startfile(p)  # Windows
+                elif sys.platform == "darwin":
+                    subprocess.call(["open", p])
+                else:
+                    subprocess.call(["xdg-open", p])
+            except Exception as e:
+                messagebox.showerror("Abrir", f"No pude abrir la ruta:\n{e}", parent=top)
+
+        ttk.Button(bar, text="Abrir esperado", command=lambda: _open_selected(tv_exp)).pack(pady=4)
+        ttk.Button(bar, text="Abrir hit", command=lambda: _open_selected(tv_hit)).pack(pady=4)
+
+        data = {}
+        for cid, q, js in rows:
+            data[cid] = (q, js)
+            tv.insert("", "end", values=(cid, q))
+
+        def on_sel(_e=None):
+            sel = tv.selection()
+            if not sel: return
+            cid = int(tv.item(sel[0], "values")[0])
+            q, js = data[cid]
+            try:
+                det = json.loads(js or "{}")
+            except Exception:
+                det = {}
+            exp = det.get("expected") or []
+            hits = det.get("hits") or []
+            for t in (tv_exp, tv_hit):
+                for iid in t.get_children(): t.delete(iid)
+            for p in exp: tv_exp.insert("", "end", values=(p,))
+            for p in hits: tv_hit.insert("", "end", values=(p,))
+
+        tv.bind("<<TreeviewSelect>>", on_sel)
 
     def _export_log_jsonl(self):
         p = filedialog.asksaveasfilename(parent=self, title="Exportar log (.jsonl)",
@@ -706,8 +1703,9 @@ class AdminPanel(ttk.Notebook):
         if not rows:
             messagebox.showinfo(APP_NAME, "¡Todo tiene observaciones! 💪", parent=self); return
         top = tk.Toplevel(self); top.title("Docs sin observaciones"); top.geometry("900x500")
-        tv = ttk.Treeview(top, columns=("path","kw"), show="headings")
-        tv.heading("path","text"); tv.heading("kw","text")
+        tv = ttk.Treeview(top, columns=("path", "kw"), show="headings")
+        tv.heading("path", text="Ruta")
+        tv.heading("kw", text="Keyword")
         tv.column("path", width=700); tv.column("kw", width=160)
         tv.pack(fill="both", expand=True)
         for path, kw in rows:
@@ -888,7 +1886,7 @@ class AdminPanel(ttk.Notebook):
 
     def _open_fuentes_panel(self):
         """Abre la ventana de Fuentes usando los hits de ESTE chat."""
-        hits = getattr(self, "_hits", []) or []
+        hits = getattr(self.asst, "_hits", []) or []
         if not hits:
             messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.")
             return
@@ -972,54 +1970,10 @@ class ChatWithLLM(ChatFrame):
             pass
 
     def _import_index_sheet(self):
-        """Importa un índice Excel/CSV a SQLite (doc_keywords/doc_notes)."""
-        p = filedialog.askopenfilename(
-            title="Importar índice (Excel/CSV)",
-            filetypes=[("Excel", "*.xlsx *.xls"), ("CSV", "*.csv"), ("Todos", "*.*")]
-        )
-        if not p:
-            return
-        # Pequeña ventana de progreso indeterminado
-        top = tk.Toplevel(self); top.title("Importando índice…")
-        ttk.Label(top, text="Importando índice a la base de datos…").pack(padx=12, pady=(12, 6))
-        pb = ttk.Progressbar(top, mode="indeterminate"); pb.pack(fill="x", padx=12, pady=(0, 12)); pb.start(60)
-        top.update_idletasks()
-
-        def worker():
-            try:
-                store = MetaStore(self.app.data.db_path)
-                stats = store.import_index_sheet(p, replace_mode=replace_mode, progress=_progress, progress_every=250)
-
-                # --- NUEVO: refrescar chips tras importar
-                self.after(0, lambda: getattr(self, "asst", None) and self.asst._load_chips())
-
-                # --- NUEVO: auto-demo → lanza la primera keyword top para rellenar 'Fuentes sugeridas'
-                def _auto_demo():
-                    try:
-                        klist = self.app.data.keywords_top(limit=1)
-                        if klist:
-                            # simula un clic de chip → rellena tabla de la derecha y actualiza "Fuentes (n)"
-                            self.asst._chip_click(klist[0][0])
-                    except Exception:
-                        pass
-                self.after(0, _auto_demo)
-
-                # refresca pie y avisa
-                self.after(0, self.app._refresh_footer)
-                self.after(0, lambda: messagebox.showinfo(
-                    APP_NAME,
-                    "Índice importado correctamente.\n\n"
-                    f"Filas: {stats.get('rows',0)}  ·  Docs: {stats.get('docs',0)}  ·  "
-                    f"Kws añadidas: {stats.get('kws_added',0)}  ·  Notas: {stats.get('notes_set',0)}",
-                    parent=self
-                ))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error importando índice:\n{e}", parent=self))
-            finally:
-                self.after(0, _close_top)
-
-
-        threading.Thread(target=worker, daemon=True).start()
+        from tkinter import messagebox
+        messagebox.showinfo(APP_NAME,
+                            "Para importar el índice, usa Admin ▸ Índice y herramientas ▸ Importar índice (Excel/CSV)…",
+                            parent=self)
 
     def _open_fuentes_panel(self):
         """Abre la ventana de Fuentes usando los hits de ESTE chat."""
