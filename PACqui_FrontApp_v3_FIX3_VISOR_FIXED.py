@@ -496,6 +496,10 @@ class AdminPanel(ttk.Notebook):
         ttk.Button(frm, text="Cargar modelo (backend)", command=self._load_model).grid(row=1, column=2, padx=4)
         frm.columnconfigure(1, weight=1)
 
+        # Tab modelo de datos (esquema SQLite)
+        tSchema = ttk.Frame(self, padding=10);
+        self.add(tSchema, text="Modelo de datos")
+        self._build_schema_tab(tSchema)
 
         # Tab logs
         t3 = ttk.Frame(self, padding=10); self.add(t3, text="Logs y estado")
@@ -559,6 +563,507 @@ class AdminPanel(ttk.Notebook):
             pass
 
         self._refresh_logs_tab()
+
+    def _build_schema_tab(self, parent):
+        """
+        Explorador de esquema SQLite del índice:
+        - Árbol de objetos (tablas, vistas).
+        - Detalle de columnas, índices, claves foráneas.
+        - SQL DDL con copiar/exportar.
+        - Vista de datos (primeras N filas).
+        """
+        root = self.app
+
+        cols = ttk.Panedwindow(parent, orient="horizontal");
+        cols.pack(fill="both", expand=True)
+
+        # ---- IZQUIERDA: Árbol de objetos ----
+        left = ttk.Frame(cols, padding=6);
+        cols.add(left, weight=1)
+        barL = ttk.Frame(left);
+        barL.pack(fill="x")
+        ttk.Label(barL, text="Objetos").pack(side="left")
+        ttk.Button(barL, text="Refrescar", command=lambda: self._schema_reload()).pack(side="right")
+
+        self.tv_schema = ttk.Treeview(left, show="tree", height=24)
+        self.tv_schema.pack(fill="both", expand=True, pady=(4, 0))
+
+        # ---- DERECHA: Notebook de detalle ----
+        right = ttk.Notebook(cols);
+        cols.add(right, weight=3)
+
+        # Pestaña Tabla (columnas + fks)
+        t_tab = ttk.Frame(right, padding=6);
+        right.add(t_tab, text="Tabla")
+        ttk.Label(t_tab, text="Columnas").pack(anchor="w")
+        self.tv_cols = ttk.Treeview(t_tab, columns=("name", "type", "notnull", "dflt", "pk"), show="headings", height=8)
+        for c, t, w, a in (("name", "Nombre", 220, "w"), ("type", "Tipo", 120, "w"),
+                           ("notnull", "NN", 60, "center"), ("dflt", "Defecto", 200, "w"), ("pk", "PK", 60, "center")):
+            self.tv_cols.heading(c, text=t);
+            self.tv_cols.column(c, width=w, anchor=a)
+        self.tv_cols.pack(fill="x", expand=False, pady=(2, 8))
+
+        ttk.Label(t_tab, text="Claves foráneas").pack(anchor="w")
+        self.tv_fks = ttk.Treeview(t_tab, columns=("id", "seq", "tbl", "from", "to", "on_upd", "on_del"),
+                                   show="headings", height=7)
+        for c, t, w in (("id", "id", 50), ("seq", "seq", 50), ("tbl", "tabla ref", 160), ("from", "desde", 140),
+                        ("to", "hacia", 140), ("on_upd", "on update", 100), ("on_del", "on delete", 100)):
+            self.tv_fks.heading(c, text=t);
+            self.tv_fks.column(c, width=w, anchor=("e" if c in ("id", "seq") else "w"))
+        self.tv_fks.pack(fill="both", expand=True)
+
+        # Pestaña Índices
+        t_idx = ttk.Frame(right, padding=6);
+        right.add(t_idx, text="Índices")
+        self.tv_idx = ttk.Treeview(t_idx, columns=("name", "unique", "origin", "cols"), show="headings", height=15)
+        for c, t, w in (
+        ("name", "Índice", 260), ("unique", "Único", 70), ("origin", "Origen", 80), ("cols", "Columnas", 360)):
+            self.tv_idx.heading(c, text=t);
+            self.tv_idx.column(c, width=w, anchor=("w" if c != "unique" else "center"))
+        self.tv_idx.pack(fill="both", expand=True)
+
+        # Pestaña SQL (DDL)
+        t_sql = ttk.Frame(right, padding=6);
+        right.add(t_sql, text="SQL (DDL)")
+        barS = ttk.Frame(t_sql);
+        barS.pack(fill="x")
+        ttk.Button(barS, text="Copiar", command=lambda: self._schema_copy_sql()).pack(side="left")
+        ttk.Button(barS, text="Exportar .sql…", command=lambda: self._schema_export_sql()).pack(side="left", padx=6)
+        self.txt_sql = tk.Text(t_sql, height=18, wrap="none", font=("Consolas", 10))
+        vs = ttk.Scrollbar(t_sql, orient="vertical", command=self.txt_sql.yview)
+        self.txt_sql.configure(yscrollcommand=vs.set)
+        self.txt_sql.pack(side="left", fill="both", expand=True);
+        vs.pack(side="left", fill="y")
+
+        # Pestaña Datos (preview)
+        t_data = ttk.Frame(right, padding=6);
+        right.add(t_data, text="Datos")
+        barD = ttk.Frame(t_data);
+        barD.pack(fill="x")
+        ttk.Label(barD, text="Filas:").pack(side="left")
+        self.var_rows = tk.IntVar(value=50)
+        ttk.Spinbox(barD, from_=1, to=1000, textvariable=self.var_rows, width=6).pack(side="left", padx=4)
+        ttk.Button(barD, text="Mostrar", command=lambda: self._schema_show_data()).pack(side="left")
+        self.tv_data = ttk.Treeview(t_data, show="headings", height=18)
+        self.tv_data.pack(fill="both", expand=True, pady=(6, 0))
+
+        # Pestaña ER (diagrama mini)
+        t_er = ttk.Frame(right, padding=6); right.add(t_er, text="ER")
+        barE = ttk.Frame(t_er); barE.pack(fill="x")
+        ttk.Button(barE, text="Redibujar", command=lambda:self._er_draw()).pack(side="left")
+        ttk.Button(barE, text="Autoajustar", command=lambda:self._er_fit()).pack(side="left", padx=6)
+        ttk.Button(barE, text="Guardar (.ps)…", command=lambda:self._er_export_ps()).pack(side="left")
+
+        self.var_er_guess = tk.BooleanVar(value=True)
+        ttk.Checkbutton(barE, text="Inferir FKs", variable=self.var_er_guess,
+                        command=lambda: self._er_draw()).pack(side="left", padx=(8, 0))
+
+        # Canvas con barras de scroll
+        wrap = ttk.Frame(t_er); wrap.pack(fill="both", expand=True, pady=(6,0))
+        self.cv_er = tk.Canvas(wrap, background="#f8fafc", scrollregion=(0,0,2000,1500), highlightthickness=1, relief="sunken")
+        vs_er = ttk.Scrollbar(wrap, orient="vertical", command=self.cv_er.yview)
+        hs_er = ttk.Scrollbar(wrap, orient="horizontal", command=self.cv_er.xview)
+        self.cv_er.configure(yscrollcommand=vs_er.set, xscrollcommand=hs_er.set)
+
+        wrap.rowconfigure(0, weight=1); wrap.columnconfigure(0, weight=1)
+        self.cv_er.grid(row=0, column=0, sticky="nsew")
+        vs_er.grid(row=0, column=1, sticky="ns")
+        hs_er.grid(row=1, column=0, sticky="ew")
+
+        # Eventos
+        self.tv_schema.bind("<<TreeviewSelect>>", lambda e: self._schema_on_select())
+        # Carga inicial
+        self._schema_reload()
+
+    def _schema_reload(self):
+        # Rellena árbol Tablas/Vistas a partir de sqlite_master
+        for iid in self.tv_schema.get_children(): self.tv_schema.delete(iid)
+        root_tbl = self.tv_schema.insert("", "end", text="Tablas", open=True)
+        root_vw = self.tv_schema.insert("", "end", text="Vistas", open=True)
+        with self.app.data._connect() as con:
+            rows = con.execute("""
+                SELECT type, name
+                FROM sqlite_master
+                WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
+                ORDER BY type, name
+            """).fetchall()
+        for t, name in rows:
+            parent = root_tbl if t == "table" else root_vw
+            self.tv_schema.insert(parent, "end", iid=f"{t}:{name}", text=name, open=False)
+
+        # Redibuja el ER con las tablas actuales
+        try:
+            self._er_draw()
+        except Exception:
+            pass
+
+
+    def _schema_on_select(self):
+        sel = self.tv_schema.selection()
+        if not sel: return
+        kind, name = sel[0].split(":", 1) if ":" in sel[0] else ("table", self.tv_schema.item(sel[0], "text"))
+        self._schema_fill_table(name, kind)
+
+        # ... ya llamas a _schema_fill_table(...)
+        try:
+            if kind == "table":
+                self._er_highlight(name)
+        except Exception:
+            pass
+
+
+    def _schema_fill_table(self, name: str, kind: str = "table"):
+        # Columnas
+        for iid in self.tv_cols.get_children(): self.tv_cols.delete(iid)
+        for iid in self.tv_fks.get_children(): self.tv_fks.delete(iid)
+        for iid in self.tv_idx.get_children(): self.tv_idx.delete(iid)
+        self.txt_sql.delete("1.0", "end")
+        try:
+            with self.app.data._connect() as con:
+                cols = con.execute(f"PRAGMA table_info('{name}')").fetchall()  # cid, name, type, notnull, dflt, pk
+                for _cid, n, t, nn, d, pk in cols:
+                    self.tv_cols.insert("", "end",
+                                        values=(n, t, "✓" if nn else "", d if d is not None else "", "✓" if pk else ""))
+                fks = con.execute(f"PRAGMA foreign_key_list('{name}')").fetchall()
+                for (fid, seq, tbl, col_from, col_to, on_upd, on_del, *_rest) in [
+                    (r[0], r[1], r[2], r[3], r[4], r[5], r[6], *r[7:]) for r in fks
+                ]:
+                    self.tv_fks.insert("", "end", values=(fid, seq, tbl, col_from, col_to, on_upd, on_del))
+                idxs = con.execute(f"PRAGMA index_list('{name}')").fetchall()  # seq, name, unique, origin, partial
+                for _seq, idx_name, uniq, origin, partial in idxs:
+                    cols_info = con.execute(f"PRAGMA index_info('{idx_name}')").fetchall()  # seqno, cid, name
+                    col_list = ", ".join([r[2] for r in cols_info])
+                    self.tv_idx.insert("", "end", values=(idx_name, "✓" if uniq else "", origin, col_list))
+                ddl = con.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()
+                self.txt_sql.insert("1.0", ddl[0] or "-- (objeto sin SQL explícito)") if ddl else self.txt_sql.insert(
+                    "1.0", "-- (no encontrado)")
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Modelo de datos", f"Error leyendo esquema de '{name}':\n{e}", parent=self)
+
+    def _schema_copy_sql(self):
+        try:
+            sql = self.txt_sql.get("1.0", "end").strip()
+            if not sql: return
+            self.clipboard_clear();
+            self.clipboard_append(sql)
+        except Exception:
+            pass
+
+    def _schema_export_sql(self):
+        from tkinter import filedialog, messagebox
+        path = filedialog.asksaveasfilename(parent=self, title="Guardar esquema como .sql",
+                                            defaultextension=".sql", filetypes=[("SQL", "*.sql"), ("Todos", "*.*")])
+        if not path: return
+        try:
+            with self.app.data._connect() as con:
+                rows = con.execute("""
+                    SELECT type, name, sql
+                    FROM sqlite_master
+                    WHERE type IN ('table','index','trigger','view') AND sql IS NOT NULL
+                    ORDER BY type, name
+                """).fetchall()
+            with open(path, "w", encoding="utf-8") as f:
+                for t, n, sql in rows:
+                    f.write(f"-- {t}: {n}\n{sql};\n\n")
+            messagebox.showinfo("Exportar esquema", "Esquema exportado correctamente.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Exportar esquema", f"No se pudo exportar:\n{e}", parent=self)
+
+    def _schema_show_data(self):
+        # Muestra primeras N filas de la tabla seleccionada
+        sel = self.tv_schema.selection()
+        if not sel: return
+        kind, name = sel[0].split(":", 1) if ":" in sel[0] else ("table", self.tv_schema.item(sel[0], "text"))
+        if kind != "table": return
+        n = int(self.var_rows.get() or 50)
+
+        # limpia tabla de datos
+        for iid in self.tv_data.get_children(): self.tv_data.delete(iid)
+        # recalcula columnas
+        self.tv_data["columns"] = ()
+        try:
+            with self.app.data._connect() as con:
+                cols = [r[1] for r in con.execute(f"PRAGMA table_info('{name}')").fetchall()]
+                if not cols: return
+                self.tv_data["columns"] = cols
+                for c in cols:
+                    self.tv_data.heading(c, text=c);
+                    self.tv_data.column(c, width=max(80, int(800 / len(cols))), anchor="w")
+                rows = con.execute(f"SELECT * FROM '{name}' LIMIT ?", (n,)).fetchall()
+            for r in rows:
+                self.tv_data.insert("", "end", values=r)
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Datos", f"No pude leer datos de '{name}':\n{e}", parent=self)
+
+    # ---------- ER helpers ----------
+    def _er_collect(self):
+        """
+        Devuelve:
+          tables: {tabla: [{name,type,pk}, ...]}
+          fks: [(src_tbl, src_col, dst_tbl, dst_col, kind)]  # kind in {"decl","guess"}
+        1) Lee FKs declaradas (PRAGMA foreign_key_list)
+        2) Si var_er_guess está activa, añade FKs inferidas por heurística:
+           - columnas *_id -> <tabla>.id (singular/plural simple)
+           - columnas fullpath -> files.fullpath (si existe)
+        """
+
+        def singular_candidates(x: str):
+            x = x.lower()
+            cand = {x, x + "s", x + "es"}
+            if x.endswith("s"): cand.add(x[:-1])  # usuarios -> usuario
+            if x.endswith("es"): cand.add(x[:-2])  # indices -> indice
+            # Mapeos específicos del proyecto:
+            if x == "case": cand.add("test_cases")
+            if x == "chunk": cand.add("chunks")
+            return list(cand)
+
+        tables = {}
+        fks = []
+        with self.app.data._connect() as con:
+            # Tablas (sin sqlite_*)
+            rows = con.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+            """).fetchall()
+            table_names = [r[0] for r in rows]
+
+            # Columnas por tabla
+            cols_by_tbl = {}
+            for name in table_names:
+                cols = con.execute(f"PRAGMA table_info('{name}')").fetchall()  # cid, name, type, notnull, dflt, pk
+                tables[name] = [{"name": r[1], "type": r[2], "pk": bool(r[5])} for r in cols]
+                cols_by_tbl[name] = {r[1].lower() for r in cols}
+
+            # 1) FKs declaradas
+            for name in table_names:
+                fkl = con.execute(f"PRAGMA foreign_key_list('{name}')").fetchall()
+                for r in fkl:
+                    # r: (id, seq, table, from, to, on_update, on_delete, match)
+                    fks.append((name, r[3], r[2], r[4], "decl"))
+
+        # 2) FKs inferidas (opcional)
+        if getattr(self, "var_er_guess", None) and self.var_er_guess.get():
+            declared = {(a.lower(), b.lower(), c.lower(), d.lower()) for (a, b, c, d, _) in fks}
+            for src_tbl, cols in cols_by_tbl.items():
+                # a) patrón *_id -> <tabla>.id
+                for col in list(cols):
+                    if col.endswith("_id"):
+                        base = col[:-3]  # quita _id
+                        for target in singular_candidates(base):
+                            if target in cols_by_tbl and "id" in cols_by_tbl[target]:
+                                key = (src_tbl.lower(), col, target.lower(), "id")
+                                if key not in declared:
+                                    fks.append((src_tbl, col, target, "id", "guess"))
+                                break
+                # b) fullpath -> files.fullpath
+                if "fullpath" in cols and "files" in cols_by_tbl and "fullpath" in cols_by_tbl["files"]:
+                    key = (src_tbl.lower(), "fullpath", "files", "fullpath")
+                    if key not in declared:
+                        fks.append((src_tbl, "fullpath", "files", "fullpath", "guess"))
+
+        return tables, fks
+
+    def _er_draw(self):
+        """Dibuja el mini diagrama ER en el canvas."""
+        import math
+        cv = getattr(self, "cv_er", None)
+        if not cv:
+            return
+        cv.delete("all")
+        self._er_nodes = {}   # table -> {"rect": id, "bbox": (x1,y1,x2,y2)}
+        self._er_colpos = {}  # {tabla_lower: {col_lower: y_centro_en_canvas}}
+
+        tables, fks = self._er_collect()
+        names = list(tables.keys())
+        if not names:
+            cv.create_text(20, 20, text="(No hay tablas)", anchor="nw"); return
+
+        # Auto-layout en rejilla
+        n = len(names)
+        cols = max(1, int(math.ceil(math.sqrt(n))))
+        node_w_min, row_gap, col_gap = 240, 70, 70
+        x0, y0 = 60, 60
+
+        # Dibuja nodos
+        coords = {}
+        for idx, name in enumerate(names):
+            col = idx % cols
+            row = idx // cols
+            x = x0 + col * (node_w_min + col_gap)
+            y = y0 + row * (140 + row_gap)
+
+            # Alto según nº de columnas (cap a 12 visibles)
+            vis_cols = tables[name][:12]
+            node_h = 28 + 18*max(1, len(vis_cols)) + 12
+
+            # Caja
+            rect = cv.create_rectangle(x, y, x+node_w_min, y+node_h,
+                                       fill="#ffffff", outline="#0ea5e9", width=2, tags=(f"node:{name}", "node"))
+            # Título
+            cv.create_rectangle(x, y, x+node_w_min, y+26, fill="#e0f2fe", outline="#0ea5e9", width=2)
+            cv.create_text(x+8, y+13, text=name, anchor="w", font=("Segoe UI", 10, "bold"),
+                           tags=(f"node:{name}",))
+            # Columnas
+            for i, c in enumerate(vis_cols):
+                y_text = y + 30 + i * 18  # Y donde pintamos el texto
+                y_center = y_text + 9  # centro visual de esa fila
+                label = f"{'🔑 ' if c['pk'] else ''}{c['name']} : {c['type'] or ''}".rstrip()
+                cv.create_text(x + 10, y_text, text=label, anchor="w", font=("Consolas", 9), tags=(f"node:{name}",))
+                # registra la Y de la columna para anclar aristas
+                self._er_colpos.setdefault(name.lower(), {})[(c['name'] or '').lower()] = y_center
+
+            self._er_nodes[name] = {"rect": rect, "bbox": (x, y, x+node_w_min, y+node_h)}
+            coords[name] = (x, y, x+node_w_min, y+node_h)
+
+        # Dibuja aristas (FKs)
+        # Dibuja aristas (FKs)
+        # Dibuja aristas (FKs), ancladas a la fila de la columna y con codo ortogonal
+        for edge in fks:
+            if len(edge) == 4:
+                src_tbl, src_col, dst_tbl, dst_col = edge;
+                kind = "decl"
+            else:
+                src_tbl, src_col, dst_tbl, dst_col, kind = edge
+
+            if src_tbl not in coords or dst_tbl not in coords:
+                continue
+            sx1, sy1, sx2, sy2 = coords[src_tbl]
+            dx1, dy1, dx2, dy2 = coords[dst_tbl]
+
+            # Y exacta de las columnas (si no la tenemos, centro de la caja)
+            y1 = self._er_colpos.get(src_tbl.lower(), {}).get((src_col or "").lower(), (sy1 + sy2) / 2)
+            y2 = self._er_colpos.get(dst_tbl.lower(), {}).get((dst_col or "").lower(), (dy1 + dy2) / 2)
+
+            # ¿Conectamos en horizontal (cajas no solapadas en X) o vertical?
+            horiz = (sx2 <= dx1) or (dx2 <= sx1)
+
+            M = 6  # margen en px
+
+            if horiz:
+                if sx2 <= dx1:
+                    x1, x2 = sx2 + M, dx1 - M  # antes: sx2, dx1
+                else:
+                    x1, x2 = sx1 - M, dx2 + M  # antes: sx1, dx2
+                xm = (x1 + x2) / 2.0
+                pts = (x1, y1, xm, y1, xm, y2, x2, y2)
+            else:
+                cx1, cx2 = (sx1 + sx2) / 2.0, (dx1 + dx2) / 2.0
+                if sy2 <= dy1:
+                    y_top, y_bot = sy2 + M, dy1 - M  # antes: sy2, dy1
+                else:
+                    y_top, y_bot = sy1 - M, dy2 + M  # antes: sy1, dy2
+                ym = (y_top + y_bot) / 2.0
+                pts = (cx1, y1, cx1, ym, cx2, ym, cx2, y2)
+
+            color = "#334155" if kind == "decl" else "#94a3b8"
+            width = 2 if kind == "decl" else 1
+            dash = None if kind == "decl" else (4, 2)
+
+            edge_tag = f"edge:{src_tbl}.{src_col}->{dst_tbl}.{dst_col}"
+            cv.create_line(
+                *pts,
+                arrow="last",
+                fill=color,
+                width=width,
+                dash=dash,
+                joinstyle="round",
+                tags=("edge", edge_tag)  # <<— NUEVO
+            )
+
+
+            # Etiqueta cerca del codo
+            labx = (pts[2] + pts[4]) / 2.0
+            laby = (pts[3] + pts[5]) / 2.0 - 12
+            cv.create_text(labx, laby, text=f"{src_col} → {dst_col}", font=("Consolas", 8), fill=color)
+
+        # Eventos: click en caja => sincroniza árbol de tablas
+        def on_click(evt):
+            item = cv.find_closest(evt.x, evt.y)
+            tags = cv.gettags(item)
+            tname = None
+            for t in tags:
+                if t.startswith("node:"):
+                    tname = t.split(":",1)[1]; break
+            if tname:
+                try:
+                    self.tv_schema.selection_set(f"table:{tname}")
+                except Exception:
+                    # fallback por si el iid no existe
+                    pass
+                self._er_highlight(tname)
+
+        cv.tag_bind("node", "<Button-1>", on_click)
+
+        # Hover sobre aristas (grosor temporal)
+        def _hover_in(_e):
+            cv.itemconfig("current", width=3)
+
+        def _hover_out(_e):
+            # Si la línea es discontinua (inferida) volvemos a 1; si no, a 2
+            dash = cv.itemcget("current", "dash")
+            cv.itemconfig("current", width=(1 if dash else 2))
+
+        cv.tag_bind("edge", "<Enter>", _hover_in)
+        cv.tag_bind("edge", "<Leave>", _hover_out)
+
+        cv.create_line(20, 20, 60, 20, fill="#334155", width=2)
+        cv.create_text(70, 20, text="FK declarada", anchor="w", font=("Segoe UI", 8))
+        cv.create_line(160, 20, 200, 20, fill="#94a3b8", width=1, dash=(4, 2))
+        cv.create_text(210, 20, text="FK inferida", anchor="w", font=("Segoe UI", 8))
+        self._er_fit()
+
+
+
+    def _er_fit(self):
+        """Ajusta scrollregion y centra el diagrama."""
+        cv = getattr(self, "cv_er", None)
+        if not cv:
+            return
+        try:
+            bb = cv.bbox("all")
+            if bb:
+                cv.configure(scrollregion=bb)
+                # centra en el canvas
+                (x1,y1,x2,y2) = bb
+                w = max(1, x2-x1); h = max(1, y2-y1)
+                cw = max(1, cv.winfo_width()); ch = max(1, cv.winfo_height())
+                cv.xview_moveto(max(0.0, (x1 + (w-cw)/2) / max(1, x2)))
+                cv.yview_moveto(max(0.0, (y1 + (h-ch)/2) / max(1, y2)))
+        except Exception:
+            pass
+
+    def _er_highlight(self, table_name: str):
+        """Resalta una tabla en el ER y des-resalta el resto."""
+        cv = getattr(self, "cv_er", None)
+        if not cv or not getattr(self, "_er_nodes", None):
+            return
+        for t, meta in self._er_nodes.items():
+            col = "#0ea5e9" if t == table_name else "#94a3b8"
+            try:
+                cv.itemconfig(meta["rect"], outline=col, width=(3 if t==table_name else 1))
+            except Exception:
+                pass
+
+    def _er_export_ps(self):
+        """Exporta el canvas como PostScript (.ps) sin dependencias externas."""
+        from tkinter import filedialog, messagebox
+        cv = getattr(self, "cv_er", None)
+        if not cv:
+            return
+        p = filedialog.asksaveasfilename(parent=self, title="Guardar diagrama (.ps)",
+                                         defaultextension=".ps",
+                                         filetypes=[("PostScript", "*.ps"), ("Todos", "*.*")])
+        if not p: return
+        try:
+            bb = cv.bbox("all") or (0,0,1200,800)
+            cv.postscript(file=p, colormode="color", pagewidth=bb[2]-bb[0])
+            messagebox.showinfo("Exportar", f"Diagrama guardado en:\n{p}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Exportar", f"No se pudo exportar:\n{e}", parent=self)
+
 
     # ---------- ZONA PELIGROSA ----------
     def _build_danger_tab(self, parent):
