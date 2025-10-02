@@ -1,6 +1,7 @@
 
 import os, json, threading, tkinter as tk
 import time
+import traceback
 from datetime import datetime
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
@@ -181,6 +182,34 @@ CONFIG_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "PACqui"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = CONFIG_DIR / "settings.json"
 
+def _cargar_dataset_evaluacion(self):
+    """
+    Carga casos de prueba desde SQLite. Ajusta si tu tabla/nombres difieren.
+    Espera devolver [{'id': ..., 'query': ...}, ...]
+    """
+    # Si usas Banco de pruebas, toma 'test_cases(id, q)'
+    with self.app.data._connect() as con:
+        rows = con.execute("SELECT id, q FROM test_cases ORDER BY id").fetchall()
+    return [{"id": r[0], "query": r[1]} for r in rows]
+
+def _guardar_resultado_eval(self, caso: dict, respuesta: str, dt_ms: int = 0):
+    """
+    Persiste la respuesta del LLM en SQLite. Crea tabla si no existe.
+    """
+    self._ensure_eval_tables()  # ya la tienes implementada
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with self.app.data._connect() as con:
+        con.execute(
+            "INSERT INTO eval_llm_responses (ts, case_id, query, response, chars, dt_ms) VALUES (?,?,?,?,?,?)",
+            (ts,
+             caso.get("id"),
+             caso.get("query", ""),
+             respuesta,
+             len(str(respuesta or "")),
+             int(dt_ms or 0))
+        )
+        con.commit()
+
 def _load_cfg():
     if CONFIG_PATH.exists():
         try: return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -277,6 +306,25 @@ class AppRoot(tk.Tk):
 
     def events_snapshot(self):
         return list(self._events)
+
+    def post_event(self, ev: dict):
+        """Inyecta eventos en el bus central para que los vea el AdminPanel."""
+        # Garantiza timestamp y añade al ring buffer
+        try:
+            ev.setdefault("ts", time.time())
+        except Exception:
+            pass
+        try:
+            self._events.append(ev)
+            self._events = self._events[-500:]  # mantén el buffer en ~500
+            # Notifica a listeners en caliente (si los hay)
+            for fn in list(self._event_listeners):
+                try:
+                    fn(ev)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def subscribe_events(self, callback):
         self._event_listeners.append(callback)
@@ -538,6 +586,7 @@ class AdminPanel(ttk.Notebook):
         ttk.Button(bar, text="Exportar .jsonl", command=self._export_log_jsonl).pack(side="left", padx=6)
         ttk.Button(bar, text="Limpiar", command=self._clear_log).pack(side="left")
         self.txt_log = tk.Text(center, height=20, wrap="none", font=("Consolas", 10))
+        self.txt_console = self.txt_log
         vs = ttk.Scrollbar(center, orient="vertical", command=self.txt_log.yview)
         self.txt_log.configure(yscrollcommand=vs.set)
         self.txt_log.pack(side="left", fill="both", expand=True); vs.pack(side="left", fill="y")
@@ -1081,6 +1130,29 @@ class AdminPanel(ttk.Notebook):
 
         ttk.Separator(left).pack(fill="x", pady=(8,4))
 
+        # --- Backend (hilo) ---
+        ttk.Separator(left).pack(fill="x", pady=(8, 4))
+        grp = ttk.Labelframe(left, text="Backend (hilo)", padding=6)
+        grp.pack(fill="x", expand=False, pady=(4, 0))
+
+        btn_eval_all = ttk.Button(grp, text="Ejecutar evaluación (todos)",
+                                  command=lambda: self._backend_evaluacion_todos())
+        btn_eval_all.pack(anchor="w", pady=2)
+
+        btn_cancel = ttk.Button(grp, text="Cancelar",
+                                command=lambda: self.cancelar_backend())
+        btn_cancel.pack(anchor="w", pady=2)
+
+        btn_autotest = ttk.Button(grp, text="Backend ▶ Autotest",
+                                  command=lambda: self._backend_selftest())
+        btn_autotest.pack(anchor="w", pady=2)
+
+        # Registra botones de backend para que _set_busy los bloquee/rehabilite
+        try:
+            self._backend_buttons = [btn_eval_all, btn_cancel, btn_autotest]
+        except Exception:
+            pass
+
         ttk.Button(left, text="Vaciar PALABRAS CLAVE (doc_keywords)…", command=self._danger_wipe_keywords).pack(anchor="w", pady=2)
         ttk.Button(left, text="Vaciar OBSERVACIONES (doc_notes)…", command=self._danger_wipe_notes).pack(anchor="w", pady=2)
 
@@ -1136,6 +1208,255 @@ class AdminPanel(ttk.Notebook):
             self._bp_ensure_tables()
         except Exception:
             pass
+
+    def _llm_eval_invoke(self, entrada: str, contexto: str, prompt_sistema: str) -> str:
+        """
+        Invoca el LLM local con la MISMA configuración que usa el chat.
+        Reutiliza self.app.llm (tu LLMService).
+        """
+        mdl = getattr(self.app, "llm", None)
+        if mdl is None:
+            # Si tu App autoload del modelo va por otro método, llámalo aquí:
+            if hasattr(self.app, "_autoload_model"):
+                self.app._autoload_model()
+                mdl = getattr(self.app, "llm", None)
+        if mdl is None:
+            raise RuntimeError("LLM no cargado (revisa _autoload_model y self.app.llm).")
+
+        messages = [
+            {"role": "system", "content": prompt_sistema or "Responde SIEMPRE en español neutro."},
+            {"role": "user", "content": ((contexto or "") + "\n\n" + (entrada or "")).strip()}
+        ]
+
+        # Tu LLMService expone .chat(...). Lo estás usando así en el banco de pruebas. :contentReference[oaicite:2]{index=2}
+        if hasattr(mdl, "chat"):
+            out = mdl.chat(messages=messages, temperature=0.2, stream=False)
+            return out["choices"][0]["message"]["content"]
+
+        # Compatibilidad si expusieras el objeto llama-cpp por debajo:
+        llama = getattr(mdl, "model", None) or getattr(mdl, "llama", None)
+        if llama and hasattr(llama, "create_chat_completion"):
+            out = llama.create_chat_completion(messages=messages, temperature=0.2)
+            return out["choices"][0]["message"]["content"]
+
+        raise RuntimeError("No encuentro un método compatible para invocar el modelo.")
+
+    def _ensure_eval_tables(self):
+        with self.app.data._connect() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS eval_llm_responses (
+                    ts TEXT NOT NULL,
+                    case_id INTEGER NOT NULL,
+                    query TEXT NOT NULL,
+                    response TEXT,
+                    chars INTEGER,
+                    dt_ms INTEGER,
+                    PRIMARY KEY (ts, case_id)
+                )
+            """)
+            con.commit()
+    # >>> PATCH BACKEND: infra común acciones backend (pegar íntegro)
+    import threading, traceback, time
+
+    def _set_busy(self, text=None):
+        """Deshabilita botones de Backend y actualiza barra/estado si existe."""
+        try:
+            self._backend_busy = bool(text)
+            for btn in getattr(self, "_backend_buttons", []):
+                try:
+                    btn.config(state=("disabled" if text else "normal"))
+                except Exception:
+                    pass
+            if hasattr(self, "status_var"):
+                self.status_var.set(text or "")
+            if hasattr(self, "progress"):
+                if text:
+                    try:
+                        self.progress.start(10)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.progress.stop()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _post_event(self, level, src, msg):
+        ev = {"ts": time.time(), "level": level, "src": src, "msg": msg}
+        try:
+            # Preferir el bus de la app si existe
+            if hasattr(self, "app") and hasattr(self.app, "post_event"):
+                self.app.post_event(ev)
+                return
+        except Exception:
+            pass
+        # Fallback: directo a la consola de esta vista
+        try:
+            self._append_console_line(ev)
+        except Exception:
+            pass
+
+    def backend_action(name):
+        """Decorador para unificar logs, errores y UI busy en todas las acciones de Backend."""
+
+        def deco(fn):
+            def wrapper(self, *args, **kwargs):
+                if getattr(self, "_backend_busy", False):
+                    from tkinter import messagebox
+                    try:
+                        messagebox.showinfo("PACqui",
+                                            "Hay un proceso de Backend en marcha. Espera a que termine o cancélalo.")
+                    except Exception:
+                        pass
+                    return
+                self._cancel_event = threading.Event()
+                self._set_busy(f"{name}…")
+                self._post_event("INFO", "Backend", f"▶ {name} — INICIO")
+
+                def run():
+                    ok = True
+                    err = None
+                    t0 = time.perf_counter()
+                    try:
+                        fn(self, *args, **kwargs)
+                    except Exception as e:
+                        ok = False
+                        err = e
+                        self._post_event("ERROR", "Backend", f"{name} falló: {e!r}")
+                        traceback.print_exc()
+                    finally:
+                        dt = time.perf_counter() - t0
+                        lvl = "SUCCESS" if ok else "ERROR"
+                        self._post_event(lvl, "Backend", f"■ {name} — FIN ({dt:0.2f}s)")
+                        self._set_busy(None)
+
+                threading.Thread(target=run, daemon=True).start()
+
+            return wrapper
+
+        return deco
+
+    def cancelar_backend(self):
+        """Puede colgarse a un botón 'Cancelar'."""
+        try:
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.set()
+                self._post_event("WARN", "Backend", "Cancelación solicitada por el usuario")
+        except Exception:
+            pass
+
+    # <<< PATCH BACKEND
+    @backend_action("Evaluación (todos)")
+    def _backend_evaluacion_todos(self, _dry_run: bool = False):
+        """
+        Ejecuta la evaluación masiva de prompts/dataset en hilo, con bloqueo UI y cancelación.
+        _dry_run=True → self-test (no llama al LLM).
+        """
+        # 1) Carga dataset
+        try:
+            dataset = _cargar_dataset_evaluacion(self)
+        except Exception as e:
+            self._post_event("ERROR", "Evaluación", f"No pude cargar el dataset: {e!r}")
+            return
+
+        n = len(dataset or [])
+        if n == 0:
+            self._post_event("WARN", "Evaluación", "Dataset vacío: nada que evaluar")
+            return
+
+        self._post_event("INFO", "Evaluación", f"Casos a evaluar: {n}")
+
+        # 2) Bucle principal
+        for i, caso in enumerate(dataset, 1):
+            # Cancelación
+            if getattr(self, "_cancel_event", None) and self._cancel_event.is_set():
+                self._post_event("WARN", "Evaluación", "Proceso cancelado por el usuario")
+                break
+
+            if _dry_run:
+                time.sleep(0.01)
+                self._post_event("DEBUG", "Evaluación", f"[{i}/{n}] DRY-RUN {caso.get('id', i)}")
+                continue
+
+            # 3) Llamada real al LLM
+            try:
+                # Contexto RAG coherente con tu chat (usa lo que ya tienes)
+                contexto = ""
+                try:
+                    # Si expones algún recuperador de contexto en la App o LLMService, úsalo aquí.
+                    # En tu Banco de pruebas llamas a self.app.llm._index_hits(...) para evaluar el índice. :contentReference[oaicite:4]{index=4}
+                    # Si quieres, puedes montar 'contexto' concatenando notas/hits. Si no, déjalo vacío.
+                    pass
+                except Exception:
+                    contexto = ""
+
+                prompt_sistema = getattr(self, "system_prompt_eval", "Responde SIEMPRE en español neutro.")
+                entrada = caso.get("query", "")
+
+                t0 = time.perf_counter()
+                respuesta = self._llm_eval_invoke(entrada, contexto, prompt_sistema)
+                dt_ms = int((time.perf_counter() - t0) * 1000)
+
+                # 4) Métrica simple y log
+                self._post_event("INFO", "Evaluación", f"[{i}/{n}] {caso.get('id', i)} → {len(str(respuesta))} chars")
+
+                # 5) Persistencia de resultados
+                try:
+                    _guardar_resultado_eval(self, caso, respuesta, dt_ms=dt_ms)
+
+                except Exception as e:
+                    self._post_event("WARN", "Evaluación", f"No guardé resultado {caso.get('id', i)}: {e!r}")
+
+            except Exception as e:
+                self._post_event("ERROR", "Evaluación", f"[{i}/{n}] Error: {e!r}")
+
+            # 6) Progreso visual si tienes progressbar en esta vista
+            try:
+                if hasattr(self, "progress"):
+                    self.progress.stop();
+                    self.progress["mode"] = "determinate"
+                    self.progress["maximum"] = n
+                    self.progress["value"] = i
+                    self.progress.update_idletasks()
+            except Exception:
+                pass
+
+    def _backend_selftest(self):
+        """
+        DRY-RUN de acciones críticas del backend para validar wiring, logs y sincronización.
+        """
+        pruebas = []
+
+        # Registra tus funciones reales:
+        if hasattr(self, "_backend_evaluacion_todos"):
+            pruebas.append(("Evaluación (todos)", self._backend_evaluacion_todos))
+
+        # Si tienes más acciones de backend, añádelas aquí:
+        if hasattr(self, "_backend_indexar_excel"):
+            pruebas.append(("Reindexar Excel", getattr(self, "_backend_indexar_excel")))
+        if hasattr(self, "_backend_scrap_keywords"):
+            pruebas.append(("Scrapeo de palabras clave", getattr(self, "_backend_scrap_keywords")))
+        if hasattr(self, "_backend_exportar_excel"):
+            pruebas.append(("Exportar Excel indexada", getattr(self, "_backend_exportar_excel")))
+
+        self._post_event("INFO", "SelfTest", f"Pruebas encontradas: {len(pruebas)}")
+
+        ok_count = 0
+        for (nombre, fn) in pruebas:
+            t0 = time.perf_counter()
+            try:
+                # Todas deben aceptar **kwargs y tragarse _dry_run=True
+                fn(_dry_run=True)
+                dt = time.perf_counter() - t0
+                ok_count += 1
+                self._post_event("SUCCESS", "SelfTest", f"{nombre}: OK ({dt:0.3f}s)")
+            except Exception as e:
+                dt = time.perf_counter() - t0
+                self._post_event("ERROR", "SelfTest", f"{nombre}: FALLÓ ({dt:0.3f}s) → {e!r}")
+
+        self._post_event("INFO", "SelfTest", f"Resumen: {ok_count}/{len(pruebas)} OK")
 
 
     # ---- Helpers de confirmación y SQL ----
@@ -2073,62 +2394,189 @@ class AdminPanel(ttk.Notebook):
         except Exception as e:
             messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{e}", parent=self)
 
-    def _tick_logs(self):
-        try:
-            if self.var_auto_logs.get():
-                self._refresh_logs_tab()
-        finally:
-            # reprograma el siguiente tick aunque haya habido excepción
-            self.after(2000, self._tick_logs)
+    # >>> PATCH LOGS: helpers de eventos (pegar íntegro)
+    import time
+    from datetime import datetime
+    import traceback
 
-    def _refresh_logs_tab(self):
-        # 1) Estado del índice
-        try:
-            tables, kw, notes = self.app.data.stats()
-            with self.app.data._connect() as con:
-                cur = con.cursor()
-                cur.execute("SELECT COUNT(DISTINCT lower(fullpath)) FROM doc_keywords")
-                docs_kw = cur.fetchone()[0] or 0
-                cur.execute("SELECT COUNT(DISTINCT lower(fullpath)) FROM doc_notes")
-                docs_note = cur.fetchone()[0] or 0
-            cov_pct = 100.0 * docs_note / max(1, docs_kw)
-            cov = f"{cov_pct:.1f}%"
-            self.lbl_idx.config(
-                text=f"tablas={tables} · keywords={kw} · notas={notes} · docs_kw={docs_kw} · docs_con_nota={docs_note} ({cov})",
-                foreground=("red" if cov_pct < 30 else "orange" if cov_pct < 60 else "green")
-            )
+    @staticmethod
+    def _parse_ts_to_epoch(ts_val):
+        """Devuelve epoch (float). Acepta int/float, string ISO, string numérica, o None."""
+        if ts_val is None:
+            return time.time()
+        if isinstance(ts_val, (int, float)):
+            return float(ts_val)
+        if isinstance(ts_val, str):
+            s = ts_val.strip()
+            # 1) ¿número en texto?
+            try:
+                return float(s)
+            except ValueError:
+                pass
+            # 2) ISO estándar (admite 'YYYY-MM-DD HH:MM:SS' y 'YYYY-MM-DDTHH:MM:SS[.mmm][Z|±hh:mm]')
+            try:
+                iso = s[:-1] if s.endswith("Z") else s
+                return datetime.fromisoformat(iso).timestamp()
+            except Exception:
+                pass
+            # 3) Algunos formatos comunes
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%H:%M:%S"):
+                try:
+                    return datetime.strptime(s, fmt).timestamp()
+                except Exception:
+                    continue
+        # Fallback
+        return time.time()
 
-        except Exception as e:
-            self.lbl_idx.config(text=f"(error índice: {e})")
+    @staticmethod
+    def _coerce_event(ev):
+        """Normaliza un evento a dict con claves ts(float), level, src, msg."""
+        if not isinstance(ev, dict):
+            return {
+                "ts": time.time(),
+                "level": "INFO",
+                "src": "app",
+                "msg": str(ev),
+            }
+        ts = _parse_ts_to_epoch(ev.get("ts"))
+        level = (ev.get("level") or ev.get("lvl") or "INFO").upper()
+        if level not in ("DEBUG", "INFO", "WARN", "WARNING", "ERROR", "SUCCESS"):
+            level = "INFO"
+        if level == "WARNING":
+            level = "WARN"
+        src = ev.get("src") or ev.get("where") or ev.get("origin") or ""
+        msg = ev.get("msg") or ev.get("message") or repr(ev)
+        return {"ts": ts, "level": level, "src": src, "msg": msg}
 
-        # 2) Estado del modelo
+    def _ensure_console_tags(self):
+        """Configura los tags si no existen (colores opcionales). Llamar una vez."""
+        txt = self.txt_console
         try:
-            llm = self.app.llm
-            if llm and llm.is_loaded():
-                mp = Path(getattr(llm, "model_path", "") or "").name
-                self.lbl_llm.config(text=f"{mp or '(desconocido)'} · ctx={llm.ctx} · th={llm.threads} · batch={llm.n_batch}")
-            else:
-                self.lbl_llm.config(text="(no cargado)")
-        except Exception as e:
-            self.lbl_llm.config(text=f"(error modelo: {e})")
-
-        # 3) Top keywords
-        for iid in self.tv_top.get_children():
-            self.tv_top.delete(iid)
-        try:
-            for kw, cnt in (self.app.data.keywords_top(limit=20) or []):
-                self.tv_top.insert("", "end", values=(kw, cnt))
+            txt.tag_config("lvl_DEBUG", foreground="#888888")
+            txt.tag_config("lvl_INFO", foreground="#222222")   # o "#000000"
+            txt.tag_config("lvl_WARN", foreground="#E6A700")
+            txt.tag_config("lvl_ERROR", foreground="#FF5555", underline=1)
+            txt.tag_config("lvl_SUCCESS", foreground="#2ECC71")
         except Exception:
             pass
 
-        # 4) Volcar eventos actuales
-        self._reload_console(self.app.events_snapshot())
+    # <<< PATCH LOGS: helpers de eventos
+    # >>> PATCH LOGS: recarga segura de consola (pegar íntegro)
+    def _append_console_line(self, ev):
+        ev = self._coerce_event(ev)
+        ts_str = time.strftime("%H:%M:%S", time.localtime(ev["ts"]))
+        level = ev["level"]
+        src = f"{ev['src']}: " if ev.get("src") else ""
+        line = f"{ts_str} [{level}] {src}{ev['msg']}\n"
+        tag = f"lvl_{level}"
+        try:
+            self.txt_console.insert("end", line, (tag,))
+            self.txt_console.see("end")
+        except Exception:
+            # último recurso
+            self.txt_console.insert("end", line)
+            self.txt_console.see("end")
 
     def _reload_console(self, events):
-        self.txt_log.config(state="normal"); self.txt_log.delete("1.0","end")
-        for ev in events[-200:]:
-            self._append_console_line(ev)
-        self.txt_log.config(state="disabled"); self.txt_log.see("end")
+        if not hasattr(self, "_console_tags_ready"):
+            self._ensure_console_tags()
+            self._console_tags_ready = True
+        for ev in events:
+            try:
+                self._append_console_line(ev)
+            except Exception as e:
+                # Nunca romper el loop por un mal evento
+                try:
+                    self._append_console_line({
+                        "level": "ERROR",
+                        "src": "LOGS",
+                        "msg": f"Evento inválido: {e!r} // {ev!r}"
+                    })
+                except Exception:
+                    pass
+
+    def _refresh_logs_tab(self):
+        # Obtiene snapshot y además refresca la columna izquierda (estado y top keywords)
+        try:
+            # --- Estado del índice (lee del SQLite) ---
+            try:
+                st = self.app.data.stats()  # devuelve (tablas, keywords, notas) o dict según tu impl.
+                # Soporta ambos formatos (tu footer usa tupla):
+                if isinstance(st, tuple):
+                    tables, kw, notes = st
+                else:
+                    tables = st.get("tables", "?");
+                    kw = st.get("keywords", "?");
+                    notes = st.get("notes", "?")
+                try:
+                    from pathlib import Path
+                    dbname = Path(self.app.data.db_path).name
+                except Exception:
+                    dbname = str(getattr(self.app.data, "db_path", "index_cache.sqlite"))
+                self.lbl_idx.config(text=f"{dbname} (tablas: {tables}; keywords: {kw}; notas: {notes})")
+            except Exception:
+                pass
+
+            # --- Estado del modelo (recicla el texto que ya pintas en la barra superior) ---
+            try:
+                self.lbl_llm.config(text=self.app.lbl_model.cget("text"))
+            except Exception:
+                try:
+                    # Fallback muy simple
+                    mdl_ok = bool(getattr(getattr(self.app, "llm", None), "model", None))
+                    self.lbl_llm.config(text="Modelo: cargado" if mdl_ok else "Modelo: (no cargado)")
+                except Exception:
+                    pass
+
+            # --- Top keywords (50 primeras) ---
+            try:
+                # Vacía el árbol y recarga desde SQLite
+                for it in self.tv_top.get_children():
+                    self.tv_top.delete(it)
+                top = []
+                try:
+                    # Si tu método admite 'limit', úsalo; si no, deja la llamada simple
+                    top = self.app.data.keywords_top(limit=50)
+                except TypeError:
+                    top = self.app.data.keywords_top()
+                # Espera pares (keyword, n)
+                for kw, n in (top or []):
+                    self.tv_top.insert("", "end", values=(kw, n))
+            except Exception:
+                pass
+
+            # --- Consola (lo que ya tenías) ---
+            snap = []
+            try:
+                snap = self.app.events_snapshot()
+            except Exception as e:
+                snap = [{"level": "WARN", "src": "LOGS", "msg": f"Sin snapshot: {e!r}", "ts": time.time()}]
+            self._reload_console(snap)
+
+        except Exception as e:
+            self._append_console_line({"level": "ERROR", "src": "LOGS", "msg": f"_refresh_logs_tab falló: {e!r}"})
+
+    # <<< PATCH LOGS
+    # >>> PATCH LOGS: temporizador a prueba de bombas (pegar íntegro)
+    def _tick_logs(self):
+        """Temporiza la recarga de logs sin permitir que una excepción mate el loop."""
+        try:
+            self._refresh_logs_tab()
+        except Exception as e:
+            # Capturamos todo para evitar bucles de callback fallidos
+            try:
+                self._append_console_line({"level": "ERROR", "src": "LOGS", "msg": f"_tick_logs: {e!r}"})
+                traceback.print_exc()
+            except Exception:
+                pass
+        finally:
+            # Reprograma el siguiente tick
+            try:
+                self.after(500, self._tick_logs)
+            except Exception:
+                pass
+
+    # <<< PATCH LOGS
 
     def on_new_event(self, ev):
         try:
@@ -2138,11 +2586,7 @@ class AdminPanel(ttk.Notebook):
         except Exception:
             pass
 
-    def _append_console_line(self, ev):
-        ts = datetime.fromtimestamp(ev.get("ts", time.time())).strftime("%H:%M:%S")
-        typ = ev.get("type","evt")
-        detail = {k:v for k,v in ev.items() if k not in ("ts","type")}
-        self.txt_log.insert("end", f"[{ts}] {typ}: {detail}\n")
+
 
     def _export_log(self):
         p = filedialog.asksaveasfilename(parent=self, title="Exportar log", defaultextension=".txt",
@@ -2343,28 +2787,21 @@ class AdminPanel(ttk.Notebook):
                         pass
                 self.after(0, _auto_demo)
                 # 2.5) logging del evento de importación
+                # 3) pie de estado + aviso
                 try:
-                    self.app._log(
-                        "index_import",
-                        path=path,
-                        rows=stats.get("rows", 0),
-                        docs=stats.get("docs", 0),
-                        kws_added=stats.get("kws_added", 0),
-                        notes_set=stats.get("notes_set", 0)
-                    )
+                    self.after(0, self.app._refresh_footer)
+                    self.after(0, self._refresh_logs_tab)  # refresca la pestaña “Logs y estado”
                 except Exception:
                     pass
 
-
-                # 3) pie de estado + aviso
-                self.after(0, self.app._refresh_footer)
                 self.after(0, lambda: messagebox.showinfo(
                     APP_NAME,
                     "Índice importado correctamente.\n\n"
-                    f"Filas: {stats.get('rows',0)}  ·  Docs: {stats.get('docs',0)}  ·  "
-                    f"Kws añadidas: {stats.get('kws_added',0)}  ·  Notas: {stats.get('notes_set',0)}",
+                    f"Filas: {stats.get('rows', 0)}  ·  Docs: {stats.get('docs', 0)}  ·  "
+                    f"Kws añadidas: {stats.get('kws_added', 0)}  ·  Notas: {stats.get('notes_set', 0)}",
                     parent=self
                 ))
+
             except Exception as e:
                 self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error importando índice:\n{e}", parent=self))
             finally:
