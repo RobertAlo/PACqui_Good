@@ -81,7 +81,8 @@ def _import_rag_patch():
     here = os.path.dirname(os.path.abspath(__file__))
     roots = [here, os.path.dirname(here)]
     for root in roots:
-        path = os.path.join(root, "pacqui_index_context_patch.py")
+        path = os.path.join(root,
+                            "../../OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/Proyecto actual/pacqui_index_context_patch.py")
         if os.path.exists(path):
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
@@ -269,6 +270,17 @@ class AppRoot(tk.Tk):
         ensure_admin_password(self)
         self._autoload_model()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # tras self._autoload_model() o justo después de crear self.llm
+        try:
+            import sqlite3
+            with sqlite3.connect(self.data.db_path) as con:
+                c = con.cursor()
+                n_chunks = c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                n_embs = c.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+            print(f"[RAG] chunks={n_chunks} embeddings={n_embs} en {self.data.db_path}")
+        except Exception as e:
+            print(f"[RAG] No se pudo comprobar: {e}")
 
     def _log(self, typ: str, **data):
         ev = {"ts": time.time(), "type": typ}
@@ -539,7 +551,7 @@ class AdminPanel(ttk.Notebook):
         ttk.Entry(frm, textvariable=self.var_path, width=80).grid(row=0, column=1, sticky="we", padx=6, pady=2)
         ttk.Button(frm, text="Elegir…", command=self._choose_model).grid(row=0, column=2, padx=4)
         ttk.Label(frm, text="Contexto:").grid(row=1, column=0, sticky="w")
-        self.var_ctx = tk.StringVar(value=str(_load_cfg().get("model_ctx") or 2048))
+        self.var_ctx = tk.StringVar(value=str(_load_cfg().get("model_ctx") or 4096))
         ttk.Entry(frm, textvariable=self.var_ctx, width=8).grid(row=1, column=1, sticky="w", pady=2)
         ttk.Button(frm, text="Cargar modelo (backend)", command=self._load_model).grid(row=1, column=2, padx=4)
         frm.columnconfigure(1, weight=1)
@@ -2898,6 +2910,14 @@ class ChatWithLLM(ChatFrame):
         self.pb.stop()
         self.pb.pack_forget()
 
+        # Toggle: solo índice (sin LLM)
+        self.var_notes_only = tk.BooleanVar(value=False)
+        chk = ttk.Checkbutton(parent, text="Solo índice (sin LLM)",
+                              variable=self.var_notes_only,
+                              command=lambda: setattr(self, "notes_only", bool(self.var_notes_only.get())))
+        chk.pack(side="left", padx=(8, 0))
+
+
     # --- NUEVO: helpers para el spinner ---
     def _spinner_start(self):
         try:
@@ -3018,9 +3038,15 @@ class ChatWithLLM(ChatFrame):
             "Si el contexto es insuficiente, dilo. No inventes rutas ni datos."
         )
 
-        # Contexto conservador inicial
-        idx_top, idx_note_chars = 3, 150
-        rag_k, rag_frag_chars = 1, 320
+        # Contexto inicial (auto-escala con el ctx del modelo)
+        ctx = int(getattr(self.llm, "ctx", 2048) or 2048)
+        if ctx >= 4096:
+            idx_top, idx_note_chars = 4, 220
+            rag_k, rag_frag_chars = 3, 360
+        else:
+            idx_top, idx_note_chars = 3, 150
+            rag_k, rag_frag_chars = 1, 320
+
 
         def shrink(text: str, max_chars: int) -> str:
             t = (text or "").strip()
@@ -3081,64 +3107,124 @@ class ChatWithLLM(ChatFrame):
         return msgs, hits, max_final
 
     def _send_llm(self):
-        text = self.ent_input.get().strip()
-        if not text:
+        from tkinter import messagebox
+        import threading, os
+
+        q = self.ent_input.get().strip()
+        if not q:
             messagebox.showinfo(APP_NAME, "Escribe algo para enviar.")
             return
 
-        # Echo del usuario
-        self._append_chat("Tú", text)
+        # Echo del usuario y limpia entrada
+        self._append_chat("Tú", q)
         self.ent_input.delete(0, "end")
 
-        _ensure_rag_patch()  # activa el monkey-patch si aún no está activo
+        # Asegura el patch de índice (no rompe si no está)
+        _ensure_rag_patch()
 
-        # 1) Recupera hits ya (y pinta el panel)
-        hits = self._collect_hits(text, top_k=5, note_chars=240)
+        # 1) Recuperación para pintar el panel de fuentes desde YA
+        hits = self._collect_hits(q, top_k=5, note_chars=240) or []
         self._hits = hits
         try:
             self._fill_sources_tree(hits)
         except Exception:
             pass
 
-        # --- LOG de la consulta del asistente (hits, hits con nota, tokens usuario, ctx, etc.) ---
-        try:
-            tok_user = self.llm.count_tokens(text)
-        except Exception:
-            tok_user = len(text)
-
-        try:
-            # self.app se añade en el punto 5
-            if getattr(self, "app", None):
-                self.app._log(
-                    "assistant_reply",
-                    query=text,
-                    hits=len(hits or []),
-                    hits_con_nota=sum(1 for h in (hits or []) if (h.get('note') or '').strip()),
-                    tok_user=tok_user,
-                    ctx=self.llm.ctx,
-                    llm=self.llm.is_loaded()
-                )
-        except Exception:
-            pass
-
-
-        # 2) Construye bloques deterministas (observaciones + rutas)
-        obs_block, rutas_block, used_hits = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
-
-        # Si no hay observaciones, mantenemos tu modo determinista de antes
-        if not obs_block:
-            self._reply_with_observations(text)
-            return
-
-        # 3) Frase humana sólo si el modelo está cargado (y no notes_only)
-        if self.llm.is_loaded() and not getattr(self, "notes_only", False):
+        # 2) Responder con LLM ANCLADO AL CONTEXTO (si hay modelo y no es "solo índice")
+        if self.llm.is_loaded() and not self.notes_only:
             self._spinner_start()
 
             def worker():
                 try:
-                    titles = [(h.get("name") or h.get("path") or "").strip() for h in used_hits or hits]
-                    persona = self._persona_line_from_llm(text, titles, len(titles))
-                    final = f"{persona}\n\nObservaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}"
+                    # 1) Contexto (ÍNDICE + RAG)
+                    idx_ctx, idx_hits = self.llm.build_index_context(q, top_k=5, max_note_chars=220)
+                    rag_ctx = self.llm._rag_retrieve(q, k=6, max_chars=750)
+
+                    has_idx = bool((idx_ctx or "").strip())
+                    has_rag = bool((rag_ctx or "").strip())
+
+                    # 2) Si NO hay NINGÚN contexto → salida determinista
+                    if not has_idx and not has_rag:
+                        rutas = []
+                        src = hits or []
+                        for s in src[:3]:
+                            name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
+                            rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
+                        msg = ("No tengo suficiente contexto en el repositorio. Prueba otra búsqueda "
+                               "o abre una de las rutas sugeridas.")
+                        if rutas:
+                            msg += "\n\nRutas sugeridas:\n\n" + "\n".join(rutas)
+                        self.after(0, lambda: self._append_chat("PACqui", msg))
+                        return
+
+                    # 3) Reglas duras según el modo (con RAG vs. solo índice)
+                    if has_rag:
+                        base_sys = (
+                            "Eres el asistente de PACqui. Responde SIEMPRE en español. "
+                            "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
+                            "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
+                        )
+                        header_user = (
+                            "INSTRUCCIONES: responde a la pregunta con 2–4 frases fundamentadas en los FRAGMENTOS. "
+                            "Incluye citas [n] en las frases que usen datos concretos."
+                        )
+                    else:
+                        base_sys = (
+                            "Eres el asistente de PACqui. Responde SIEMPRE en español. "
+                            "NO tienes fragmentos RAG. SOLO puedes usar el [ÍNDICE] (observaciones cortas del índice). "
+                            "No inventes definiciones ni datos externos. Responde en 2–4 frases breves y luego yo añadiré rutas."
+                        )
+                        header_user = (
+                            "INSTRUCCIONES: resume brevemente la relevancia de los documentos del [ÍNDICE] para la pregunta. "
+                            "No añadas contenido que no esté en esas observaciones."
+                        )
+
+                    # 4) Ensamblar contexto y recortar a presupuesto
+                    contexto = ""
+                    if has_idx:
+                        contexto += "[ÍNDICE]\n" + idx_ctx.strip() + "\n\n"
+                    if has_rag:
+                        contexto += "[FRAGMENTOS]\n" + rag_ctx.strip() + "\n\n"
+
+                    ctx_max = getattr(self.llm, "ctx", 2048)
+                    tok_out = max(128, min(256, int(ctx_max * 0.12)))
+                    tok_in_budget = max(256, ctx_max - tok_out - 64)
+
+                    def _tok(s: str) -> int:
+                        return self.llm.count_tokens(s)
+
+                    def _recorta_ctx(ctx_text: str, budget: int) -> str:
+                        if _tok(ctx_text) <= budget:
+                            return ctx_text
+                        if "[FRAGMENTOS]" in ctx_text:  # recorta primero RAG
+                            head, frag = ctx_text.split("[FRAGMENTOS]", 1)
+                            frag = "[FRAGMENTOS]" + frag
+                            lines = frag.splitlines()
+                            while lines and _tok(head + "\n".join(lines)) > budget:
+                                lines = lines[:-4]
+                            ctx_text = head + "\n".join(lines)
+                        while _tok(ctx_text) > budget and "\n" in ctx_text:
+                            ctx_text = "\n".join(ctx_text.splitlines()[:-4])
+                        return ctx_text
+
+                    contexto = _recorta_ctx(contexto, tok_in_budget)
+
+                    # 5) Mensajes y llamada al modelo
+                    messages = [
+                        {"role": "system", "content": base_sys},
+                        {"role": "user", "content": f"{header_user}\n\n{contexto}PREGUNTA: {q}"}
+                    ]
+                    out = self.llm.chat(messages=messages, temperature=0.1, max_tokens=tok_out, stream=False)
+                    content = ((out.get("choices") or [{}])[0].get("message") or {}).get("content", "") \
+                              or ((out.get("choices") or [{}])[0].get("text", "") or "")
+                    text_llm = (content or "").strip()
+
+                    # 6) Añadir rutas deterministas (para ambos modos)
+                    obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
+                    final = text_llm
+                    if rutas_block.strip():
+                        final += f"\n\nRutas sugeridas:\n\n{rutas_block}"
+
                     self.after(0, lambda: self._append_chat("PACqui", final))
                 finally:
                     self.after(0, self._spinner_stop)
@@ -3146,8 +3232,12 @@ class ChatWithLLM(ChatFrame):
             threading.Thread(target=worker, daemon=True).start()
             return
 
-        # 4) Si no hay modelo, salida determinista
-        final = f"Aquí tienes las fuentes que encajan. ¿Te abro alguna?\n\nObservaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}"
+        # 3) Si no hay modelo, salida determinista (sin LLM)
+        obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
+        final = (
+            "Aquí tienes las fuentes que encajan. ¿Te abro alguna?\n\n"
+            f"Observaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}"
+        )
         self._append_chat("PACqui", final)
 
     def _fill_sources_tree(self, hits):

@@ -3311,6 +3311,56 @@ class HelpDialog(tk.Toplevel):
         n = len(b)//4
         return list(struct.unpack('<'+'f'*n, b)) if n>0 else []
 
+    # === EMBEDDER BACKEND (ST -> HASH fallback) =================================
+    def _rag_meta_get(self, conn, key: str, default=None):
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS rag_meta(key TEXT PRIMARY KEY, value TEXT)")
+        row = c.execute("SELECT value FROM rag_meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def _rag_meta_set(self, conn, key: str, value: str):
+        c = conn.cursor()
+        c.execute("""
+        INSERT INTO rag_meta(key, value) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, value))
+        conn.commit()
+
+    def _get_embedder(self):
+        # cache
+        if hasattr(self, "_embedder_cached") and self._embedder_cached:
+            return self._embedder_cached
+
+        model_id = os.getenv("PACQUI_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        model_dir = os.getenv("PACQUI_EMBED_DIR", "")  # ruta local opcional
+
+        # 1) Preferir Sentence-Transformers si está instalado
+        try:
+            from sentence_transformers import SentenceTransformer  # pip install sentence-transformers
+            model_path = model_dir or model_id
+            st_model = SentenceTransformer(model_path)
+            dim = int(getattr(st_model, "get_sentence_embedding_dimension", lambda: 384)())
+
+            def _encode_st(text: str):
+                v = st_model.encode(text or "", normalize_embeddings=True)
+                return v.tolist() if hasattr(v, "tolist") else list(map(float, v))
+
+            sig = f"st:{dim}:{model_path}"
+            self._embedder_cached = {"encode": _encode_st, "dim": dim, "backend": "st", "sig": sig}
+            return self._embedder_cached
+        except Exception:
+            pass
+
+        # 2) Fallback: hash-embeddings (mismo que teníamos, normalizado)
+        def _encode_hash(text: str, _dim=256):
+            return self._hash_embedder(text, dim=_dim)
+
+        sig = "hash:256"
+        self._embedder_cached = {"encode": _encode_hash, "dim": 256, "backend": "hash", "sig": sig}
+        return self._embedder_cached
+
+    # ============================================================================
+
     def _hash_embedder(self, text: str, dim: int = 256):
         v = [0.0]*dim
         if not text:
@@ -3343,6 +3393,19 @@ class HelpDialog(tk.Toplevel):
                 conn = sqlite3.connect(self._db_path(), check_same_thread=False)
             self._db_rag_ensure(conn)
             c = conn.cursor()
+            # --- comprobar firma de embeddings y purgar si cambia ---
+            embed = self._get_embedder()
+            current_sig = embed["sig"]
+            stored_sig = self._rag_meta_get(conn, "embedding_sig")
+            if stored_sig != current_sig:
+                # Limpiamos embeddings para reindexar con el nuevo backend/dim
+                c.execute("DELETE FROM embeddings")
+                self._rag_meta_set(conn, "embedding_sig", current_sig)
+                try:
+                    self.queue.put(('msg', (f'RAG: firma embeddings cambiada → {current_sig}. Reindexando…', 'INFO')))
+                except Exception:
+                    pass
+
             try:
                 c.execute("DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE file_path=?)", (fullpath,))
                 c.execute("DELETE FROM chunks WHERE file_path=?", (fullpath,))
@@ -3355,8 +3418,9 @@ class HelpDialog(tk.Toplevel):
             for ch in self._text_chunks(txt, max_chars=1200, overlap=200):
                 c.execute("INSERT INTO chunks(file_path, mtime, text) VALUES(?,?,?)", (fullpath, float(mtime_ts), ch))
                 cid = c.lastrowid
-                v = self._hash_embedder(ch, dim=256)
-                c.execute("INSERT OR REPLACE INTO embeddings(chunk_id, vec) VALUES(?,?)", (cid, self._vec_to_blob(v)))
+                vec = self._get_embedder()["encode"](ch)
+                c.execute("INSERT OR REPLACE INTO embeddings(chunk_id, vec) VALUES(?,?)", (cid, self._vec_to_blob(vec)))
+
                 count += 1
             conn.commit()
             return count
@@ -4473,7 +4537,8 @@ try:
             def dot(a,b): return sum((x*y for x,y in zip(a,b)))
             def norm(a):
                 s = math.sqrt(sum((x*x for x in a))) or 1.0; return [x/s for x in a]
-            vq = norm(self._hash_embedder(query or '', dim=256))
+            vq = norm(self._get_embedder()["encode"](query or ''))
+
             scored=[]
             for cid, txt, fp, blob in rows:
                 vv = norm(blob_to_vec(blob)); s = dot(vq, vv)

@@ -48,13 +48,64 @@ class LLMService:
 
     # --------- token count util ---------
     def count_tokens(self, text: str) -> int:
-        if not text: return 0
         try:
-            toks = self.model.tokenize(text.encode("utf-8"), add_bos=False) if self.model else []
-            return len(toks)
+            return len(self.model.tokenize(text.encode("utf-8"), add_bos=False))
         except Exception:
-            # heurística: ~4 chars por token
-            return max(1, int(len(text) / 4))
+            return max(1, len(text) // 3)
+
+    def _rag_meta_get(self, key: str, default=None):
+        try:
+            con = sqlite3.connect(self.db_path, check_same_thread=False)
+            cur = con.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS rag_meta(key TEXT PRIMARY KEY, value TEXT)")
+            row = cur.execute("SELECT value FROM rag_meta WHERE key=?", (key,)).fetchone()
+            return row[0] if row else default
+        except Exception:
+            return default
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+    def _get_embedder(self):
+        # cache
+        if hasattr(self, "_embedder_cached") and self._embedder_cached:
+            return self._embedder_cached
+
+        sig = self._rag_meta_get("embedding_sig", None)
+
+        # Si el índice fue creado con Sentence-Transformers (st:dim:model)
+        if sig and sig.startswith("st:"):
+            try:
+                parts = sig.split(":", 2)
+                dim = int(parts[1]) if len(parts) > 1 else 384
+                model_path = parts[2] if len(parts) > 2 else os.getenv("PACQUI_EMBED_MODEL",
+                                                                       "sentence-transformers/all-MiniLM-L6-v2")
+                # Permitir override por variable de entorno PACQUI_EMBED_DIR
+                model_override = os.getenv("PACQUI_EMBED_DIR", "")
+                if model_override:
+                    model_path = model_override
+                from sentence_transformers import SentenceTransformer
+                st_model = SentenceTransformer(model_path)
+
+                def _encode_st(text: str):
+                    v = st_model.encode(text or "", normalize_embeddings=True)
+                    return v.tolist() if hasattr(v, "tolist") else list(map(float, v))
+
+                self._embedder_cached = {"encode": _encode_st, "dim": dim, "backend": "st", "sig": sig}
+                return self._embedder_cached
+            except Exception:
+                # Si el modelo no está instalado → caeremos a hash y anotaremos aviso en el contexto
+                self._embedder_cached = {"encode": lambda t: self._hash_embedder(t, dim=256),
+                                         "dim": 256, "backend": "hash", "sig": "hash:256",
+                                         "warn": f"[aviso] El índice usa {sig} pero no se pudo cargar el modelo local. Instala sentence-transformers o define PACQUI_EMBED_DIR."}
+                return self._embedder_cached
+
+        # Fallback por defecto (hash)
+        self._embedder_cached = {"encode": lambda t: self._hash_embedder(t, dim=256),
+                                 "dim": 256, "backend": "hash", "sig": "hash:256"}
+        return self._embedder_cached
 
     # --------- índice (keywords/observaciones) ---------
     def _index_hits(self, query: str, top_k: int = 8, max_note_chars: int = 240):
@@ -117,29 +168,32 @@ class LLMService:
         finally:
             con.close()
 
-    def _rag_retrieve(self, query: str, k: int = 2, max_chars: int = 600) -> str:
-        rows = self._rag_rows()
-        if not rows: return ""
-        def blob_to_vec(b):
-            n = len(b) // 4
-            return list(struct.unpack('<'+'f'*n, b)) if n>0 else []
-        def norm(a):
-            s = math.sqrt(sum((x*x for x in a))) or 1.0
-            return [x/s for x in a]
-        def dot(a,b): return sum((x*y for x,y in zip(a,b)))
-        vq = norm(self._hash_embedder(query or "", dim=256))
-        scored=[]
-        for _cid, txt, fp, blob in rows:
-            vv = norm(blob_to_vec(blob)); s = dot(vq, vv)
-            frag = (txt or "").strip()
-            if len(frag)>max_chars: frag = frag[:max_chars] + "…"
-            scored.append((s, frag, fp))
-        scored.sort(reverse=True, key=lambda t: t[0])
-        top = scored[:max(1,int(k))]
-        partes=[]
-        for i,(_,frag,fp) in enumerate(top, start=1):
-            partes.append(f"[{i}] {fp}\n\"\"\"\n{frag}\n\"\"\"")
-        return "\n\n".join(partes) if partes else ""
+    def _rag_retrieve(self, query: str, k: int = 4, max_chars: int = 700) -> str:
+        """
+        Recupera k fragmentos ordenados por similitud SIN descartar por umbral.
+        Devuelve un bloque con marcas [1], [2]... y ruta de fichero por fragmento.
+        """
+        try:
+            hits = self.rag.search(query, top_k=int(k) or 4)  # asume interfaz .search(query, top_k)
+        except Exception:
+            hits = []
+        if not hits:
+            return ""
+
+        frags, used = [], 0
+        for i, h in enumerate(hits, start=1):
+            text = (h.get("text") or "").strip()
+            path = (h.get("path") or h.get("file") or "").strip()
+            if not text:
+                continue
+            if len(text) > 600:
+                text = text[:600] + "…"
+            frag = f"[{i}] {text}\n    Fuente: {path}"
+            if used + len(frag) > max_chars * k:  # limita por tamaño total
+                break
+            frags.append(frag)
+            used += len(frag)
+        return "\n\n".join(frags)
 
     def _hash_embedder(self, text, dim=256):
         import hashlib
@@ -152,10 +206,60 @@ class LLMService:
         return [x/n for x in v]
 
     # --------- chat ---------
+    # pacqui_llm_service_FIX3.py  (dentro de class LLMService)
+
+    def _trim_to_tokens(self, text: str, max_tokens: int) -> str:
+        if max_tokens <= 0 or not text:
+            return ""
+        toks = self.count_tokens(text)
+        if toks <= max_tokens:
+            return text
+        # recorte por líneas conservador
+        lines = text.splitlines()
+        out = []
+        for ln in lines:
+            out.append(ln)
+            if self.count_tokens("\n".join(out)) > max_tokens:
+                out.pop()
+                break
+        if not out:  # último recurso: por caracteres
+            ratio = max_tokens / max(1, toks)
+            cut = max(64, int(len(text) * ratio))
+            return text[:cut]
+        return "\n".join(out)
+
+    def _shrink_messages(self, messages, budget_in_tokens: int):
+        """Intenta recortar SOLO el bloque de contexto del 'user'.
+        Busca [FRAGMENTOS] primero y luego [ÍNDICE]."""
+        if not messages:
+            return messages
+        msgs = list(messages)
+        for i in range(len(msgs) - 1, -1, -1):
+            m = msgs[i]
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                # prioridad: recortar fragmentos RAG
+                parts = content.split("[FRAGMENTOS]")
+                if len(parts) > 1:
+                    head = parts[0]
+                    rest = "[FRAGMENTOS]".join(parts[1:])
+                    # recorta primero FRAGMENTOS
+                    keep = rest
+                    while self.count_tokens(head + "[FRAGMENTOS]" + keep) > budget_in_tokens and "\n" in keep:
+                        keep = "\n".join(keep.splitlines()[:-4])  # quita 4 líneas por iteración
+                    content = head + "[FRAGMENTOS]" + keep
+                # si sigue pasando, recorta todo el 'user' al presupuesto
+                if self.count_tokens(content) > budget_in_tokens:
+                    content = self._trim_to_tokens(content, budget_in_tokens)
+                msgs[i] = {"role": "user", "content": content}
+                break
+        return msgs
+
     def chat(self, messages, temperature=0.3, max_tokens=256, stream=True):
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
         try:
+            # Algunos builds no aceptan cache_prompt
             return self.model.create_chat_completion(
                 messages=messages, temperature=float(temperature), max_tokens=int(max_tokens),
                 stream=bool(stream), cache_prompt=True
@@ -166,18 +270,20 @@ class LLMService:
                 messages=messages, temperature=float(temperature), max_tokens=int(max_tokens),
                 stream=bool(stream)
             )
-        except RuntimeError as e:
-            # Segunda oportunidad: presupuesto ultra-conservador
+        except (RuntimeError, ValueError) as e:
+            # Si es desbordamiento de contexto → recortamos y reintentamos
             msg = str(e)
-            if "Requested tokens" in msg and "context window" in msg:
-                safe = max(48, min(96, self.ctx // 16))  # 48–96 como red de seguridad
+            if "context window" in msg or "exceed context" in msg:
+                # Presupuesto:  ctx - salida - margen
+                out_tok = max(128, min(256, int(self.ctx * 0.12)))
+                budget_in = max(256, self.ctx - out_tok - 64)
+                safe_msgs = self._shrink_messages(messages, budget_in_tokens=budget_in)
                 try:
                     return self.model.create_chat_completion(
-                        messages=messages, temperature=float(temperature), max_tokens=int(safe),
-                        stream=bool(stream)
+                        messages=safe_msgs, temperature=float(temperature),
+                        max_tokens=int(out_tok), stream=bool(stream)
                     )
-                except Exception as e2:
-                    # Último recurso: devolvemos un mensaje corto para no dejar al usuario "en blanco"
+                except Exception:
                     return {
                         "choices": [{
                             "message": {
@@ -187,6 +293,8 @@ class LLMService:
                             }
                         }]
                     }
+            # Otros errores: propaga
             raise
+
 
 
