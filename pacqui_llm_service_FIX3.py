@@ -108,27 +108,163 @@ class LLMService:
         return self._embedder_cached
 
     # --------- índice (keywords/observaciones) ---------
-    def _index_hits(self, query: str, top_k: int = 8, max_note_chars: int = 240):
-        toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", query or "")]
-        if not toks: return []
+    def _index_hits(self, query: str, top_k: int = 8, max_note_chars: int = 240, prefer_only=None):
+        """
+        Búsqueda en índice con:
+        - normalización (acentos, minúsculas)
+        - expansión de sinónimos (FEADER/FEAGA/pago/ayuda/anticipo…)
+        - stopwords básicas
+        - fallback a nombres de fichero (tabla files) y a doc_notes
+        - re-ranking por extensión (PDF/DOCX primero) y nombre
+        - filtro explícito prefer_only (p.ej. [".pdf"] o [".docx",".doc"])
+        - “must term” si la consulta incluye FEADER
+        """
+        import os, sqlite3, re, unicodedata
+        from pathlib import Path
+
+        def _norm(s: str) -> str:
+            if not s: return ""
+            s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+            return s.lower()
+
+        qnorm = _norm(query or "")
+        toks = [t for t in re.findall(r"[a-z0-9]{3,}", qnorm)]
+
+        # Stopwords / saludos / nombre del bot
+        STOP = {
+            "hola", "buenas", "buenos", "dias", "tardes", "noches", "gracias",
+            "ok", "vale", "de", "la", "el", "los", "las", "un", "una", "y", "o",
+            "pacqui", "assistant", "ayuda"
+        }
+        toks = [t for t in toks if t not in STOP]
+        if not toks:
+            return []
+
+        # Sinónimos mínimos del dominio
+        syn = {
+            "feader": ["feader", "eafrd", "pdr", "desarrollorural", "desarrollo", "rural"],
+            "feaga": ["feaga", "fega"],
+            "pago": ["pago", "pagos", "abono", "abonar", "anticipos", "anticipo", "liquidacion", "transferencia",
+                     "ordenpago"],
+            "ayuda": ["ayuda", "ayudas", "subvencion", "subvenciones", "expediente", "beneficiario"],
+            "calendario": ["calendario", "planificacion", "cronograma"],
+        }
+        expanded = set(toks)
+        for t in list(toks):
+            if t in syn:
+                expanded.update(syn[t])
+            if t.endswith("s"):
+                expanded.add(t[:-1])
+            else:
+                expanded.add(t + "s")
+        toks = list(expanded)
+
+        EXT_BONUS = {".pdf": 3, ".docx": 3, ".doc": 2, ".pptx": 1}
+        EXT_MALUS = {".png": -2, ".jpg": -2, ".jpeg": -2, ".gif": -2, ".py": -2, ".java": -1, ".sql": -1}
+
+        # --- Reglas de obligación/exclusión sacadas de la consulta normalizada ---
+        # Grupos "must_any": de cada grupo, debe cumplirse al menos 1 término.
+        must_any = []
+        if "feader" in qnorm:
+            must_any.append({"feader"})
+        if "feaga" in qnorm:
+            # FEAGA suele aparecer también como FEGA → cualquiera de los dos vale
+            must_any.append({"feaga", "fega"})
+
+        # Términos prohibidos (si el usuario pide explícitamente "no sigc", o "sin sigc")
+        must_not = set()
+        if "no sigc" in qnorm or "sin sigc" in qnorm:
+            must_not.add("sigc")
+
         con = sqlite3.connect(self.db_path, check_same_thread=False)
         try:
             cur = con.cursor()
             from collections import defaultdict
-            score = defaultdict(int)
+            acc = defaultdict(lambda: {"kw": 0, "fname": 0, "notes": 0})
+
+            # 1) keywords
             for t in toks:
-                cur.execute("SELECT fullpath FROM doc_keywords WHERE lower(keyword) LIKE lower(?) LIMIT 1000", (f"%{t}%",))
+                cur.execute("SELECT fullpath FROM doc_keywords WHERE lower(keyword) LIKE lower(?) LIMIT 5000",
+                            (f"%{t}%",))
                 for (fp,) in cur.fetchall():
-                    score[os.path.normcase(os.path.normpath(fp))] += 1
-            if not score: return []
-            top = sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1,int(top_k))]
+                    acc[os.path.normcase(os.path.normpath(fp))]["kw"] += 1
+
+            # 2) observaciones
+            for t in toks:
+                cur.execute("SELECT fullpath FROM doc_notes WHERE lower(note) LIKE lower(?) LIMIT 5000", (f"%{t}%",))
+                for (fp,) in cur.fetchall():
+                    acc[os.path.normcase(os.path.normpath(fp))]["notes"] += 1
+
+            # 3) nombres y carpetas (tabla files si existe)
+            try:
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='files'")
+                if cur.fetchone():
+                    for t in toks:
+                        like = f"%{t}%"
+                        cur.execute("""SELECT fullpath FROM files
+                                       WHERE lower(name) LIKE ? OR lower(dir) LIKE ?
+                                       LIMIT 5000""", (like, like))
+                        for (fp,) in cur.fetchall():
+                            acc[os.path.normcase(os.path.normpath(fp))]["fname"] += 1
+            except Exception:
+                pass
+
+            if not acc:
+                return []
+
+            ranked = []
+            for fp, sc in acc.items():
+                ext = Path(fp).suffix.lower()
+
+                # Filtro “prefer_only” (desde el front: solo pdf/docx si se pide)
+                if prefer_only and ext not in set(prefer_only):
+                    continue
+
+                # “must terms”: p.ej. si pregunta contiene “feader”, exige que aparezca
+                # --- Filtrado por obligación (must_any) y exclusiones (must_not) ---
+                # Construye 1 sola vez el "blob" normalizado con kws + nota + nombre fichero
+                blob = " ".join(self._get_keywords(cur, fp) +
+                                [self._get_note(cur, fp), os.path.basename(fp)])
+                blob_norm = _norm(blob)
+
+                # Cada grupo de must_any debe tener AL MENOS 1 término presente
+                if must_any and not all(any(t in blob_norm for t in group) for group in must_any):
+                    continue
+                # Ningún término prohibido debe estar presente
+                if must_not and any(t in blob_norm for t in must_not):
+                    continue
+
+                ext_adj = EXT_BONUS.get(ext, 0) + EXT_MALUS.get(ext, 0)
+
+                # Penaliza coincidencias SOLO por nombre de fichero/carpeta
+                only_fname = (sc["kw"] == 0 and sc["notes"] == 0)
+                if only_fname and len(toks) <= 2:
+                    continue
+
+                rank = sc["kw"] * 12 + sc["notes"] * 8 + sc["fname"] * 2 + ext_adj * 8
+                if only_fname:
+                    rank -= 10
+                ranked.append((rank, sc["kw"], sc["notes"], sc["fname"], fp))
+
+            if not ranked:
+                return []
+
+            ranked.sort(key=lambda x: (-x[0], -x[1], -x[2], -x[3], x[4]))
+            ranked = ranked[:max(1, int(top_k))]
+
+            # Si entre los top_k hay PDF/DOC/DOCX, nos quedamos SOLO con esos
+            prefer_exts = {".pdf", ".docx", ".doc"}
+            prefer_only_list = [t for t in ranked if Path(t[4]).suffix.lower() in prefer_exts]
+            if prefer_only_list:
+                ranked = prefer_only_list[:max(1, int(top_k))]
+
             out = []
-            for fp, sc in top:
+            for _rank, _kw, _notes, _fn, fp in ranked:
                 name = os.path.basename(fp)
                 kws = "; ".join(self._get_keywords(cur, fp))
                 note = self._get_note(cur, fp)
                 if len(note) > max_note_chars: note = note[:max_note_chars] + "…"
-                out.append({"path": fp, "name": name, "score": sc, "keywords": kws, "note": note})
+                out.append({"path": fp, "name": name, "score": _kw + _notes + _fn, "keywords": kws, "note": note})
             return out
         finally:
             con.close()
@@ -170,18 +306,54 @@ class LLMService:
 
     def _rag_retrieve(self, query: str, k: int = 4, max_chars: int = 700) -> str:
         """
-        Recupera k fragmentos ordenados por similitud SIN descartar por umbral.
-        Devuelve un bloque con marcas [1], [2]... y ruta de fichero por fragmento.
+        Recupera k fragmentos re-ordenando por similitud + preferencia de extensión (PDF/DOCX).
+        Si el usuario pide PDF/DOCX explícitamente en la consulta, se filtra a esas extensiones.
         """
+        import os, re
+        from pathlib import Path
+
+        qlow = (query or "").lower()
+        ext_filter = set()
+        if "pdf" in qlow: ext_filter.add(".pdf")
+        if "docx" in qlow: ext_filter.add(".docx")
+        if "doc" in qlow and ".docx" not in qlow: ext_filter.add(".doc")
+
+        EXT_BONUS = {".pdf": 3, ".docx": 3, ".doc": 2, ".pptx": 1}
+        EXT_MALUS = {".png": -2, ".jpg": -2, ".jpeg": -2, ".gif": -2, ".py": -2, ".java": -1, ".sql": -1}
+
         try:
-            hits = self.rag.search(query, top_k=int(k) or 4)  # asume interfaz .search(query, top_k)
+            hits = self.rag.search(query, top_k=int(max(k * 3, 8)))
         except Exception:
             hits = []
         if not hits:
             return ""
 
+        toks = re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", qlow)
+
+        def _score(h):
+            path = (h.get("path") or h.get("file") or "").strip()
+            ext = Path(path).suffix.lower()
+            base = float(h.get("score", 0.0))
+            fname = os.path.basename(path).lower()
+            fname_bonus = sum(1 for t in toks if t.lower() in fname)
+            ext_adj = EXT_BONUS.get(ext, 0) + EXT_MALUS.get(ext, 0)
+            return base * 10 + ext_adj * 5 + fname_bonus * 2
+
+        scored = []
+        for h in hits:
+            path = (h.get("path") or h.get("file") or "").strip()
+            ext = Path(path).suffix.lower()
+            if ext_filter and ext not in ext_filter:
+                continue
+            scored.append((_score(h), h))
+        if not scored:
+            return ""
+
+        scored.sort(key=lambda x: -x[0])
+        picked = [h for _, h in scored[:max(1, int(k))]]
+
         frags, used = [], 0
-        for i, h in enumerate(hits, start=1):
+        for i, h in enumerate(picked, start=1):
             text = (h.get("text") or "").strip()
             path = (h.get("path") or h.get("file") or "").strip()
             if not text:
@@ -189,7 +361,7 @@ class LLMService:
             if len(text) > 600:
                 text = text[:600] + "…"
             frag = f"[{i}] {text}\n    Fuente: {path}"
-            if used + len(frag) > max_chars * k:  # limita por tamaño total
+            if used + len(frag) > max_chars * k:
                 break
             frags.append(frag)
             used += len(frag)

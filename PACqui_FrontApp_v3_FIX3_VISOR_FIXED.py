@@ -113,7 +113,7 @@ def _ensure_rag_patch():
 
 def _ensure_organizador_loaded():
     """
-    Carga PACqui_RAG_bomba_SAFE sin escanear todo el disco:
+    Carga PACqui_RAG_bomba_SAFE (o *_VISOR) sin escanear todo el disco:
     - Import directo si ya está en sys.path
     - Busca SOLO en ubicaciones conocidas (env var + script dir + cwd + hasta 3 padres)
       en formato archivo (.py) o paquete (__init__.py).
@@ -125,28 +125,26 @@ def _ensure_organizador_loaded():
 
     # 1) Intento directo
     try:
-        return importlib.import_module(modname)
+        import importlib
+        importlib.import_module(modname)
+        return
     except Exception:
         pass
 
-    # 2) Raíces candidatas (no recursivo para evitar cuelgues)
+    # 2) Raíces conocidas
     roots = []
-    env = os.getenv("PACQUI_ORG_PATH")
-    if env and os.path.exists(env):
-        roots.append(env)
-
+    env = os.getenv("PACQUI_RAG_DIR", "")
+    if env: roots.append(env)
     here = os.path.dirname(os.path.abspath(__file__))
     roots.append(here)
     roots.append(os.getcwd())
-    # hasta 3 padres
     p = here
     for _ in range(3):
         p = os.path.dirname(p)
         if p and p not in roots:
             roots.append(p)
 
-    # 3) Probar archivos directos
-    # 3) Probar archivos directos
+    # 3) Probar archivos directos (SAFE y SAFE_VISOR)
     candidates = []
     for root in roots:
         for rel in (
@@ -159,7 +157,6 @@ def _ensure_organizador_loaded():
             if os.path.exists(cand):
                 candidates.append(cand)
 
-
     for cand in candidates:
         try:
             spec = importlib.util.spec_from_file_location(modname, cand)
@@ -167,16 +164,16 @@ def _ensure_organizador_loaded():
             sys.modules[modname] = mod
             assert spec.loader is not None
             spec.loader.exec_module(mod)  # type: ignore
-            return mod
+            return
         except Exception:
             continue
 
-    # 4) Último intento: añadir raíces al sys.path y reimportar
-    for root in roots:
-        if root not in sys.path:
-            sys.path.append(root)
-    return importlib.import_module(modname)  # si falla, lanzará ImportError con detalle
-# Preload organizer and apply the index-context patch
+    # 4) Último intento: añadir raíces a sys.path y reimportar
+    for r in roots:
+        if r not in sys.path:
+            sys.path.append(r)
+    importlib.import_module(modname)
+
 
 
 CONFIG_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "PACqui"
@@ -1490,6 +1487,7 @@ class AdminPanel(ttk.Notebook):
                 con.execute("CREATE INDEX IF NOT EXISTS idx_kw_path ON doc_keywords(lower(fullpath))")
                 con.execute("CREATE INDEX IF NOT EXISTS idx_kw_kw   ON doc_keywords(lower(keyword))")
                 con.execute("CREATE INDEX IF NOT EXISTS idx_no_path ON doc_notes(lower(fullpath))")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_no_note ON doc_notes(lower(note))")
                 con.commit()
             self.app._log("danger_create_indices")
             messagebox.showinfo("Índices", "Índices creados o ya existentes.", parent=self)
@@ -2898,6 +2896,25 @@ class ChatWithLLM(ChatFrame):
 
     def _build_ui(self):
         super()._build_ui()
+        # --- NUEVO: reencaminar Enter y el botón "Enviar" al LLM ---
+        try:
+            self.ent_input.bind("<Return>", lambda e: self._send_llm())
+        except Exception:
+            pass
+
+        # Buscar un botón con texto "Enviar" en la fila de entrada y reconfigurarlo
+        try:
+            input_row = self.ent_input.master
+            for ch in input_row.winfo_children():
+                try:
+                    if str(ch.cget("text")).strip().lower() == "enviar":
+                        ch.configure(command=self._send_llm)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         parent = self.ent_input.master
 
         # Botón de envío al LLM
@@ -3032,10 +3049,11 @@ class ChatWithLLM(ChatFrame):
 
     def _compose_system_budgeted(self, user_text: str, max_tokens: int = 256):
         base_sys = (
-            "Eres PACqui. PRIMERO ofrece 2–3 frases claras para el usuario. "
-            "DESPUÉS, si hay [Contexto (índice)], lista rutas (bullets) con nombre y ruta. "
-            "Si hay [Contexto del repositorio], explica y cita con [n] y muestra la ruta. "
-            "Si el contexto es insuficiente, dilo. No inventes rutas ni datos."
+            "Eres PACqui. Tono cercano y profesional. PRIMERO ofrece 2–3 frases claras y útiles. "
+            "DESPUÉS, si hay [Contexto (índice)], lista rutas (viñetas) con nombre y ruta, priorizando PDF/DOCX. "
+            "Si hay [Contexto del repositorio], explica y CITA con [n] y muestra la ruta. "
+            "Si el contexto es insuficiente, dilo con amabilidad y sugiere cómo afinar la búsqueda. "
+            "No inventes rutas ni datos."
         )
 
         # Contexto inicial (auto-escala con el ctx del modelo)
@@ -3115,9 +3133,81 @@ class ChatWithLLM(ChatFrame):
             messagebox.showinfo(APP_NAME, "Escribe algo para enviar.")
             return
 
+
         # Echo del usuario y limpia entrada
         self._append_chat("Tú", q)
         self.ent_input.delete(0, "end")
+
+        # --- NUEVO: detección de saludo / ruido corto ---
+        # --- Detección de saludo / small-talk (no toca índice) ---
+        import re
+        qlow = q.lower().strip()
+
+        # quita menciones al bot para que "hola pacqui" cuente como saludo
+        qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
+
+        # saludo laxo: "hola", "hola pacqui", "buenas", etc.
+        if re.match(r"^(hola|buenas(?:\s+(tardes|noches))?|buenos\s+dias|hey|hello|gracias|ok|vale)\b", qlow_clean):
+            self._append_chat("PACqui",
+                              "¡Hola! 👋 Puedo buscar en tu repositorio y priorizar **PDF/DOCX**. "
+                              "Dime una palabra clave (p. ej., *pagos FEADER*) o escribe *solo pdf* / *solo docx* para filtrar.")
+            return
+
+        # small-talk típico: no consultes índice
+        if re.search(
+                r"\b(cómo\s+estás|como\s+estas|qué\s+tal|que\s+tal|cómo\s+te\s+va|como\s+te\s+va|qué\s+tal\s+todo|que\s+tal\s+todo)\b",
+                qlow_clean):
+            self._append_chat("PACqui",
+                              "¡Todo bien! 🙂 ¿En qué te ayudo del repositorio (puedo priorizar **PDF/DOCX**)?")
+            return
+
+        # --- INTENCIÓN “¿tienes/hay/existen…?” (ahora sí, tras registrar la entrada) ---
+        import re
+        from pathlib import Path
+
+        qlow = q.lower()
+        if re.search(r"(tienes|hay|existen).*(documento|documentos|pdf|docx|base de datos|repositorio)", qlow):
+            # Filtros de extensión pedidos explícitamente
+            prefer = None
+            if "solo pdf" in qlow:
+                prefer = [".pdf"]
+            elif "solo docx" in qlow:
+                prefer = [".docx", ".doc"]
+
+            t0 = time.time()
+            hits = self._collect_hits(q, top_k=8, note_chars=240, prefer_only=prefer) or []
+            dt_ms = int((time.time() - t0) * 1000)
+
+            # pintar árbol lateral y guardar últimos hits
+            try:
+                self._fill_sources_tree(hits)
+            except Exception:
+                pass
+            self._hits = hits
+            try:
+                self.app._log("query_hits", query=q, hits=len(hits), ms=dt_ms)
+            except Exception:
+                pass
+
+            # construir bloques de "Observaciones" y "Rutas" desde el ÍNDICE SQLite
+            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=5, max_obs_chars=220)
+
+            titles = [h.get("name") or "" for h in hits]
+            lead = self._persona_line_from_llm(q, titles, n=len(titles)) if hits else \
+                "No veo resultados claros aún. ¿Probamos con otra palabra clave o acotamos a *solo pdf*/*solo docx*?"
+
+            if hits:
+                try:
+                    db_name = Path(self.app.data.db_path).name
+                except Exception:
+                    db_name = "index_cache.sqlite"
+                foot = f"\n\n— Origen: índice {db_name} · {len(hits)} aciertos · {dt_ms} ms."
+                msg = f"{lead}\n\nObservaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}{foot}"
+            else:
+                msg = lead
+
+            self._append_chat("PACqui", msg)
+            return
 
         # Asegura el patch de índice (no rompe si no está)
         _ensure_rag_patch()
@@ -3143,17 +3233,20 @@ class ChatWithLLM(ChatFrame):
                     has_idx = bool((idx_ctx or "").strip())
                     has_rag = bool((rag_ctx or "").strip())
 
-                    # 2) Si NO hay NINGÚN contexto → salida determinista
+
+                    # 2) Si NO hay NINGÚN contexto → salida determinista (tono cercano + sugerencia PDF/DOCX)
                     if not has_idx and not has_rag:
                         rutas = []
                         src = hits or []
                         for s in src[:3]:
                             name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
                             rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
-                        msg = ("No tengo suficiente contexto en el repositorio. Prueba otra búsqueda "
-                               "o abre una de las rutas sugeridas.")
+                        msg = (
+                            "Gracias por la pregunta. Aún no he localizado fragmentos suficientemente relevantes.\n\n"
+                            "Te dejo rutas prometedoras (priorizando PDF/DOCX). "
+                            "Si quieres, intento **buscar solo en PDF/DOCX** o afinamos con alguna palabra clave más.\n")
                         if rutas:
-                            msg += "\n\nRutas sugeridas:\n\n" + "\n".join(rutas)
+                            msg += "\nRutas sugeridas:\n\n" + "\n".join(rutas)
                         self.after(0, lambda: self._append_chat("PACqui", msg))
                         return
 
@@ -3225,6 +3318,17 @@ class ChatWithLLM(ChatFrame):
                     if rutas_block.strip():
                         final += f"\n\nRutas sugeridas:\n\n{rutas_block}"
 
+                    # ... después de calcular text_llm y rutas_block ...
+                    # --- NUEVO: línea de cortesía muy breve al inicio ---
+                    try:
+                        titles = [h.get("name") or "" for h in (hits or [])]
+                        lead = self._persona_line_from_llm(q, titles, n=len(titles))
+                        if lead:
+                            final = lead + "\n\n" + final
+                    except Exception:
+                        pass
+
+
                     self.after(0, lambda: self._append_chat("PACqui", final))
                 finally:
                     self.after(0, self._spinner_stop)
@@ -3249,28 +3353,29 @@ class ChatWithLLM(ChatFrame):
             name = os.path.basename(h["path"])
             tv.insert("", "end", values=(keyword_hint, name, h["path"]))
 
-    def _collect_hits(self, query_text: str, top_k: int = 5, note_chars: int = 240):
+    def _collect_hits(self, query_text: str, top_k: int = 5, note_chars: int = 240, prefer_only=None):
         try:
-            return self.llm._index_hits(query_text, top_k=top_k, max_note_chars=note_chars) or []
+            return self.llm._index_hits(query_text, top_k=top_k, max_note_chars=note_chars,
+                                        prefer_only=prefer_only) or []
         except Exception:
             return []
 
     def _build_obs_and_routes_blocks(self, hits, max_items: int = 3, max_obs_chars: int = 220):
-        """Devuelve (obs_block, rutas_block, hits_usados). Solo coge items con 'note'."""
-        used = []
-        obs_lines = []
-        ruta_lines = []
+        """Devuelve (obs_block, rutas_block, hits_usados).
+        - obs_block: solo entradas con nota (recortada)
+        - rutas_block: SIEMPRE incluye hasta max_items rutas, aunque no tengan nota
+        """
+        used, obs_lines, ruta_lines = [], [], []
         for s in hits:
-            note = (s.get("note") or "").strip()
-            if not note:
-                continue
             if len(used) >= max_items:
                 break
-            if len(note) > max_obs_chars:
-                note = note[:max_obs_chars].rstrip() + "…"
             name = s.get("name") or s.get("path") or "(sin nombre)"
             path = s.get("path") or ""
-            obs_lines.append(f"- {name}\n  Observaciones: {note}")
+            note = (s.get("note") or "").strip()
+            if note:
+                if len(note) > max_obs_chars:
+                    note = note[:max_obs_chars].rstrip() + "…"
+                obs_lines.append(f"- {name}\n  Observaciones: {note}")
             ruta_lines.append(f"- {name}\n  Ruta: {path}")
             used.append(s)
         obs_block = "\n".join(obs_lines).strip()
