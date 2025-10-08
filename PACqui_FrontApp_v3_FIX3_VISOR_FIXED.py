@@ -2892,7 +2892,84 @@ class ChatWithLLM(ChatFrame):
         self.llm = llm
         self.app = app or master.winfo_toplevel()  # <— referencia al AppRoot
         self.notes_only = False  # usamos saludo LLM + observaciones/rutas deterministas
+        self._last_choice = None  # {"hit": {...}, "reasons": "texto", "query": "…"}
+        self._last_query = None
+
         super().__init__(master, data)
+
+    def _user_asks_why_this(self, q: str) -> bool:
+        import re
+        ql = (q or "").lower()
+        return bool(
+            re.search(r"\bpor\s*qué\b", ql)
+            and (
+                    re.search(r"\b(este|esta|estos|estas|éste|ésta|ésos?|esas?|eso)\b", ql)
+                    or re.search(r"\b(documento|documentos|fuente|fuentes|recomendaci[oó]n|elecci[oó]n)\b", ql)
+                    or re.search(r"\b(has\s+elegido|elegiste|has\s+seleccionado|seleccionaste|elegid[oa]s?)\b", ql)
+            )
+        )
+
+    def _choice_reasons(self, hit: dict, q: str) -> str:
+        import os
+        ql = (q or "").lower()
+        title = (hit.get("name") or os.path.basename(hit.get("path", "")) or "").lower()
+        note = (hit.get("note") or "").lower()
+        ext = (os.path.splitext(hit.get("path", ""))[1] or "").lower()
+
+        kws = set()
+        for t in ("feader", "feaga", "pago", "pagos", "pepac", "circular", "fichero", "ficheros"):
+            if t in title or t in note or t in ql:
+                kws.add(t)
+
+        reasons = []
+        if {"feader", "feaga"} & kws:
+            reasons.append("menciona **FEADER/FEAGA** en el título o la nota")
+        if {"pago", "pagos"} & kws:
+            reasons.append("se centra en **pagos**")
+        if "pepac" in kws:
+            reasons.append("está alineado con **PEPAC**")
+        if "circular" in kws:
+            reasons.append("es **circular** normativa/procedimental")
+        if "fichero" in kws or "ficheros" in kws:
+            reasons.append("trata sobre **ficheros de intercambio**")
+
+        if hit.get("note"):
+            reasons.append("tiene **observaciones** en el índice")
+        if ext == ".pdf":
+            reasons.append("es **PDF** (suele ser la fuente maestra)")
+
+        if not reasons:
+            import re
+            ql2 = (q or "").lower()
+            toks = re.findall(r"[a-z0-9]{3,}", ql2)
+            GENERIC = {
+                "documento", "documentos", "doc", "docs", "pdf", "docx", "archivo", "archivos",
+                "base", "datos", "repositorio", "sistema", "proceso", "procesos",
+                "nuevo", "nueva", "tecnico", "tecnicos", "incorporacion", "onboarding",
+                "proyecto", "proyectos", "lanzadera", "ticketing", "severidad", "analisis",
+                "requerimiento", "requerimientos"
+            }
+            rare = [t for t in toks if t not in GENERIC and len(t) >= 5]
+            blob = " ".join([
+                title,
+                (hit.get("path", "") or "").lower(),
+                note
+            ])
+            if rare and not any(t in blob for t in rare):
+                reasons.append("no contiene **" + " / ".join(sorted(set(rare))[:2]) + "**; candidato débil")
+            else:
+                reasons.append("tiene **alta similitud** con tu consulta")
+
+        # Junta bonito
+        txt = "; ".join(reasons)
+        # Limpia duplicados por si acaso
+        parts = []
+        seen = set()
+        for r in [p.strip() for p in txt.split(";") if p.strip()]:
+            if r not in seen:
+                parts.append(r);
+                seen.add(r)
+        return "; ".join(parts)
 
     def _build_ui(self):
         super()._build_ui()
@@ -3138,6 +3215,36 @@ class ChatWithLLM(ChatFrame):
         self._append_chat("Tú", q)
         self.ent_input.delete(0, "end")
 
+        if self._user_asks_why_this(q):
+            # 2.1) Si hubo recomendación única previa → explica esa
+            if self._last_choice:
+                h = self._last_choice["hit"]
+                reasons = self._last_choice["reasons"]
+                import os
+                name = h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)"
+                path = h.get("path", "")
+                self._append_chat("PACqui", f"Elegí **{name}**\nRuta: {path}\nporque {reasons}.")
+                return
+
+            # 2.2) Si no hubo recomendación única → explica el porqué del último listado (top 3)
+            hits = getattr(self, "_hits", []) or []
+            if hits:
+                import os
+                last_q = getattr(self, "_last_query", "") or q
+                out = []
+                for h in hits[:3]:
+                    reasons = self._choice_reasons(h, last_q)
+                    name = h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)"
+                    path = h.get("path", "")
+                    out.append(f"- **{name}**\n  Ruta: {path}\n  Motivo: {reasons}.")
+                self._append_chat("PACqui", "He priorizado estas fuentes por:\n\n" + "\n".join(out))
+                return
+
+            # 2.3) Fallback si no tengo contexto todavía
+            self._append_chat("PACqui",
+                              "Necesito primero listar o elegir alguna fuente para poder explicarte el motivo.")
+            return
+
         # --- NUEVO: detección de saludo / ruido corto ---
         # --- Detección de saludo / small-talk (no toca índice) ---
         import re
@@ -3160,6 +3267,46 @@ class ChatWithLLM(ChatFrame):
             self._append_chat("PACqui",
                               "¡Todo bien! 🙂 ¿En qué te ayudo del repositorio (puedo priorizar **PDF/DOCX**)?")
             return
+
+        # --- INTENCIÓN “elige/escoge/selecciona… el mejor” ---------------------------------
+        if self._user_wants_choice(q):
+            t0 = time.time()
+            # 1) Intenta recoger hits nuevos; si la frase de “elige” no aporta tokens, caemos a los previos
+            hits = self._collect_hits(q, top_k=8, note_chars=240) or (getattr(self, "_hits", []) or [])
+            dt_ms = int((time.time() - t0) * 1000)
+
+            if hits:
+                # pinta árbol lateral y guarda últimos hits
+                try:
+                    self._fill_sources_tree(hits)
+                except Exception:
+                    pass
+                self._hits = hits
+
+                try:
+                    if hits and hasattr(self, "_open_fuentes_panel"):
+                        # Solo la primera vez de la sesión o si estaba vacío
+                        if not getattr(self, "_fuentes_auto_opened", False):
+                            self._fuentes_auto_opened = True
+                            self._open_fuentes_panel()
+                except Exception:
+                    pass
+
+                best = self._pick_best_hit(hits, q)
+                if best:
+                    reasons = self._choice_reasons(best, q)
+                    self._last_choice = {"hit": best, "reasons": reasons, "query": q}
+                    self._last_query = q
+                    name = best.get("name") or (best.get("path") and os.path.basename(best["path"])) or "(sin nombre)"
+                    path = best.get("path", "")
+                    msg = f"Te recomiendo **{name}**.\nRuta: {path}\nMotivo: {reasons}."
+                    self._append_chat("PACqui", msg)
+                    return
+
+                # sin best claro: seguimos flujo normal
+
+            # si no hubo hits, continuamos con el flujo habitual (tendrá fallback)
+
 
         # --- INTENCIÓN “¿tienes/hay/existen…?” (ahora sí, tras registrar la entrada) ---
         import re
@@ -3184,6 +3331,31 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
             self._hits = hits
+            # NEW: si el usuario dio términos fuertes (p.ej. "seresco") y ninguno aparece, invalida hits
+            import re, os
+            ql = (q or "").lower()
+            toks = re.findall(r"[a-z0-9]{3,}", ql)
+            GENERIC = {
+                "documento", "documentos", "doc", "docs", "pdf", "docx", "archivo", "archivos",
+                "base", "datos", "repositorio", "sistema", "proceso", "procesos",
+                "nuevo", "nueva", "tecnico", "tecnicos", "incorporacion", "onboarding",
+                "proyecto", "proyectos", "lanzadera", "ticketing", "severidad", "analisis",
+                "requerimiento", "requerimientos"
+            }
+            strong = [t for t in toks if t not in GENERIC and len(t) >= 5]
+            if strong and hits:
+                def _blob(h):
+                    return (" ".join([
+                        (h.get("name") or "").lower(),
+                        (h.get("path") or "").lower(),
+                        (h.get("keywords") or "").lower(),
+                        (h.get("note") or "").lower()
+                    ]))
+
+                if not any(any(t in _blob(h) for t in strong) for h in hits):
+                    hits = []
+                    self._hits = []
+
             try:
                 self.app._log("query_hits", query=q, hits=len(hits), ms=dt_ms)
             except Exception:
@@ -3205,7 +3377,7 @@ class ChatWithLLM(ChatFrame):
                 msg = f"{lead}\n\nObservaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}{foot}"
             else:
                 msg = lead
-
+            self._last_query = q
             self._append_chat("PACqui", msg)
             return
 
@@ -3215,6 +3387,8 @@ class ChatWithLLM(ChatFrame):
         # 1) Recuperación para pintar el panel de fuentes desde YA
         hits = self._collect_hits(q, top_k=5, note_chars=240) or []
         self._hits = hits
+        self._last_query = q
+
         try:
             self._fill_sources_tree(hits)
         except Exception:
@@ -3381,6 +3555,102 @@ class ChatWithLLM(ChatFrame):
         obs_block = "\n".join(obs_lines).strip()
         rutas_block = "\n".join(ruta_lines).strip()
         return obs_block, rutas_block, used
+
+    # --- NUEVO: intención de selección ("elige el mejor") y rankeo determinista ---
+
+    def _user_wants_choice(self, q: str) -> bool:
+        import re
+        ql = (q or "").lower()
+        # elige/escoge/selecciona/recomiend(a|ame)/cuál es mejor/qué es más adecuado…
+        return bool(re.search(
+            r"\b(elige|escoge|selecciona|recomiend[aoeá]|recomiénd[aoeá]|"
+            r"(cu[aá]l|que|qué).{0,14}(mejor|adecuad[oa]|m[aá]s\s+relevante))\b", ql))
+
+    def _score_choice(self, hit: dict, q: str) -> tuple:
+        """Devuelve una tupla de score para ordenar (mayor es mejor)."""
+        import os, re
+        from pathlib import Path
+        qlow = (q or "").lower()
+        toks = re.findall(r"[a-z0-9]{3,}", qlow)
+
+        name = (hit.get("name") or os.path.basename(hit.get("path","")) or "").lower()
+        path = (hit.get("path") or "").lower()
+        kws  = (hit.get("keywords") or "").lower()
+        note = (hit.get("note") or "").lower()
+        ext  = Path(path).suffix.lower()
+
+        # preferencia de formato (coherente con tu RAG): PDF/DOCX mejor que otros
+        ext_bonus = {".pdf": 30, ".docx": 28, ".doc": 20}.get(ext, 0)
+
+        # tokens en nombre/ruta/keywords (ponderación decreciente)
+        token_bonus = sum(3 for t in toks if t in name) \
+                    + sum(2 for t in toks if t in path) \
+                    + sum(1 for t in toks if t in kws)
+
+        # sesgo específico si preguntan por FEAGA/FEADER
+        feaga_bias = 0
+        if "feaga" in qlow:
+            feaga_bias += (5 if "feaga" in name else 3 if "feaga" in path or "feaga" in kws else 0)
+            feaga_bias -= 2 if ("feader" in name or "feader" in path or "feader" in kws) else 0
+        if "feader" in qlow and "feaga" not in qlow:
+            feaga_bias += (5 if "feader" in name else 3 if "feader" in path or "feader" in kws else 0)
+
+        # ligera preferencia si hay observación en el índice
+        note_bonus = 4 if note else 0
+
+        # tu _index_hits ya devuelve un "score" proxy; lo usamos como parte del ranking
+        base = float(hit.get("score", 0.0))
+
+        # último tie-break: rutas más cortas (más cercanas a raíz tienden a ser “oficiales”)
+        tiebreak_shorter_path = -len(path)
+
+        return (ext_bonus + token_bonus + feaga_bias + note_bonus, base, tiebreak_shorter_path)
+
+    def _pick_best_hit(self, hits: list[dict], q: str) -> dict | None:
+        scored = [ (self._score_choice(h, q), h) for h in (hits or []) ]
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1]
+
+    def _format_choice_answer(self, best: dict, hits: list[dict], dt_ms: int, q: str) -> str:
+        """Mensaje final: 1 recomendación + motivo corto + pie '— Origen: índice …'."""
+        from pathlib import Path
+        import os, re
+        name = best.get("name") or best.get("path") or "(sin nombre)"
+        path = best.get("path") or ""
+        ext  = os.path.splitext(path)[1].upper()[1:] if os.path.splitext(path)[1] else ""
+        kws  = (best.get("keywords") or "")
+        note = (best.get("note") or "").strip()
+
+        # Motivos (cortos y verificables)
+        reasons = []
+        ql = (q or "").lower()
+        if ext in ("PDF","DOCX","DOC"):
+            reasons.append(f"formato {ext}")
+        if "feaga" in ql and re.search(r"\bfeaga\b", (name + " " + path + " " + kws).lower()):
+            reasons.append("contiene “FEAGA”")
+        if "feader" in ql and re.search(r"\bfeader\b", (name + " " + path + " " + kws).lower()):
+            reasons.append("contiene “FEADER”")
+        # overlap de palabras clave (máx 3 para no alargar)
+        toks = re.findall(r"[a-z0-9]{3,}", ql)
+        common = [t for t in toks if t in (kws.lower())]
+        if common:
+            reasons.append("palabras clave: " + ", ".join(sorted(set(common))[:3]))
+        if not reasons and note:
+            reasons.append("observaciones del índice coinciden")
+
+        # pie '— Origen: índice …' coherente con tu UI
+        try:
+            db_name = Path(self.app.data.db_path).name
+        except Exception:
+            db_name = "index_cache.sqlite"
+        foot = f"\n\n— Origen: índice {db_name} · {len(hits)} aciertos · {dt_ms} ms."
+
+        motivo = ("Motivo: " + "; ".join(reasons) + ".") if reasons else ""
+        rec = f"Te recomiendo **{name}**.\nRuta: {path}\n{motivo}".rstrip()
+        return rec + foot
+
 
     def _compose_persona_from_obs(self, user_text: str, max_tokens: int = 192):
         """

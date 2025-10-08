@@ -164,12 +164,32 @@ class LLMService:
 
         # --- Reglas de obligación/exclusión sacadas de la consulta normalizada ---
         # Grupos "must_any": de cada grupo, debe cumplirse al menos 1 término.
+        # --- Reglas de obligación/exclusión sacadas de la consulta normalizada ---
+        # Grupos "must_any": de cada grupo, debe cumplirse al menos 1 término.
         must_any = []
         if "feader" in qnorm:
             must_any.append({"feader"})
         if "feaga" in qnorm:
             # FEAGA suele aparecer también como FEGA → cualquiera de los dos vale
             must_any.append({"feaga", "fega"})
+
+        # NEW: fuerza presencia de "términos fuertes" (evita ruido de "documento/base/datos...")
+        GENERIC = {
+            "documento", "documentos", "doc", "docs", "pdf", "docx", "archivo", "archivos",
+            "base", "datos", "repositorio", "sistema", "proceso", "procesos",
+            "nuevo", "nueva", "tecnico", "tecnicos", "incorporacion", "onboarding",
+            "proyecto", "proyectos", "lanzadera", "ticketing", "severidad", "analisis",
+            "requerimiento", "requerimientos"
+        }
+        strong = [t for t in toks if t not in GENERIC and len(t) >= 5]
+        # Si hay términos fuertes (p.ej. "seresco"), exige que aparezca al menos uno:
+        if strong:
+            must_any.append(set(strong))
+
+        # Términos prohibidos (si el usuario pide explícitamente "no sigc", o "sin sigc")
+        must_not = set()
+        if "no sigc" in qnorm or "sin sigc" in qnorm:
+            must_not.add("sigc")
 
         # Términos prohibidos (si el usuario pide explícitamente "no sigc", o "sin sigc")
         must_not = set()

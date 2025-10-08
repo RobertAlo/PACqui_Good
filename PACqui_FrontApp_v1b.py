@@ -316,7 +316,71 @@ class ChatFrame(ttk.Frame):
         self._populate_sources(text)
 
     def _append_chat(self, who: str, content: str):
+        import re, uuid, os
+        from pathlib import Path
+        try:
+            from path_utils import open_in_explorer
+        except Exception:
+            # fallback mínimo para no romper la UI si falla el import
+            def open_in_explorer(p):
+                from pathlib import Path
+                import os, sys, subprocess
+                p = Path(p)
+                try:
+                    if os.name == "nt":
+                        if p.is_file():
+                            subprocess.run(["explorer", "/select,", str(p)], check=False)
+                        else:
+                            os.startfile(str(p))  # type: ignore[attr-defined]
+                    elif sys.platform == "darwin":
+                        subprocess.run(["open", str(p if p.is_dir() else p.parent)], check=False)
+                    else:
+                        subprocess.run(["xdg-open", str(p if p.is_dir() else p.parent)], check=False)
+                except Exception:
+                    pass
+
+        # Punto de inserción antes de volcar el texto
+        start = self.txt_chat.index("end-1c")
         self.txt_chat.insert("end", f"\n{who}: {content}\n")
+        end = self.txt_chat.index("end-1c")
+
+        # Textual del bloque recién insertado
+        segment = self.txt_chat.get(start, end)
+
+        # 1) Linkifica líneas tipo "Ruta: <path>"
+        for m in re.finditer(r"Ruta:\s+(.+)", segment):
+            raw_path = m.group(1).strip()
+            # Normaliza y protege
+            try:
+                p = str(Path(raw_path))
+            except Exception:
+                p = raw_path
+
+            s_idx = f"{start}+{m.start(1)}c"
+            e_idx = f"{start}+{m.end(1)}c"
+            tag = f"pathlink_{uuid.uuid4().hex[:8]}"
+
+            # pinta aspecto de enlace
+            self.txt_chat.tag_add(tag, s_idx, e_idx)
+            self.txt_chat.tag_config(tag, foreground="#0b5bd3", underline=True)
+
+            # cursor mano
+            self.txt_chat.tag_bind(tag, "<Enter>", lambda e: self.txt_chat.config(cursor="hand2"))
+            self.txt_chat.tag_bind(tag, "<Leave>", lambda e: self.txt_chat.config(cursor=""))
+
+            # on-click: abrir en explorador/sistema
+            def _open(_e=None, _p=p):
+                try:
+                    open_in_explorer(Path(_p))
+                except Exception:
+                    # fallback: intenta abrir archivo directamente
+                    try:
+                        os.startfile(_p)  # Windows
+                    except Exception:
+                        pass
+
+            self.txt_chat.tag_bind(tag, "<Button-1>", _open)
+
         self.txt_chat.see("end")
 
     def _populate_sources(self, text: str):
