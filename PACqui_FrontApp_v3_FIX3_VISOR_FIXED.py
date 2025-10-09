@@ -62,12 +62,10 @@ def _import_organizador():
         "en esta carpeta o en la carpeta padre (también vale como paquete con __init__.py)."
     )
 
-
-# ---- Carga del patch del índice y log “RAG monkey…” ----
 def _import_rag_patch():
     """
-    Importa pacqui_index_context_patch desde módulo o por ruta (junto al front o en la carpeta padre).
-    El módulo se auto-aplica al importar. Imprime el log de compatibilidad.
+    Importa pacqui_index_context_patch desde módulo o por ruta.
+    El módulo se auto-aplica al importar.
     """
     import importlib, importlib.util, sys, os
     name = "pacqui_index_context_patch"
@@ -81,8 +79,7 @@ def _import_rag_patch():
     here = os.path.dirname(os.path.abspath(__file__))
     roots = [here, os.path.dirname(here)]
     for root in roots:
-        path = os.path.join(root,
-                            "../../OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/Proyecto actual/pacqui_index_context_patch.py")
+        path = os.path.join(root, "../../OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/Proyecto actual/pacqui_index_context_patch.py")
         if os.path.exists(path):
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
@@ -92,7 +89,6 @@ def _import_rag_patch():
             print("RAG monkey-patch listo: OK")
             return mod
 
-    # Si no existe, no bloqueamos el visor
     print("RAG monkey-patch: SKIPPED (no encontrado)")
     return None
 
@@ -363,6 +359,12 @@ class AppRoot(tk.Tk):
 
         try:
             self.llm.load(mp, ctx=ctx)
+            # Precalentado en segundo plano (evita el “no responde” del 1er turno)
+            try:
+                self.after(200, self.llm.warmup_async)
+            except Exception:
+                pass
+
             self.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
         except Exception as e:
             # Log a consola en vez de popup
@@ -2837,18 +2839,17 @@ class AdminPanel(ttk.Notebook):
             messagebox.showerror(APP_NAME, f"No se pudo exportar:\n{out_path}", parent=self)
 
     def _open_fuentes_panel(self):
-        """Abre la ventana de Fuentes usando los hits de ESTE chat."""
         hits = getattr(self.asst, "_hits", []) or []
         if not hits:
             messagebox.showinfo(APP_NAME, "Todavía no hay fuentes para mostrar. Lanza una consulta primero.")
             return
-
         try:
             pan = SourcesPanel(self)
         except Exception as e:
             messagebox.showerror(APP_NAME, f"No se pudo abrir el panel de fuentes:\n{e}")
             return
 
+        # Intento principal + fallback seguro a estructura simple (UNA sola vez)
         try:
             pan.update_sources(hits)
         except Exception:
@@ -2865,27 +2866,6 @@ class AdminPanel(ttk.Notebook):
             except Exception:
                 pass
 
-        # Intento principal
-        try:
-            pan.update_sources(hits)
-            return
-        except Exception:
-            pass
-
-        # Fallback si la estructura de 'hits' difiere
-        safe = []
-        for h in hits:
-            safe.append({
-                "path": h.get("path", ""),
-                "name": h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)",
-                "note": h.get("note", ""),
-                "keywords": h.get("keywords", "")
-            })
-        try:
-            pan.update_sources(safe)
-        except Exception:
-            # Si aun así falla, no rompemos la ventana
-            pass
 
 class ChatWithLLM(ChatFrame):
     def __init__(self, master, data: DataAccess, llm: LLMService, app=None):
@@ -2894,6 +2874,24 @@ class ChatWithLLM(ChatFrame):
         self.notes_only = False  # usamos saludo LLM + observaciones/rutas deterministas
         self._last_choice = None  # {"hit": {...}, "reasons": "texto", "query": "…"}
         self._last_query = None
+        self._ext_filter = set()  # {".pdf"} | {".doc",".docx"} | set()
+
+        def _update_ext_filter(qlow: str):
+            import re
+            # Activa filtro persistente
+            if re.search(r"\bsolo\s+(en\s+)?pdfs?\b", qlow):
+                self._ext_filter = {".pdf"}
+            elif re.search(r"\bsolo\s+(en\s+)?docx?\b", qlow):
+                self._ext_filter = {".docx", ".doc"}
+            elif re.search(r"\bsolo\s+(en\s+)?docs?\b", qlow):
+                self._ext_filter = {".doc", ".docx"}
+            # Limpia filtro
+            elif re.search(r"\b(limpiar|quitar|sin)\s+filtro(s)?\b", qlow):
+                self._ext_filter = set()
+            # Nada: mantiene el último filtro
+            return self._ext_filter
+        self._update_ext_filter = _update_ext_filter
+
 
         super().__init__(master, data)
 
@@ -2908,6 +2906,17 @@ class ChatWithLLM(ChatFrame):
                     or re.search(r"\b(has\s+elegido|elegiste|has\s+seleccionado|seleccionaste|elegid[oa]s?)\b", ql)
             )
         )
+
+    def _user_wants_choice(self, q: str) -> bool:
+        import re
+        ql = (q or "").lower()
+        patterns = [
+            r"\b(elige|escoge|selecciona)\b",
+            r"\b(recomiend[ao]s?|recomendar[ií]as?)\b",
+            r"\b(cu[aá]l\s+me\s+recomiendas?)\b",
+            r"\b(cu[aá]l\s+(de\s+estos|de\s+estas)|cu[aá]l\s+es\s+mejor)\b",
+        ]
+        return any(re.search(p, ql) for p in patterns)
 
     def _choice_reasons(self, hit: dict, q: str) -> str:
         import os
@@ -3060,21 +3069,7 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
-        try:
-            pan.update_sources(hits)
-        except Exception:
-            safe = []
-            for h in hits or []:
-                safe.append({
-                    "path": h.get("path", ""),
-                    "name": h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)",
-                    "note": h.get("note", ""),
-                    "keywords": h.get("keywords", "")
-                })
-            try:
-                pan.update_sources(safe)
-            except Exception:
-                pass
+
 
     def _spinner_stop(self):
         try:
@@ -3126,11 +3121,12 @@ class ChatWithLLM(ChatFrame):
 
     def _compose_system_budgeted(self, user_text: str, max_tokens: int = 256):
         base_sys = (
-            "Eres PACqui. Tono cercano y profesional. PRIMERO ofrece 2–3 frases claras y útiles. "
-            "DESPUÉS, si hay [Contexto (índice)], lista rutas (viñetas) con nombre y ruta, priorizando PDF/DOCX. "
-            "Si hay [Contexto del repositorio], explica y CITA con [n] y muestra la ruta. "
-            "Si el contexto es insuficiente, dilo con amabilidad y sugiere cómo afinar la búsqueda. "
-            "No inventes rutas ni datos."
+            "Eres PACqui. Tono cercano y profesional. PRIMERO ofrece 2–3 frases claras y útiles.\n"
+            "DESPUÉS, si hay [Contexto (índice)], lista rutas (viñetas) con nombre y ruta EXACTAMENTE como aparecen.\n"
+            "PROHIBIDO inventar rutas, títulos o documentos; si no hay [Contexto (índice)] no listes rutas.\n"
+            "Si hay [Contexto del repositorio], explica y CITA con [n] y muestra la ruta.\n"
+            "Si el contexto es insuficiente, dilo con amabilidad y sugiere cómo afinar la búsqueda.\n"
+            "Nunca menciones documentos que no estén en el [Contexto (índice)] ni introduzcas temas no pedidos."
         )
 
         # Contexto inicial (auto-escala con el ctx del modelo)
@@ -3141,7 +3137,6 @@ class ChatWithLLM(ChatFrame):
         else:
             idx_top, idx_note_chars = 3, 150
             rag_k, rag_frag_chars = 1, 320
-
 
         def shrink(text: str, max_chars: int) -> str:
             t = (text or "").strip()
@@ -3157,7 +3152,11 @@ class ChatWithLLM(ChatFrame):
 
         # Construcción de contextos
         idx_ctx, hits = self.llm.build_index_context(user_text, top_k=idx_top, max_note_chars=idx_note_chars)
-        rag_ctx = self.llm._rag_retrieve(user_text, k=rag_k, max_chars=rag_frag_chars)
+        rag_q = user_text
+        if getattr(self, "_ext_filter", None):
+            rag_q = user_text + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
+        # >>> ESTA LÍNEA ES LA QUE FALTABA <<<
+        rag_ctx = self.llm._rag_retrieve(rag_q, k=rag_k, max_chars=rag_frag_chars)
 
         def build_system_text():
             parts = [base_sys]
@@ -3165,12 +3164,11 @@ class ChatWithLLM(ChatFrame):
             if rag_ctx: parts += ["[Contexto del repositorio]", rag_ctx]
             return "\n\n".join(parts).strip()
 
-        ctx = int(getattr(self.llm, "ctx", 2048) or 2048)
         sys_full = build_system_text()
 
-        # --- CLAVE: overhead del render de mensajes de llama-cpp ---
+        # --- Overhead del render de mensajes ---
         def used_effective():
-            # 1.35x de margen + 20 tokens fijos por roles/plantilla
+            # 1.35x margen + 20 tokens plantilla
             return int(1.35 * (toklen(sys_full) + toklen(user_text))) + 20
 
         used = used_effective()
@@ -3203,17 +3201,54 @@ class ChatWithLLM(ChatFrame):
 
     def _send_llm(self):
         from tkinter import messagebox
-        import threading, os
+        import threading, os, re
 
+        # 1) Lee el texto del usuario (¡ANTES de usar q.lower()!)
         q = self.ent_input.get().strip()
+        _ensure_rag_patch()
+
         if not q:
-            messagebox.showinfo(APP_NAME, "Escribe algo para enviar.")
+            try:
+                messagebox.showinfo(APP_NAME, "Escribe algo para enviar.")
+            except Exception:
+                pass
+            return
+
+        # 2) Eco al chat y limpia el input
+        self._append_chat("Tú", q)
+        try:
+            self.ent_input.delete(0, "end")
+        except Exception:
+            pass
+
+        # 3) Saludos / small-talk (no toca índice)
+        qlow = q.lower().strip()
+        qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
+
+        if re.match(r"^(hola|buenas(?:\s+(tardes|noches))?|buenos\s+dias|hey|hello|gracias|ok|vale)\b", qlow_clean):
+            self._append_chat("PACqui",
+                                "¡Hola! 👋 Puedo buscar en tu repositorio y priorizar **PDF/DOCX**. "
+                                "Dime una palabra clave (p. ej., *pagos FEADER*) o escribe *solo pdf* / *solo docx* para filtrar.")
             return
 
 
-        # Echo del usuario y limpia entrada
-        self._append_chat("Tú", q)
-        self.ent_input.delete(0, "end")
+
+        # 4) Actualiza filtro persistente por extensión segun texto del usuario
+        if hasattr(self, "_update_ext_filter"):
+            try:
+                self._update_ext_filter(qlow)
+            except Exception:
+                pass
+
+        # 5) Guardarraíl: si la consulta NO aporta señal y no hay hits previos, evita llamar al LLM
+        toks = re.findall(r"[a-z0-9áéíóúüñ]{3,}", qlow)
+        if len(toks) <= 2 and not getattr(self, "_hits", []):
+            self._append_chat("PACqui",
+                                "Para recomendar algo, necesito al menos una palabra clave concreta o que elijas una de las fuentes listadas.")
+            return
+
+        # (A partir de aquí CONTINÚA tu código — la siguiente línea debe ser exactamente:)
+
 
         if self._user_asks_why_this(q):
             # 2.1) Si hubo recomendación única previa → explica esa
@@ -3238,6 +3273,7 @@ class ChatWithLLM(ChatFrame):
                     path = h.get("path", "")
                     out.append(f"- **{name}**\n  Ruta: {path}\n  Motivo: {reasons}.")
                 self._append_chat("PACqui", "He priorizado estas fuentes por:\n\n" + "\n".join(out))
+
                 return
 
             # 2.3) Fallback si no tengo contexto todavía
@@ -3249,6 +3285,9 @@ class ChatWithLLM(ChatFrame):
         # --- Detección de saludo / small-talk (no toca índice) ---
         import re
         qlow = q.lower().strip()
+        # Actualiza (o mantiene) el filtro de extensiones persistente
+        self._update_ext_filter(qlow)
+
 
         # quita menciones al bot para que "hola pacqui" cuente como saludo
         qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
@@ -3272,7 +3311,15 @@ class ChatWithLLM(ChatFrame):
         if self._user_wants_choice(q):
             t0 = time.time()
             # 1) Intenta recoger hits nuevos; si la frase de “elige” no aporta tokens, caemos a los previos
-            hits = self._collect_hits(q, top_k=8, note_chars=240) or (getattr(self, "_hits", []) or [])
+            hits = self._collect_hits(
+                q, top_k=5, note_chars=240,
+                prefer_only=(sorted(self._ext_filter) if getattr(self, "_ext_filter", None) else None)
+            ) or []
+
+            # Si no hay hits nuevos pero venimos de un listado previo, usa los últimos
+            if not hits:
+                hits = getattr(self, "_hits", []) or []
+
             dt_ms = int((time.time() - t0) * 1000)
 
             if hits:
@@ -3320,6 +3367,10 @@ class ChatWithLLM(ChatFrame):
                 prefer = [".pdf"]
             elif "solo docx" in qlow:
                 prefer = [".docx", ".doc"]
+            # Prioridad al filtro persistente del chat (si está activo)
+            if getattr(self, "_ext_filter", None):
+                prefer = sorted(self._ext_filter)
+
 
             t0 = time.time()
             hits = self._collect_hits(q, top_k=8, note_chars=240, prefer_only=prefer) or []
@@ -3402,7 +3453,10 @@ class ChatWithLLM(ChatFrame):
                 try:
                     # 1) Contexto (ÍNDICE + RAG)
                     idx_ctx, idx_hits = self.llm.build_index_context(q, top_k=5, max_note_chars=220)
-                    rag_ctx = self.llm._rag_retrieve(q, k=6, max_chars=750)
+                    rag_q = q
+                    if getattr(self, "_ext_filter", None):
+                        rag_q = q + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
+                    rag_ctx = self.llm._rag_retrieve(rag_q, k=6, max_chars=750)
 
                     has_idx = bool((idx_ctx or "").strip())
                     has_rag = bool((rag_ctx or "").strip())
@@ -3415,14 +3469,41 @@ class ChatWithLLM(ChatFrame):
                         for s in src[:3]:
                             name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
                             rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
-                        msg = (
-                            "Gracias por la pregunta. Aún no he localizado fragmentos suficientemente relevantes.\n\n"
-                            "Te dejo rutas prometedoras (priorizando PDF/DOCX). "
-                            "Si quieres, intento **buscar solo en PDF/DOCX** o afinamos con alguna palabra clave más.\n")
-                        if rutas:
-                            msg += "\nRutas sugeridas:\n\n" + "\n".join(rutas)
-                        self.after(0, lambda: self._append_chat("PACqui", msg))
-                        return
+                        msg = ""
+                        # Diagnóstico del índice y sugerencias
+                        try:
+                            with self.app.data._connect() as con:
+                                kw = con.execute("SELECT COUNT(1) FROM doc_keywords").fetchone()[0] or 0
+                                nt = con.execute("SELECT COUNT(1) FROM doc_notes").fetchone()[0] or 0
+                                ff = con.execute("SELECT COUNT(1) FROM files").fetchone()[0] or 0
+                        except Exception:
+                            kw = nt = ff = 0
+
+                        try:
+                            top_kw = [t for t, _ in self.app.data.keywords_top(limit=6)]
+                        except Exception:
+                            top_kw = []
+
+                        filtro_txt = ""
+                        if getattr(self, "_ext_filter", None):
+                            filtro_txt = " (filtro activo: " + ", ".join(sorted(ext.lstrip(".") for ext in self._ext_filter)) + ")"
+
+                        if (kw + nt + ff) == 0:
+                            msg = (
+                                "No encuentro contenido porque el **índice está vacío**.\n\n"
+                                "→ Ve a *Admin ▸ Índice* y carga el índice desde SQLite o ejecuta un escaneo inicial.\n"
+                            )
+                        else:
+                            msg = (
+                                f"No he localizado fragmentos suficientemente relevantes{filtro_txt}.\n\n"
+                                "Puedes afinar con una palabra clave concreta"
+                                + (" o quitar el filtro con *quitar filtro*" if filtro_txt else "")
+                                + "."
+                            )
+
+
+
+
 
                     # 3) Reglas duras según el modo (con RAG vs. solo índice)
                     if has_rag:
@@ -3658,7 +3739,11 @@ class ChatWithLLM(ChatFrame):
         Si no hay observaciones, el que llama debe caer a _reply_with_observations().
         """
         # 1) Recogemos hits y construimos bloques OBS + RUTAS
-        all_hits = self._collect_hits(user_text, top_k=5, note_chars=240)
+        all_hits = self._collect_hits(
+            user_text, top_k=5, note_chars=240,
+            prefer_only=(sorted(self._ext_filter) if getattr(self, "_ext_filter", None) else None)
+        )
+
         # El treeview se actualiza fuera, pero devolvemos también los hits
         obs_block, rutas_block, used_hits = self._build_obs_and_routes_blocks(all_hits, max_items=3, max_obs_chars=220)
 

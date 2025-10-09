@@ -186,10 +186,6 @@ class LLMService:
         if strong:
             must_any.append(set(strong))
 
-        # Términos prohibidos (si el usuario pide explícitamente "no sigc", o "sin sigc")
-        must_not = set()
-        if "no sigc" in qnorm or "sin sigc" in qnorm:
-            must_not.add("sigc")
 
         # Términos prohibidos (si el usuario pide explícitamente "no sigc", o "sin sigc")
         must_not = set()
@@ -326,11 +322,25 @@ class LLMService:
 
     def _rag_retrieve(self, query: str, k: int = 4, max_chars: int = 700) -> str:
         """
-        Recupera k fragmentos re-ordenando por similitud + preferencia de extensión (PDF/DOCX).
-        Si el usuario pide PDF/DOCX explícitamente en la consulta, se filtra a esas extensiones.
+        Recupera k fragmentos re-ordenando por similitud + preferencia de extensión (PDF/DOCX),
+        SIN depender de self.rag (usa chunks/embeddings del SQLite).
         """
-        import os, re
+        import re, os, struct
         from pathlib import Path
+
+        rows = self._rag_rows()
+        if not rows:
+            return ""
+
+        emb = self._get_embedder()
+        qv = emb["encode"](query or "")
+
+        def cos(a, b):
+            s = 0.0
+            m = min(len(a), len(b))
+            for i in range(m):
+                s += a[i] * b[i]
+            return s
 
         qlow = (query or "").lower()
         ext_filter = set()
@@ -340,51 +350,43 @@ class LLMService:
 
         EXT_BONUS = {".pdf": 3, ".docx": 3, ".doc": 2, ".pptx": 1}
         EXT_MALUS = {".png": -2, ".jpg": -2, ".jpeg": -2, ".gif": -2, ".py": -2, ".java": -1, ".sql": -1}
-
-        try:
-            hits = self.rag.search(query, top_k=int(max(k * 3, 8)))
-        except Exception:
-            hits = []
-        if not hits:
-            return ""
-
         toks = re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", qlow)
 
-        def _score(h):
-            path = (h.get("path") or h.get("file") or "").strip()
-            ext = Path(path).suffix.lower()
-            base = float(h.get("score", 0.0))
-            fname = os.path.basename(path).lower()
-            fname_bonus = sum(1 for t in toks if t.lower() in fname)
-            ext_adj = EXT_BONUS.get(ext, 0) + EXT_MALUS.get(ext, 0)
-            return base * 10 + ext_adj * 5 + fname_bonus * 2
-
         scored = []
-        for h in hits:
-            path = (h.get("path") or h.get("file") or "").strip()
-            ext = Path(path).suffix.lower()
+        for _cid, text, path, vec_blob in rows:
+            try:
+                vec = list(struct.unpack(f"{len(vec_blob) // 4}f", vec_blob)) if isinstance(vec_blob, (
+                bytes, bytearray)) else list(vec_blob)
+            except Exception:
+                continue
+            ext = Path(path or "").suffix.lower()
             if ext_filter and ext not in ext_filter:
                 continue
-            scored.append((_score(h), h))
+            base = cos(qv, vec)
+            fname = os.path.basename(path or "").lower()
+            fname_bonus = sum(1 for t in toks if t in fname)
+            ext_adj = EXT_BONUS.get(ext, 0) + EXT_MALUS.get(ext, 0)
+            scored.append((base * 10 + ext_adj * 5 + fname_bonus * 2, text or "", path or ""))
+
         if not scored:
             return ""
 
         scored.sort(key=lambda x: -x[0])
-        picked = [h for _, h in scored[:max(1, int(k))]]
+        picked = scored[:max(1, int(k))]
 
         frags, used = [], 0
-        for i, h in enumerate(picked, start=1):
-            text = (h.get("text") or "").strip()
-            path = (h.get("path") or h.get("file") or "").strip()
-            if not text:
+        for i, (_, text, path) in enumerate(picked, start=1):
+            t = (text or "").strip()
+            if not t:
                 continue
-            if len(text) > 600:
-                text = text[:600] + "…"
-            frag = f"[{i}] {text}\n    Fuente: {path}"
+            if len(t) > 600:
+                t = t[:600] + "…"
+            frag = f"[{i}] {t}\n    Fuente: {path}"
             if used + len(frag) > max_chars * k:
                 break
             frags.append(frag)
             used += len(frag)
+
         return "\n\n".join(frags)
 
     def _hash_embedder(self, text, dim=256):
@@ -446,6 +448,40 @@ class LLMService:
                 msgs[i] = {"role": "user", "content": content}
                 break
         return msgs
+
+    # --- warmup no bloqueante (añadir dentro de LLMService) ---
+    def warmup_async(self):
+        import threading
+        if getattr(self, "_warmed", False):
+            return
+        t = threading.Thread(target=self._warmup, daemon=True)
+        t.start()
+
+    def _warmup(self):
+        if getattr(self, "_warmed", False):
+            return
+        try:
+            # 1) fuerza carga del embedder (si hay SentenceTransformers o hash)
+            try:
+                _ = self._get_embedder()
+            except Exception:
+                pass
+            # 2) toca SQLite del RAG una vez (abre/cierra y lee algo)
+            try:
+                _ = self._rag_rows()[:1]
+            except Exception:
+                pass
+            # 3) primer chat mínimo para compilar grafo/kv-cache del LLM
+            try:
+                if self.model is not None:
+                    self.model.create_chat_completion(
+                        messages=[{"role": "system", "content": "ok"}, {"role": "user", "content": "ok"}],
+                        max_tokens=1, temperature=0.0, stream=False
+                    )
+            except Exception:
+                pass
+        finally:
+            self._warmed = True
 
     def chat(self, messages, temperature=0.3, max_tokens=256, stream=True):
         if not self.model:
