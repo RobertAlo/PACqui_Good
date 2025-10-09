@@ -240,7 +240,6 @@ class AppRoot(tk.Tk):
         self.lbl_model.pack(side="right")
         self.btn_lock = ttk.Button(top, text="🔒 Admin", command=self._toggle_admin)
         self.btn_lock.pack(side="right", padx=(0, 8))
-        ttk.Button(top, text="Visor", command=self._open_viewer).pack(side="right", padx=(0, 8))
         ttk.Button(
             top, text="Ayuda",
             command=lambda: messagebox.showinfo(
@@ -251,9 +250,41 @@ class AppRoot(tk.Tk):
         self.stack = ttk.Frame(self)
         self.stack.pack(fill="both", expand=True)
 
-        # Nota: pasamos app=self (aunque tu __init__ ya hace fallback al toplevel)
-        self.chat = ChatWithLLM(self.stack, self.data, self.llm, app=self)
+        # Notebook del FRONT: Asistente (público) + Visor (cliente)
+        self.nb_front = ttk.Notebook(self.stack)
+        self.nb_front.pack(fill="both", expand=True)
+
+        # --- Pestaña 1: Asistente (modo público) ---
+        tab_chat = ttk.Frame(self.nb_front, padding=6)
+        self.nb_front.add(tab_chat, text="PACqui (Asistente)")
+        self.chat = ChatWithLLM(tab_chat, self.data, self.llm, app=self)
         self.chat.pack(fill="both", expand=True)
+
+        # --- Pestaña 2: Visor (cliente) ---
+        tab_visor = ttk.Frame(self.nb_front, padding=6)
+        self.nb_front.add(tab_visor, text="Visor")
+
+        # El Organizador fue diseñado para un Toplevel con .protocol(): emulamos un no-op
+        if not hasattr(tab_visor, "protocol"):
+            def _noop_protocol(*_a, **_k):
+                return None
+
+            tab_visor.protocol = _noop_protocol  # mismo truco que usamos en AdminPanel. :contentReference[oaicite:1]{index=1}
+
+        # Carga del módulo del Visor + (opcional) RAG patch
+        try:
+            base = _import_organizador()
+            try:
+                _import_rag_patch()
+            except Exception:
+                pass
+            OrganizadorFrame = getattr(base, "OrganizadorFrame")
+            # Visor en modo cliente: oculta botones de LLM/Scraper/dry-run dentro del visor. :contentReference[oaicite:2]{index=2}
+            self.visor = OrganizadorFrame(tab_visor, visor_mode=True)
+            self.visor.pack(fill="both", expand=True)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudo cargar el Visor en la pestaña:\n{e}", parent=self)
+
         self.admin = None
 
         self.footer = ttk.Label(self, anchor="w")
@@ -377,12 +408,17 @@ class AppRoot(tk.Tk):
                 self.btn_lock.configure(text="🔓 Admin (activo)")
                 if self.admin is None:
                     self.admin = AdminPanel(self.stack, self)
-                self.chat.pack_forget(); self.admin.pack(fill="both", expand=True)
+                # Oculta el front (notebook) y muestra Admin
+                if hasattr(self, "nb_front"):
+                    self.nb_front.pack_forget()
+                self.admin.pack(fill="both", expand=True)
         else:
             self._is_admin = False
             self.btn_lock.configure(text="🔒 Admin")
-            if self.admin: self.admin.pack_forget()
-            self.chat.pack(fill="both", expand=True)
+            if self.admin:
+                self.admin.pack_forget()
+            if hasattr(self, "nb_front"):
+                self.nb_front.pack(fill="both", expand=True)
         self._refresh_footer()
 
     def _open_viewer(self):
@@ -3685,10 +3721,40 @@ class ChatWithLLM(ChatFrame):
         # último tie-break: rutas más cortas (más cercanas a raíz tienden a ser “oficiales”)
         tiebreak_shorter_path = -len(path)
 
-        return (ext_bonus + token_bonus + feaga_bias + note_bonus, base, tiebreak_shorter_path)
+        # --- BONUS por frase exacta "control de coherencia" ---
+        phrase_bonus = 0
+        if re.search(r"control\s+(de\s+)?coherencia", qlow):
+            if re.search(r"control\s+(de\s+)?coherencia", name):
+                # Frase en el TÍTULO del fichero → boost fuerte
+                phrase_bonus += 50
+            elif re.search(r"control\s+(de\s+)?coherencia", path):
+                # Frase en la RUTA (carpeta) → boost medio
+                phrase_bonus += 30
+
+        # ÚLTIMO tie-break: rutas más cortas tienden a ser “oficiales”
+        tiebreak_shorter_path = -len(path)
+
+        return (ext_bonus + token_bonus + feaga_bias + note_bonus + phrase_bonus,
+                base,
+                tiebreak_shorter_path)
 
     def _pick_best_hit(self, hits: list[dict], q: str) -> dict | None:
-        scored = [ (self._score_choice(h, q), h) for h in (hits or []) ]
+        import re
+        ql = (q or "").lower()
+
+        # 1) Si preguntan por "control de coherencia", restringe a los que tengan la frase en
+        #    título o ruta (si hay alguno). Esto evita que gane "calidad..." por acumulación de puntos.
+        if re.search(r"control\s+(de\s+)?coherencia", ql):
+            exact = []
+            for h in (hits or []):
+                blob = ((h.get("name") or "") + " " + (h.get("path") or "")).lower()
+                if re.search(r"control\s+(de\s+)?coherencia", blob):
+                    exact.append(h)
+            if exact:
+                hits = exact
+
+        # 2) Puntúa y ordena con el resto de criterios
+        scored = [(self._score_choice(h, q), h) for h in (hits or [])]
         if not scored:
             return None
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -3720,6 +3786,13 @@ class ChatWithLLM(ChatFrame):
             reasons.append("palabras clave: " + ", ".join(sorted(set(common))[:3]))
         if not reasons and note:
             reasons.append("observaciones del índice coinciden")
+
+        # Motivo explícito por frase exacta
+        if re.search(r"control\s+(de\s+)?coherencia", ql):
+            if re.search(r"control\s+(de\s+)?coherencia", (name or "").lower()):
+                reasons.append('contiene la frase **"control de coherencia"** en el título')
+            elif re.search(r"control\s+(de\s+)?coherencia", (path or "").lower()):
+                reasons.append('contiene **"control de coherencia"** en la ruta')
 
         # pie '— Origen: índice …' coherente con tu UI
         try:
