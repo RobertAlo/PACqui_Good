@@ -32,14 +32,24 @@ def _import_organizador():
     primary = "PACqui_RAG_bomba_SAFE"
     alt = "PACqui_RAG_bomba_SAFE_VISOR"
 
-    # 1) Import normal por nombre de módulo (por si ya está en sys.path)
-    # Ahora: preferimos el VISOR
+    # 1) Import directo por nombre (preferimos el VISOR)
     for name in (alt, primary):
         try:
             return importlib.import_module(name)
         except Exception:
             pass
 
+    # 2) Rutas conocidas para búsqueda por fichero/paquete
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [here, os.path.dirname(here), os.getcwd()]
+    # añade hasta 3 padres
+    p = here
+    for _ in range(3):
+        p = os.path.dirname(p)
+        if p and p not in roots:
+            roots.append(p)
+
+    candidates = []
     for root in roots:
         for base in (alt, primary):
             candidates.append(os.path.join(root, f"{base}.py"))
@@ -61,6 +71,7 @@ def _import_organizador():
         "No encontré el visor: acepta 'PACqui_RAG_bomba_SAFE.py' o 'PACqui_RAG_bomba_SAFE_VISOR.py' "
         "en esta carpeta o en la carpeta padre (también vale como paquete con __init__.py)."
     )
+
 
 def _import_rag_patch():
     """
@@ -100,6 +111,11 @@ def _ensure_rag_patch():
     global _RAG_READY
     if _RAG_READY:
         return
+    try:
+        # ← NUEVO: garantizamos que el módulo base exista con ese nombre
+        _ensure_organizador_loaded()
+    except Exception:
+        pass
     try:
         _import_rag_patch()
         _RAG_READY = True
@@ -262,6 +278,8 @@ class AppRoot(tk.Tk):
         # … tras self.nb_front.add(tab_visor, text="Visor")
         self.nb_front.bind("<<NotebookTabChanged>>", self._sync_help_button_visibility)
         self._sync_help_button_visibility()
+        # Precarga silenciosa del monkey-patch de RAG para evitar bloqueo en el 1er envío
+        threading.Thread(target=_ensure_rag_patch, daemon=True).start()
 
         # Referencias para poder activar la pestaña desde código
         self.tab_visor = tab_visor
@@ -395,6 +413,10 @@ class AppRoot(tk.Tk):
 
         try:
             self.llm.load(mp, ctx=ctx)
+            # dentro de _autoload_model(), justo después de self.llm.load(...):
+            import threading
+            threading.Thread(target=self.llm.warmup_async, daemon=True).start()
+
             # Precalentado en segundo plano (evita el “no responde” del 1er turno)
             try:
                 self.after(200, self.llm.warmup_async)
@@ -1446,8 +1468,8 @@ class AdminPanel(ttk.Notebook):
 
         # Compatibilidad si expusieras el objeto llama-cpp por debajo:
         llama = getattr(mdl, "model", None) or getattr(mdl, "llama", None)
-        if llama and hasattr(llama, "create_chat_completion"):
-            out = llama.create_chat_completion(messages=messages, temperature=0.2)
+        if llama and hasattr(llama, "self.app.llm.chat"):
+            out = llama.self.app.llm.chat(messages=messages, temperature=0.2)
             return out["choices"][0]["message"]["content"]
 
         raise RuntimeError("No encuentro un método compatible para invocar el modelo.")
@@ -2913,6 +2935,22 @@ class AdminPanel(ttk.Notebook):
                           ctx=ctx,
                           threads=self.app.llm.threads,
                           batch=self.app.llm.n_batch)
+            self.app.llm.load(mp, ctx=ctx)
+            self.app.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
+            cfg = _load_cfg();
+            cfg["model_path"] = mp;
+            cfg["model_ctx"] = ctx;
+            _save_cfg(cfg)
+            messagebox.showinfo(APP_NAME, "Modelo cargado en backend.")
+            self.app._log("model_loaded",
+                          model=os.path.basename(mp),
+                          ctx=ctx,
+                          threads=self.app.llm.threads,
+                          batch=self.app.llm.n_batch)
+
+            # Calienta en background: embedder, SQLite RAG y mini chat (compila grafo/KV)
+            self.app.llm.warmup_async()
+
 
         except Exception as e:
             messagebox.showerror(APP_NAME, f"No se pudo cargar el modelo:\n{e}")
@@ -3405,7 +3443,7 @@ class ChatWithLLM(ChatFrame):
 
         # 1) Lee el texto del usuario (¡ANTES de usar q.lower()!)
         q = self.ent_input.get().strip()
-        _ensure_rag_patch()
+
 
         if not q:
             try:
@@ -3650,6 +3688,7 @@ class ChatWithLLM(ChatFrame):
             self._spinner_start()
 
             def worker():
+
                 try:
                     # 1) Contexto (ÍNDICE + RAG)
                     idx_ctx, idx_hits = self.llm.build_index_context(q, top_k=5, max_note_chars=220)

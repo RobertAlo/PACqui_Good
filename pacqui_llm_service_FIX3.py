@@ -6,13 +6,29 @@ from pathlib import Path
 class LLMService:
     """Servicio LLM sin UI para PACqui. Carga GGUF (llama-cpp) y expone chat().
        Incluye utilidades para contar tokens (aprox) y compactar contexto."""
+
     def __init__(self, db_path: str):
+        from pathlib import Path
         self.db_path = str(Path(db_path))
         self.model = None
         self.model_path = ""
         self.ctx = 2048
-        self.threads = max(2, (os.cpu_count() or 4) - 1)
-        self.n_batch = 256
+
+        # Reserva 1–2 cores para la UI
+        import os
+        self.threads = max(2, (os.cpu_count() or 4) - 2)
+
+        # Más conservador para primer run (evita picos)
+        self.n_batch = 128
+
+        # --- NUEVO: sincronización y flags de warmup ---
+        import threading
+        self._model_lock = threading.Lock()  # un solo hilo puede usar el modelo a la vez
+        self._warming = False  # warmup en curso
+        self._warmed = False  # warmup finalizado
+
+        # cache opcional del embedder
+        self._embedder_cached = None
 
     # --------- carga ---------
     def load(self, model_path: str, ctx: int = 2048):
@@ -451,78 +467,93 @@ class LLMService:
 
     # --- warmup no bloqueante (añadir dentro de LLMService) ---
     def warmup_async(self):
+        """Lanza un warmup una sola vez y nunca en paralelo."""
         import threading
-        if getattr(self, "_warmed", False):
+        if self._warmed or self._warming or not self.model:
             return
-        t = threading.Thread(target=self._warmup, daemon=True)
-        t.start()
+        self._warming = True
+        threading.Thread(target=self._warmup, daemon=True).start()
 
     def _warmup(self):
-        if getattr(self, "_warmed", False):
-            return
+        """Calienta embedder, SQLite y compila el grafo con un chat mínimo, BAJO LOCK."""
         try:
-            # 1) fuerza carga del embedder (si hay SentenceTransformers o hash)
+            # 1) embedder
             try:
                 _ = self._get_embedder()
             except Exception:
                 pass
-            # 2) toca SQLite del RAG una vez (abre/cierra y lee algo)
+
+            # 2) tocar RAG (SQLite)
             try:
                 _ = self._rag_rows()[:1]
             except Exception:
                 pass
-            # 3) primer chat mínimo para compilar grafo/kv-cache del LLM
+
+            # 3) micro-chat para compilar grafo/KV — SIEMPRE bajo lock
             try:
                 if self.model is not None:
-                    self.model.create_chat_completion(
-                        messages=[{"role": "system", "content": "ok"}, {"role": "user", "content": "ok"}],
-                        max_tokens=1, temperature=0.0, stream=False
-                    )
+                    with self._model_lock:
+                        self.model.self.app.llm.chat(
+                            messages=[{"role": "system", "content": "ok"},
+                                      {"role": "user", "content": "ok"}],
+                            max_tokens=1, temperature=0.0, stream=False
+                        )
             except Exception:
                 pass
         finally:
             self._warmed = True
+            self._warming = False
 
     def chat(self, messages, temperature=0.3, max_tokens=256, stream=True):
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
+
         try:
-            # Algunos builds no aceptan cache_prompt
-            return self.model.create_chat_completion(
-                messages=messages, temperature=float(temperature), max_tokens=int(max_tokens),
-                stream=bool(stream), cache_prompt=True
-            )
-        except TypeError:
-            # build de llama-cpp sin cache_prompt
-            return self.model.create_chat_completion(
-                messages=messages, temperature=float(temperature), max_tokens=int(max_tokens),
-                stream=bool(stream)
-            )
+            with self._model_lock:
+                try:
+                    return self.model.create_chat_completion(
+                        messages=messages,
+                        temperature=float(temperature),
+                        max_tokens=int(max_tokens),
+                        stream=bool(stream),
+                        cache_prompt=True
+                    )
+                except TypeError:
+                    # build de llama-cpp sin cache_prompt
+                    return self.model.create_chat_completion(
+                        messages=messages,
+                        temperature=float(temperature),
+                        max_tokens=int(max_tokens),
+                        stream=bool(stream)
+                    )
         except (RuntimeError, ValueError) as e:
-            # Si es desbordamiento de contexto → recortamos y reintentamos
+            # Desbordes de contexto → recortar y reintentar
             msg = str(e)
             if "context window" in msg or "exceed context" in msg:
-                # Presupuesto:  ctx - salida - margen
                 out_tok = max(128, min(256, int(self.ctx * 0.12)))
                 budget_in = max(256, self.ctx - out_tok - 64)
                 safe_msgs = self._shrink_messages(messages, budget_in_tokens=budget_in)
-                try:
-                    return self.model.create_chat_completion(
-                        messages=safe_msgs, temperature=float(temperature),
-                        max_tokens=int(out_tok), stream=bool(stream)
-                    )
-                except Exception:
-                    return {
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "[aviso] El contexto era demasiado largo y fue recortado automáticamente. "
-                                           "Vuelve a preguntar con una frase más concreta."
-                            }
-                        }]
-                    }
-            # Otros errores: propaga
+                with self._model_lock:
+                    try:
+                        return self.model.create_chat_completion(
+                            messages=safe_msgs,
+                            temperature=float(temperature),
+                            max_tokens=int(out_tok),
+                            stream=bool(stream)
+                        )
+                    except Exception:
+                        return {
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "[aviso] El contexto era demasiado largo y fue recortado automáticamente. "
+                                               "Vuelve a preguntar con una frase más concreta."
+                                }
+                            }]
+                        }
             raise
+
+
 
 
 

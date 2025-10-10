@@ -4066,11 +4066,11 @@ class LLMChatDialog(tk.Toplevel):
             stream = None
             try:
                 try:
-                    stream = self.model.create_chat_completion(
+                    stream = self.model.self.app.llm.chat(
                         messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
                     )
                 except TypeError:
-                    stream = self.model.create_chat_completion(
+                    stream = self.model.self.app.llm.chat(
                         messages=msgs, temperature=temp, max_tokens=max_t, stream=True
                     )
             except Exception:
@@ -4101,11 +4101,11 @@ class LLMChatDialog(tk.Toplevel):
             if not final and not self.stop_event.is_set():
                 try:
                     try:
-                        resp = self.model.create_chat_completion(
+                        resp = self.model.self.app.llm.chat(
                             messages=msgs, temperature=temp, max_tokens=max_t, stream=False, cache_prompt=True
                         )
                     except TypeError:
-                        resp = self.model.create_chat_completion(
+                        resp = self.model.self.app.llm.chat(
                             messages=msgs, temperature=temp, max_tokens=max_t, stream=False
                         )
                     ch0 = (resp.get("choices") or [{}])[0]
@@ -4342,11 +4342,11 @@ class LLMChatDialog(tk.Toplevel):
             stream = None
             try:
                 try:
-                    stream = self.model.create_chat_completion(
+                    stream = self.model.self.app.llm.chat(
                         messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
                     )
                 except TypeError:
-                    stream = self.model.create_chat_completion(
+                    stream = self.model.self.app.llm.chat(
                         messages=msgs, temperature=temp, max_tokens=max_t, stream=True
                     )
             except Exception:
@@ -4377,11 +4377,11 @@ class LLMChatDialog(tk.Toplevel):
             if not final and not self.stop_event.is_set():
                 try:
                     try:
-                        resp = self.model.create_chat_completion(
+                        resp = self.model.self.app.llm.chat(
                             messages=msgs, temperature=temp, max_tokens=max_t, stream=False, cache_prompt=True
                         )
                     except TypeError:
-                        resp = self.model.create_chat_completion(
+                        resp = self.model.self.app.llm.chat(
                             messages=msgs, temperature=temp, max_tokens=max_t, stream=False
                         )
                     ch0 = (resp.get("choices") or [{}])[0]

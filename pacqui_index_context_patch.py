@@ -8,10 +8,18 @@
 import os, re
 from pathlib import Path
 
+# al principio del archivo, donde importabas la base
 try:
     import PACqui_RAG_bomba_SAFE as base
-except Exception as e:
-    raise RuntimeError(f"No se pudo importar PACqui_RAG_bomba_SAFE: {e}")
+except Exception:
+    try:
+        import PACqui_RAG_bomba_SAFE_VISOR as base
+        import sys as _sys
+        # alias para que otros imports por el nombre "SAFE" funcionen
+        _sys.modules.setdefault("PACqui_RAG_bomba_SAFE", base)
+    except Exception as e:
+        raise RuntimeError(f"No se pudo importar PACqui_RAG_bomba_SAFE: {e}")
+
 
 LLMChatDialog = base.LLMChatDialog
 
@@ -133,14 +141,15 @@ def _patched_worker_chat_stream(self):
         # Llamada en streaming (tolerando builds sin cache_prompt)
         stream = None
         try:
-            try:
-                stream = self.model.create_chat_completion(
-                    messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
-                )
-            except TypeError:
-                stream = self.model.create_chat_completion(
-                    messages=msgs, temperature=temp, max_tokens=max_t, stream=True
-                )
+            stream = self.app.llm.chat(
+                messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
+            )
+        except TypeError:
+            # builds sin cache_prompt → misma llamada pero sin ese kw
+            stream = self.app.llm.chat(
+                messages=msgs, temperature=temp, max_tokens=max_t, stream=True
+            )
+
         except Exception:
             stream = None
 
@@ -159,7 +168,7 @@ def _patched_worker_chat_stream(self):
         final = "".join(out).strip()
         if not final and stream is None:
             try:
-                resp = self.model.create_chat_completion(
+                resp = self.app.llm.chat(
                     messages=msgs, temperature=temp, max_tokens=max_t, stream=False
                 )
                 final = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
