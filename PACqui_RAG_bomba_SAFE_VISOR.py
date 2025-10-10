@@ -1197,7 +1197,13 @@ class OrganizadorFrame(ttk.Frame):
     def cmd_ayuda(self):
         """Abre el diálogo de ayuda con pestañas."""
         try:
-            HelpDialog(self.master, app_name=APP_NAME, version=APP_VERSION)
+            HelpDialog(
+                self.master,
+                app_name=APP_NAME,
+                version=APP_VERSION,
+                is_front=getattr(self, "visor_mode", False),
+            )
+
         except Exception as ex:
             self._append_msg(f"No se pudo abrir la ayuda: {ex}", "WARN")
 
@@ -2482,7 +2488,7 @@ class OrganizadorFrame(ttk.Frame):
         messagebox.showinfo(APP_NAME, f"Palabras clave:\n\n{txt}")
 
     def _open_help(self, event=None):
-        HelpDialog(self.master, APP_NAME, APP_VERSION)
+        HelpDialog(self.master, APP_NAME, APP_VERSION, is_front=getattr(self, "visor_mode", False))
 
     def _ensure_kw_schema(self, conn):
         try:
@@ -3076,8 +3082,9 @@ class ProgressDialog(tk.Toplevel):
 
 
 class HelpDialog(tk.Toplevel):
-    def __init__(self, master, app_name: str, version: str):
+    def __init__(self, master, app_name: str, version: str, is_front: bool = False):
         super().__init__(master)
+        self.is_front = bool(is_front)
         self.title(f"{app_name} • Ayuda")
         self.transient(master); self.resizable(True, True); self.grab_set()
         self.minsize(780, 560)
@@ -3130,33 +3137,62 @@ class HelpDialog(tk.Toplevel):
             self._text_by_tab[frame]=txt; self._matches_by_tab[frame]=[]; self._cursor_by_tab[frame]=-1
             return frame
 
-        guia = r"""
-        # Guía rápida
+        # --- Contenido de ayuda: cambia si es visor del front ---
+        if self.is_front:
+            guia = r"""
+            # Guía rápida (VISOR – Front)
 
-        1) **Selecciona Carpeta Base** (pestaña *Base*).
-        2) Pulsa **Escanear (F5)** para indexar toda la jerarquía en SQLite.
-        3) Escribe texto y pulsa **Enter** o **Buscar**.
-           - Puedes marcar **"Buscar también en ruta"** para incluir directorios.
-           - Filtra por **Extensiones (csv)**, p. ej.: `pdf,docx,xlsx`.
-        4) Revisa la pestaña **Resultados**. Clic derecho sobre un resultado:
-           **Abrir fichero** o **Abrir carpeta**.
-        5) **Exportar ▾**: elige *Visibles* o *Todo* para crear Excel con:
-           - **CARPETA BASE** (columna independiente)
-           - **LOCALIZACIÓN relativa** `"<BASE>\\sub\\sub"`
-           - **Hipervínculo** absoluto (Windows/UNC).
-        """.strip("\n")
-        add_tab("Guía rápida", guia)
+            1) **Abrir carpeta base**: abre en el explorador la carpeta ya indexada (solo lectura).
+            2) Escribe texto y pulsa **Enter** o **Buscar**.
+               - Puedes marcar **“Buscar también en ruta”** para incluir directorios.
+               - Filtra por **Extensiones (csv)**, p. ej.: `pdf,docx,xlsx`.
+            3) Revisa la pestaña **Resultados**. Clic derecho sobre un resultado:
+               **Abrir fichero** o **Abrir carpeta**.
+            4) **Exportar ▾**: elige *Visibles* o *Todo* para crear Excel con:
+               - **CARPETA BASE** (columna independiente)
+               - **LOCALIZACIÓN relativa** `"<BASE>\\sub\\sub"`
+               - **Hipervínculo** absoluto (Windows/UNC).
 
-        atajos = r"""
-        # Atajos
-        - **F1**: abrir ayuda.
-        - **F5**: escanear carpeta base.
-        - **Enter**: ejecutar búsqueda.
-        - **Ctrl+L**: limpiar resultados/mensajes.
-        - **Doble clic** en resultado: abrir fichero.
-        - **Botón derecho**: menú contextual.
-        """.strip("\n")
-        add_tab("Atajos", atajos)
+            **Notas**
+            - Este visor es de solo lectura: no permite seleccionar/eliminar carpeta base,
+              **escanear** ni **vaciar resultados**. Esas acciones se realizan en el asistente (backend).
+            """.strip("\n")
+
+            atajos = r"""
+            # Atajos
+            - **F1**: abrir ayuda.
+            - **Enter**: ejecutar búsqueda.
+            - **Ctrl+L**: limpiar filtros.
+            - **Doble clic** en resultado: abrir fichero.
+            - **Botón derecho**: menú contextual.
+            """.strip("\n")
+        else:
+            # (Contenido actual del backend — déjalo tal cual)
+            guia = r"""
+            # Guía rápida
+
+            1) **Selecciona Carpeta Base** (pestaña Base).
+            2) Pulsa **Escanear (F5)** para indexar toda la jerarquía en SQLite.
+            3) Escribe texto y pulsa **Enter** o **Buscar**.
+               - Puedes marcar **“Buscar también en ruta”** para incluir directorios.
+               - Filtra por **Extensiones (csv)**, p. ej.: `pdf,docx,xlsx`.
+            4) Revisa la pestaña **Resultados**. Clic derecho sobre un resultado:
+               **Abrir fichero** o **Abrir carpeta**.
+            5) **Exportar ▾**: elige *Visibles* o *Todo* para crear Excel con:
+               - **CARPETA BASE** (columna independiente)
+               - **LOCALIZACIÓN relativa** `"<BASE>\\sub\\sub"`
+               - **Hipervínculo** absoluto (Windows/UNC).
+            """.strip("\n")
+
+            atajos = r"""
+            # Atajos
+            - **F1**: abrir ayuda.
+            - **F5**: escanear carpeta base.
+            - **Enter**: ejecutar búsqueda.
+            - **Ctrl+L**: limpiar resultados/mensajes.
+            - **Doble clic** en resultado: abrir fichero.
+            - **Botón derecho**: menú contextual.
+            """.strip("\n")
 
         busqueda = r"""
         # Búsqueda

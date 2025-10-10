@@ -7,6 +7,9 @@ from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from meta_store import MetaStore
 from ui_fuentes import SourcesPanel
+# ——— INSERTA / ASEGURA ESTE IMPORT ———
+from tkinter import messagebox
+
 
 
 from PACqui_FrontApp_v1b import (
@@ -30,18 +33,15 @@ def _import_organizador():
     alt = "PACqui_RAG_bomba_SAFE_VISOR"
 
     # 1) Import normal por nombre de módulo (por si ya está en sys.path)
-    for name in (primary, alt):
+    # Ahora: preferimos el VISOR
+    for name in (alt, primary):
         try:
             return importlib.import_module(name)
         except Exception:
             pass
 
-    # 2) Búsqueda controlada en ubicaciones conocidas (sin escanear disco)
-    here = os.path.dirname(os.path.abspath(__file__))
-    roots = [here, os.path.dirname(here)]
-    candidates = []
     for root in roots:
-        for base in (primary, alt):
+        for base in (alt, primary):
             candidates.append(os.path.join(root, f"{base}.py"))
             candidates.append(os.path.join(root, base, "__init__.py"))
 
@@ -240,12 +240,8 @@ class AppRoot(tk.Tk):
         self.lbl_model.pack(side="right")
         self.btn_lock = ttk.Button(top, text="🔒 Admin", command=self._toggle_admin)
         self.btn_lock.pack(side="right", padx=(0, 8))
-        ttk.Button(
-            top, text="Ayuda",
-            command=lambda: messagebox.showinfo(
-                APP_NAME, "El modelo se gestiona en Admin › Modelo (backend)."
-            )
-        ).pack(side="right", padx=(0, 8))
+        self.btn_help = ttk.Button(top, text="Ayuda", command=self._show_help_contextual)
+        self.btn_help.pack(side="right", padx=(0, 8))
 
         self.stack = ttk.Frame(self)
         self.stack.pack(fill="both", expand=True)
@@ -263,6 +259,12 @@ class AppRoot(tk.Tk):
         # --- Pestaña 2: Visor (cliente) ---
         tab_visor = ttk.Frame(self.nb_front, padding=6)
         self.nb_front.add(tab_visor, text="Visor")
+        # … tras self.nb_front.add(tab_visor, text="Visor")
+        self.nb_front.bind("<<NotebookTabChanged>>", self._sync_help_button_visibility)
+        self._sync_help_button_visibility()
+
+        # Referencias para poder activar la pestaña desde código
+        self.tab_visor = tab_visor
 
         # El Organizador fue diseñado para un Toplevel con .protocol(): emulamos un no-op
         if not hasattr(tab_visor, "protocol"):
@@ -305,6 +307,9 @@ class AppRoot(tk.Tk):
             print(f"[RAG] chunks={n_chunks} embeddings={n_embs} en {self.data.db_path}")
         except Exception as e:
             print(f"[RAG] No se pudo comprobar: {e}")
+
+        # ——— ACTIVAR MODO FRONT EN VISOR ———
+        self.after(200, self._activar_modo_front_visor)
 
     def _log(self, typ: str, **data):
         ev = {"ts": time.time(), "type": typ}
@@ -412,6 +417,8 @@ class AppRoot(tk.Tk):
                 if hasattr(self, "nb_front"):
                     self.nb_front.pack_forget()
                 self.admin.pack(fill="both", expand=True)
+                if not self.btn_help.winfo_manager():
+                    self.btn_help.pack(side="right", padx=(0, 8))
         else:
             self._is_admin = False
             self.btn_lock.configure(text="🔒 Admin")
@@ -419,94 +426,251 @@ class AppRoot(tk.Tk):
                 self.admin.pack_forget()
             if hasattr(self, "nb_front"):
                 self.nb_front.pack(fill="both", expand=True)
+            try:
+                self._sync_help_button_visibility()
+            except Exception:
+                pass
         self._refresh_footer()
 
     def _open_viewer(self):
-        """Abre el organizador en modo cliente (búsqueda/árbol/preview) y deshabilita 3 controles."""
-        import tkinter as tk
-        from tkinter import messagebox
-
+        """Compatibilidad: si algún botón antiguo intenta 'abrir el visor',
+        simplemente activa la pestaña Visor embebida."""
         try:
-            base = _import_organizador()
-            OrganizadorFrame = getattr(base, "OrganizadorFrame")
-            # Aplica el patch del índice (no bloquea si no está)
-            try:
-                _import_rag_patch()
-            except Exception:
-                pass
-
-            # (opcional) aplicar el patch de índice si está presente
-            # Aplica el patch (si está); busca junto al front o en la carpeta padre
-
-
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"No puedo abrir el Visor:\n{e}")
+            # Si guardaste self.tab_visor (paso 1), úsala directamente:
+            self.nb_front.select(self.tab_visor)
             return
-
-        top = tk.Toplevel(self)
-        top.title("PACqui — Visor")
-        top.geometry("1400x820")
-        visor = OrganizadorFrame(top)
-        visor.pack(fill="both", expand=True)
-
-        # Deshabilitar: “PACqui (Asistente)”, “Scraper”, “Simular (dry-run)”
-        for name in ("btn_llm", "btn_scraper", "chk_dry_bot"):
-            w = getattr(visor, name, None)
-            if not w:
-                continue
-            try:
-                w.configure(state="disabled")
-            except Exception:
-                # Por si no soporta 'state', los ocultamos sin romper layout
-                try:
-                    w.grid_remove()
-                except Exception:
-                    try:
-                        w.pack_forget()
-                    except Exception:
-                        pass
-
-        # --- Fallback: desactivar por texto visible (por si cambian los nombres de widget) ---
-        try:
-            import tkinter as _tk
-
-            def _walk(w):
-                for ch in w.winfo_children():
-                    yield ch
-                    yield from _walk(ch)
-
-            to_disable_btn = ("escanear", "seleccionar carpeta", "eliminar carpeta", "exportar")
-            to_disable_chk = ("buscar también en ruta", "dry")
-
-            for w in _walk(visor):
-                cls = w.__class__.__name__.lower()
-                if "button" in cls:
-                    try:
-                        txt = (w.cget("text") or "").strip().lower()
-                        if any(kw in txt for kw in to_disable_btn):
-                            w.configure(state="disabled")
-                    except Exception:
-                        pass
-                elif "checkbutton" in cls:
-                    try:
-                        txt = (w.cget("text") or "").strip().lower()
-                        if any(kw in txt for kw in to_disable_chk):
-                            w.configure(state="disabled")
-                    except Exception:
-                        pass
         except Exception:
             pass
-
-
+        # Fallback: localizar la pestaña por su texto ("Visor")
         try:
-            top.title("PACqui — Visor (cliente)")
+            for tid in self.nb_front.tabs():
+                if (self.nb_front.tab(tid, "text") or "").lower().startswith("visor"):
+                    self.nb_front.select(tid)
+                    break
         except Exception:
             pass
 
     def _refresh_footer(self):
             tables, kw, notes = self.data.stats()
             self.footer.config(text=f"Índice: {Path(self.data.db_path).name} (tablas: {tables}; keywords: {kw}; notas: {notes}) | Admin: {'activo' if self._is_admin else 'bloqueado'}")
-    
+            # // ================================================================
+            # // MODO FRONT PARA VISOR: capar botones de admin por texto visible
+            # // ================================================================
+
+    def _activar_modo_front_visor(self):
+        """Lanza el capado cuando la UI ya está construida (con reintentos)."""
+        try:
+            self.unbind_all("<F5>")  # desactiva atajo de escaneo
+        except Exception:
+            pass
+
+        def tick(tries=[0]):
+            toolbar = self._find_toolbar_visor()
+            if toolbar is not None:
+                self._capar_toolbar_front(toolbar)
+                #self._reconfigurar_boton_ayuda(toolbar)
+            # Barrido global de respaldo SIEMPRE
+            self._capar_toolbar_global()
+
+            tries[0] += 1
+            # Reintenta unas cuantas veces por si la barra aparece tarde
+            if tries[0] < 6:
+                self.after(350, tick)
+
+        self.after(200, tick)
+
+    def _iter_widgets(self, root):
+        for w in root.winfo_children():
+            yield w
+            yield from self._iter_widgets(w)
+
+    def _find_buttons_by_text(self, container, textos):
+        encontrados = {}
+        for w in self._iter_widgets(container):
+            try:
+                # ttk.Button o tk.Button
+                if w.winfo_class() in ("TButton", "Button"):
+                    t = w.cget("text").strip()
+                    if t in textos:
+                        encontrados[t] = w
+            except Exception:
+                pass
+        return encontrados
+
+    def _find_toolbar_visor(self):
+        """
+        Encuentra la barra del VISOR buscando un Frame con botones/menubotones cuyo
+        texto normalizado contenga 'Buscar' y 'Exportar' (admite 'Exportar ▾').
+        Preferimos limitar la búsqueda al contenedor de la pestaña del visor.
+        """
+        root = getattr(self, "tab_visor", self)
+
+        def norm(txt: str) -> str:
+            return (txt or "").replace("…", "").replace("...", "").replace("▾", "").strip().lower()
+
+        BTN_KINDS = ("TButton", "Button", "TMenubutton", "Menubutton")
+        for w in self._iter_widgets(root):
+            try:
+                if w.winfo_class() not in ("TFrame", "Frame", "Labelframe", "TLabelframe"):
+                    continue
+                labels = []
+                for ch in w.winfo_children():
+                    if ch.winfo_class() in BTN_KINDS:
+                        labels.append(norm(ch.cget("text")))
+                if any(t.startswith("exportar") for t in labels) and any(
+                        t == "buscar" or t.startswith("buscar") for t in labels):
+                    return w
+            except Exception:
+                pass
+        return None
+
+    def _capar_toolbar_front(self, toolbar):
+        """
+        Elimina del VISOR (front) los botones de administración.
+        Mantenemos: Abrir carpeta base, Exportar, Buscar, Limpiar filtros, etc.
+        """
+        prefijos_a_quitar = (
+            "Seleccionar carpeta base",  # admite …/...
+            "Eliminar carpeta base",
+            "Escanear",  # admite “(F5)”
+            "Vaciar resultados",
+        )
+        BTN_KINDS = ("TButton", "Button", "TMenubutton", "Menubutton")
+
+        # 1) Quita en la toolbar detectada
+        for w in list(toolbar.winfo_children()):
+            try:
+                if w.winfo_class() in BTN_KINDS:
+                    t = (w.cget("text") or "").strip()
+                    if any(t.startswith(p) for p in prefijos_a_quitar):
+                        w.destroy()
+            except Exception:
+                pass
+
+    def _capar_toolbar_global(self):
+        """
+        Respaldo: barre TODA la pestaña del visor y elimina los mismos botones
+        aunque no hubiéramos localizado la toolbar.
+        """
+        root = getattr(self, "tab_visor", self)
+        prefijos_a_quitar = (
+            "Seleccionar carpeta base",
+            "Eliminar carpeta base",
+            "Escanear",
+            "Vaciar resultados",
+        )
+        BTN_KINDS = ("TButton", "Button", "TMenubutton", "Menubutton")
+        for w in list(self._iter_widgets(root)):
+            try:
+                if w.winfo_class() in BTN_KINDS:
+                    t = (w.cget("text") or "").strip()
+                    if any(t.startswith(p) for p in prefijos_a_quitar):
+                        w.destroy()
+            except Exception:
+                pass
+
+        # --- Ayuda específica del VISOR (front) ---
+
+
+    HELP_ASISTENTE_FRONT = """
+    ASISTENTE (pestaña pública)
+
+    • ¿Qué puedo escribir?
+      Preguntas en lenguaje natural. Ej.: “circular FEAGA pagos”, “solo en pdf”, “limpiar filtros”.
+
+    • Resultados y fuentes
+      - El panel de la izquierda muestra chips con palabras clave del índice.
+      - Tras enviar, verás arriba una frase breve y, debajo, la lista de fuentes (ruta + nombre).
+      - Pulsa “Fuentes (n)” para abrir el panel con el detalle de hits y observaciones.
+
+    • Filtros útiles en el texto
+      - “solo en pdf” → limita a .pdf
+      - “solo en docx” o “solo en doc” → limita a .docx / .doc
+      - “limpiar filtros” → elimina cualquier filtro de extensión activo
+
+    • Botones
+      - Enviar / Responder con LLM: genera respuesta breve usando el modelo cargado.
+      - Solo índice (sin LLM): muestra sólo rutas/observaciones del índice (sin generar texto).
+    """.strip()
+
+    def _show_help_contextual(self):
+        """Muestra ayuda según el contexto (pestaña actual o Admin)."""
+        try:
+            # Si está activo Admin, ayuda de backend
+            if self._is_admin and self.admin and str(self.admin.winfo_ismapped()) == "1":
+                messagebox.showinfo(
+                    "Ayuda — Admin (backend)",
+                    "En Admin puedes cargar el modelo (Modelo ▸ Cargar), importar/exportar el índice,\n"
+                    "ver logs/estado y usar herramientas de mantenimiento.\n\n"
+                    "El modelo se gestiona en Admin ▸ Modelo (backend)."
+                )
+                return
+        except Exception:
+            pass
+
+        # Si no estamos en Admin, miramos la pestaña del FRONT
+        try:
+            current = self.nb_front.tab(self.nb_front.select(), "text") or ""
+        except Exception:
+            current = ""
+
+        t = current.strip().lower()
+        if t.startswith("visor"):
+            messagebox.showinfo("Ayuda — Visor (Front)", self.HELP_VISOR_FRONT)
+        elif "asistente" in t or "pacqui" in t:
+            messagebox.showinfo("Ayuda — Asistente (Front)", self.HELP_ASISTENTE_FRONT)
+        else:
+            # Fallback muy simple
+            messagebox.showinfo(
+                "Ayuda",
+                "Usa PACqui (Asistente) para consultar y la pestaña Visor para explorar resultados.\n"
+                "Las acciones de backend (modelo, importación, mantenimiento) están en Admin."
+            )
+
+    def _sync_help_button_visibility(self, _evt=None):
+        """
+        Oculta el botón global 'Ayuda' cuando la pestaña activa es 'Visor',
+        y lo muestra en cualquier otra pestaña del FRONT.
+        """
+        try:
+            # Si está visible la vista Admin, el botón global debe verse
+            if self._is_admin and self.admin and str(self.admin.winfo_ismapped()) == "1":
+                if not self.btn_help.winfo_manager():
+                    self.btn_help.pack(side="right", padx=(0, 8))
+                return
+        except Exception:
+            pass
+
+        # Caso FRONT: decidir por pestaña
+        try:
+            current = self.nb_front.tab(self.nb_front.select(), "text") or ""
+        except Exception:
+            current = ""
+
+        is_visor = (current.strip().lower().startswith("visor"))
+        if is_visor:
+            # Ocúltalo si estuviera empaquetado
+            if self.btn_help.winfo_manager():
+                self.btn_help.pack_forget()
+        else:
+            # Muéstralo si estuviera oculto
+            if not self.btn_help.winfo_manager():
+                self.btn_help.pack(side="right", padx=(0, 8))
+
+    """def _reconfigurar_boton_ayuda(self, toolbar):
+        Reengancha el botón 'Ayuda' del visor para mostrar el texto capado.
+        btns = self._find_buttons_by_text(toolbar, {"Ayuda"})
+        btn = btns.get("Ayuda")
+        if not btn:
+            return
+        try:
+            # Quita bindings previos y fija command explícito
+            btn.unbind("<Button-1>")
+        except Exception:
+            pass
+        btn.configure(command=lambda: messagebox.showinfo("Ayuda — Visor (Front)", self.HELP_VISOR_FRONT))"""
+
+
 class AdminPanel(ttk.Notebook):
     def __init__(self, master, app: AppRoot):
         super().__init__(master); self.app = app
