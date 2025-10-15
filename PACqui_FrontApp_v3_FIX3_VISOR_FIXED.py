@@ -692,6 +692,137 @@ class AppRoot(tk.Tk):
             pass
         btn.configure(command=lambda: messagebox.showinfo("Ayuda — Visor (Front)", self.HELP_VISOR_FRONT))"""
 
+class PinnedSourcesDialog(tk.Toplevel):
+    def __init__(self, master, db_path: str, on_change=None):
+        super().__init__(master)
+        self.title("Fuentes grabadas")
+        # geometría inicial y comportamiento de ventana
+        self.geometry("1100x520+120+80")
+        self.minsize(820, 360)
+        self.resizable(True, True)             # ← permite maximizar/minimizar
+        try:
+            # aseguramos decoraciones "normales" (no toolwindow)
+            self.wm_attributes("-toolwindow", False)
+        except Exception:
+            pass
+
+        # si quieres seguir siendo modal respecto al master:
+        self.transient(master)
+        self.grab_set()
+
+        self.db_path = db_path
+        self.on_change = on_change
+
+        # ========= BARRA SUPERIOR =========
+        bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bar, text="Refrescar", command=self._reload).pack(side="left")
+        ttk.Button(bar, text="Borrar seleccionadas", command=self._delete_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Borrar TODAS", command=self._delete_all).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Cerrar", command=self.destroy).pack(side="right")
+
+        # ========= ÁREA DE TABLA + SCROLLS =========
+        table_frame = ttk.Frame(self)
+        table_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        self.tv = ttk.Treeview(
+            table_frame,
+            columns=("name", "path", "note", "weight"),
+            show="headings",
+            height=18
+        )
+        # cabeceras
+        self.tv.heading("name", text="Nombre")
+        self.tv.heading("path", text="Ruta")
+        self.tv.heading("note", text="Observaciones")
+        self.tv.heading("weight", text="Peso")
+
+        # anchos y estiramiento
+        self.tv.column("name", width=260, anchor="w", stretch=True)
+        self.tv.column("path", width=540, anchor="w", stretch=True)
+        self.tv.column("note", width=260, anchor="w", stretch=True)
+        self.tv.column("weight", width=70, anchor="center", stretch=False)
+
+        # scrollbars
+        ysb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tv.yview)
+        xsb = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tv.xview)
+        self.tv.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+
+        # grid
+        self.tv.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+
+        # atajos útiles
+        self.bind("<Alt-Return>", self._toggle_max_restore)  # Alt+Enter: maximizar/restaurar
+        self.bind("<Control-a>", lambda e: (self.tv.selection_set(*self.tv.get_children()), "break"))
+
+        self._reload()
+
+    # ---- maximizar/restaurar con Alt+Enter ----
+    def _toggle_max_restore(self, _evt=None):
+        try:
+            if self.state() == "zoomed":
+                self.state("normal")
+            else:
+                self.state("zoomed")
+        except Exception:
+            # fallback en plataformas sin 'zoomed'
+            w, h = self.winfo_width(), self.winfo_height()
+            self.geometry(f"{max(820,w)}x{max(360,h)}+60+40")
+        return "break"
+
+    def _reload(self):
+        from meta_store import MetaStore
+        # limpia
+        for i in self.tv.get_children():
+            self.tv.delete(i)
+        # recarga
+        try:
+            rows = MetaStore(self.db_path).list_pinned_sources()
+        except Exception:
+            rows = []
+        for r in rows:
+            self.tv.insert(
+                "", "end",
+                values=(
+                    r.get("name") or "",
+                    r.get("path") or "",
+                    r.get("note") or "",
+                    r.get("weight") or 1.0
+                )
+            )
+
+    def _delete_selected(self):
+        from tkinter import messagebox
+        sel = self.tv.selection()
+        if not sel:
+            return
+        paths = [self.tv.item(i, "values")[1] for i in sel]
+        if not messagebox.askyesno("Borrar", f"¿Eliminar {len(paths)} fuente(s) seleccionada(s)?"):
+            return
+        from meta_store import MetaStore
+        n = MetaStore(self.db_path).delete_pinned_sources(paths)
+        messagebox.showinfo("Borrar", f"Eliminadas: {n}")
+        self._reload()
+        if callable(self.on_change):
+            self.on_change()
+
+    def _delete_all(self):
+        from tkinter import messagebox
+        if not messagebox.askyesno("Borrar TODAS", "¿Seguro que quieres borrar TODAS las fuentes grabadas?"):
+            return
+        from meta_store import MetaStore
+        MetaStore(self.db_path).clear_pinned_sources()
+        messagebox.showinfo("Borrar", "Fuentes borradas.")
+        self._reload()
+        if callable(self.on_change):
+            self.on_change()
+
+
+
+
 
 class AdminPanel(ttk.Notebook):
     def __init__(self, master, app: AppRoot):
@@ -733,6 +864,14 @@ class AdminPanel(ttk.Notebook):
         ttk.Button(bar, text="Cargar índice (Excel/CSV)…", command=self._import_index_sheet).pack(side="left")
         self.btn_fuentes = ttk.Button(bar, text="Fuentes (0)", command=self._open_fuentes_panel, state="disabled")
         self.btn_fuentes.pack(side="left", padx=8)
+        self.btn_save_sources = ttk.Button(bar, text="Grabar fuentes", command=self._save_sources, state="disabled")
+        self.btn_save_sources.pack(side="left", padx=4)
+
+        self.btn_clear_sources = ttk.Button(bar, text="Ver/Borrar fuentes…",
+                                            command=self._open_pinned_sources_viewer)
+        self.btn_clear_sources.pack(side="left", padx=4)
+        # Pinta el contador de grabadas al abrir la pestaña
+        self._refresh_pinned_badge()
 
         # Asistente embebido (reutiliza ChatWithLLM con el modelo backend)
         self.asst = ChatWithLLM(tA, self.app.data, self.app.llm)
@@ -751,6 +890,10 @@ class AdminPanel(ttk.Notebook):
                 hits = getattr(self.asst, "_hits", []) or []
                 n = len(hits)
                 self.btn_fuentes.configure(text=f"Fuentes ({n})", state=("normal" if n else "disabled"))
+                st = ("normal" if n else "disabled")
+                self.btn_fuentes.configure(text=f"Fuentes ({n})", state=st)
+                self.btn_save_sources.configure(state=st)
+
             self.asst._populate_sources = _pop_and_update
 
 
@@ -761,6 +904,10 @@ class AdminPanel(ttk.Notebook):
             hits = getattr(self.asst, "_hits", []) or []
             n = len(hits)
             self.btn_fuentes.configure(text=f"Fuentes ({n})", state=("normal" if n else "disabled"))
+            st = ("normal" if n else "disabled")
+            self.btn_fuentes.configure(text=f"Fuentes ({n})", state=st)
+            self.btn_save_sources.configure(state=st)
+
         self.asst._send_llm = _send_and_update
 
 
@@ -789,6 +936,11 @@ class AdminPanel(ttk.Notebook):
         # Tab zona peligrosa
         t4 = ttk.Frame(self, padding=12); self.add(t4, text="Zona peligrosa")
         self._build_danger_tab(t4)
+
+        # --- NUEVA PESTAÑA: Históricos ---
+        tH = ttk.Frame(self, padding=12);
+        self.add(tH, text="Históricos")
+        self._build_history_tab(tH)
 
     # ---------- LOGS TAB ----------
     def _build_logs_tab(self, parent):
@@ -1080,6 +1232,167 @@ class AdminPanel(ttk.Notebook):
             messagebox.showerror("Datos", f"No pude leer datos de '{name}':\n{e}", parent=self)
 
     # ---------- ER helpers ----------
+    def _build_history_tab(self, parent):
+        root = self.app
+        cols = ttk.Panedwindow(parent, orient="horizontal");
+        cols.pack(fill="both", expand=True)
+
+        # ---- IZQ: listado de QA ----
+        left = ttk.Frame(cols, padding=6);
+        cols.add(left, weight=2)
+        bar = ttk.Frame(left);
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Consultas").pack(side="left")
+        self.var_hist_f = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.var_hist_f, width=28).pack(side="left", padx=6)
+        ttk.Button(bar, text="Buscar", command=lambda: _reload()).pack(side="left")
+        ttk.Button(bar, text="Refrescar", command=lambda: _reload(True)).pack(side="right")
+
+        self.tv_hist = ttk.Treeview(left, columns=("id", "ts", "query", "rating"), show="headings", height=18)
+        for c, t, w, a in (("id", "id", 60, "e"), ("ts", "fecha/hora", 140, "w"), ("query", "consulta", 520, "w"),
+                           ("rating", "★", 60, "center")):
+            self.tv_hist.heading(c, text=t);
+            self.tv_hist.column(c, width=w, anchor=a)
+        self.tv_hist.pack(fill="both", expand=True, pady=(6, 0))
+        self.tv_hist.bind("<<TreeviewSelect>>", lambda _e: _load_detail())
+
+        # ---- DER: detalle + valoración ----
+        right = ttk.Notebook(cols);
+        cols.add(right, weight=3)
+
+        t_det = ttk.Frame(right, padding=8);
+        right.add(t_det, text="Detalle")
+        self.txt_q = tk.Text(t_det, height=5, wrap="word");
+        self.txt_q.pack(fill="x")
+        self.txt_a = tk.Text(t_det, height=14, wrap="word");
+        self.txt_a.pack(fill="both", expand=True, pady=(6, 0))
+        row = ttk.Frame(t_det);
+        row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text="Valoración (0–10):").pack(side="left")
+        self.var_rate = tk.IntVar(value=-1)
+        ttk.Spinbox(row, from_=0, to=10, textvariable=self.var_rate, width=4).pack(side="left", padx=6)
+        self.var_note = tk.StringVar()
+        ttk.Entry(row, textvariable=self.var_note, width=60).pack(side="left", padx=6)
+        ttk.Button(row, text="Guardar valoración", command=lambda: _save_rating()).pack(side="right")
+
+        # ---- Subpestaña Conceptos (CRUD) ----
+        t_con = ttk.Frame(right, padding=8);
+        right.add(t_con, text="Conceptos")
+        upper = ttk.Frame(t_con);
+        upper.pack(fill="x")
+        ttk.Label(upper, text="Buscar:").pack(side="left")
+        self.var_con_f = tk.StringVar();
+        ttk.Entry(upper, textvariable=self.var_con_f, width=30).pack(side="left", padx=6)
+        ttk.Button(upper, text="Buscar", command=lambda: _reload_concepts()).pack(side="left")
+        ttk.Button(upper, text="Nuevo", command=lambda: _edit_concept(None)).pack(side="left", padx=6)
+
+        self.tv_con = ttk.Treeview(t_con, columns=("id", "slug", "title", "tags"), show="headings", height=14)
+        for c, t, w, a in (
+        ("id", "id", 60, "e"), ("slug", "slug", 180, "w"), ("title", "título", 340, "w"), ("tags", "tags", 220, "w")):
+            self.tv_con.heading(c, text=t);
+            self.tv_con.column(c, width=w, anchor=a)
+        self.tv_con.pack(fill="both", expand=True, pady=(6, 4))
+        self.tv_con.bind("<Double-1>", lambda _e: _edit_concept(_sel_con()))
+
+        # --- helpers de datos ---
+        ms = MetaStore(root.data.db_path)
+
+        def _reload(force=False):
+            for iid in self.tv_hist.get_children(): self.tv_hist.delete(iid)
+            rows = ms.list_qa(self.var_hist_f.get().strip() or None, limit=400)
+            for r in rows:
+                self.tv_hist.insert("", "end",
+                                    values=(r["id"], r["ts"], r["query"], ("" if r["rating"] < 0 else r["rating"])))
+
+        def _load_detail():
+            sel = self.tv_hist.selection()
+            if not sel: return
+            qa_id = int(self.tv_hist.item(sel[0], "values")[0])
+            qa = ms.get_qa(qa_id)
+            self.txt_q.delete("1.0", "end");
+            self.txt_q.insert("1.0", qa["query"] or "")
+            self.txt_a.delete("1.0", "end");
+            self.txt_a.insert("1.0", qa["answer"] or "")
+            self.var_rate.set(-1)
+            self.var_note.set("")
+            try:
+                with root.data._connect() as con:
+                    rat = con.execute("SELECT rating, notes FROM qa_feedback WHERE qa_id=?", (qa_id,)).fetchone()
+                if rat:
+                    self.var_rate.set(int(rat[0]));
+                    self.var_note.set(rat[1] or "")
+            except Exception:
+                pass
+
+        def _save_rating():
+            sel = self.tv_hist.selection()
+            if not sel: return
+            qa_id = int(self.tv_hist.item(sel[0], "values")[0])
+            ms.set_feedback(qa_id, int(self.var_rate.get()), self.var_note.get().strip())
+            _reload()
+
+        # ---- Conceptos: CRUD mínimo ----
+        def _sel_con():
+            s = self.tv_con.selection()
+            return int(self.tv_con.item(s[0], "values")[0]) if s else None
+
+        def _reload_concepts():
+            for iid in self.tv_con.get_children(): self.tv_con.delete(iid)
+            for c in ms.list_concepts(self.var_con_f.get().strip() or None, limit=500):
+                self.tv_con.insert("", "end", values=(c["id"], c["slug"], c["title"], c.get("tags", "") or ""))
+
+        def _edit_concept(cid):
+            top = tk.Toplevel(self);
+            top.title("Concepto");
+            top.grab_set()
+            frm = ttk.Frame(top, padding=10);
+            frm.pack(fill="both", expand=True)
+            vars = {k: tk.StringVar() for k in ("slug", "title", "tags", "aliases")}
+            txt = tk.Text(frm, height=12, wrap="word")
+
+            def _load():
+                if not cid: return
+                with root.data._connect() as con:
+                    r = con.execute("SELECT slug,title,body,tags FROM concepts WHERE id=?", (cid,)).fetchone()
+                vars["slug"].set(r[0]);
+                vars["title"].set(r[1]);
+                txt.insert("1.0", r[2]);
+                vars["tags"].set(r[3] or "")
+                als = [a[0] for a in
+                       con.execute("SELECT alias FROM concept_alias WHERE concept_id=?", (cid,)).fetchall()]
+                vars["aliases"].set(", ".join(als))
+
+            def _save():
+                aliases = [a.strip() for a in (vars["aliases"].get() or "").split(",") if a.strip()]
+                ms.upsert_concept(vars["slug"].get(), vars["title"].get(), txt.get("1.0", "end").strip(),
+                                  vars["tags"].get(), aliases=aliases, concept_id=cid)
+                top.destroy();
+                _reload_concepts()
+
+            row = ttk.Frame(frm);
+            row.pack(fill="x")
+            ttk.Label(row, text="slug:").pack(side="left");
+            ttk.Entry(row, textvariable=vars["slug"], width=32).pack(side="left", padx=6)
+            ttk.Label(row, text="título:").pack(side="left");
+            ttk.Entry(row, textvariable=vars["title"], width=48).pack(side="left", padx=6)
+            row2 = ttk.Frame(frm);
+            row2.pack(fill="x", pady=(6, 0))
+            ttk.Label(row2, text="tags:").pack(side="left");
+            ttk.Entry(row2, textvariable=vars["tags"], width=40).pack(side="left", padx=6)
+            ttk.Label(row2, text="alias (coma):").pack(side="left");
+            ttk.Entry(row2, textvariable=vars["aliases"], width=40).pack(side="left", padx=6)
+            ttk.Label(frm, text="Cuerpo").pack(anchor="w", pady=(6, 0));
+            txt.pack(fill="both", expand=True)
+            btns = ttk.Frame(frm);
+            btns.pack(fill="x", pady=(8, 0))
+            ttk.Button(btns, text="Guardar", command=_save).pack(side="right")
+            ttk.Button(btns, text="Cancelar", command=lambda: top.destroy()).pack(side="right", padx=8)
+            _load()
+
+        # Arranque
+        _reload();
+        _reload_concepts()
+
     def _er_collect(self):
         """
         Devuelve:
@@ -3104,6 +3417,52 @@ class AdminPanel(ttk.Notebook):
             except Exception:
                 pass
 
+    def _save_sources(self):
+        hits = getattr(self.asst, "_hits", []) or []
+        if not hits:
+            messagebox.showinfo(APP_NAME, "No hay fuentes para grabar. Lanza una consulta primero.", parent=self)
+            return
+        try:
+            ms = MetaStore(self.app.data.db_path)
+            # confirmación si son muchas
+            if len(hits) > 300:
+                if not messagebox.askyesno(APP_NAME, f"Vas a grabar {len(hits)} fuentes. ¿Continuar?", parent=self):
+                    return
+            n = ms.save_pinned_sources(hits)  # ← SIN [:100]
+            messagebox.showinfo(APP_NAME, f"Fuentes grabadas: {n}", parent=self)
+            self._refresh_pinned_badge()  # ← ver método nuevo
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudieron grabar las fuentes:\n{e}", parent=self)
+
+    def _open_pinned_sources_viewer(self):
+        """Abre el visor/gestor de 'Fuentes grabadas'."""
+        try:
+            PinnedSourcesDialog(self, self.app.data.db_path, on_change=self._refresh_pinned_badge)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudo abrir el visor:\n{e}", parent=self)
+
+    def _clear_sources(self):
+        if not messagebox.askyesno(APP_NAME, "¿Borrar TODAS las fuentes grabadas?", parent=self):
+            return
+        try:
+            ms = MetaStore(self.app.data.db_path)
+            ms.clear_pinned_sources()
+            messagebox.showinfo(APP_NAME, "Fuentes borradas.", parent=self)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"No se pudieron borrar las fuentes:\n{e}", parent=self)
+
+    def _refresh_pinned_badge(self):
+        try:
+            ms = MetaStore(self.app.data.db_path)
+            m = ms.count_pinned_sources()
+        except Exception:
+            m = 0
+        try:
+            # Muestra el nº de FUENTES GRABADAS (persistentes)
+            self.btn_fuentes.configure(text=f"Fuentes ({m})")
+        except Exception:
+            pass
+
 
 class ChatWithLLM(ChatFrame):
     def __init__(self, master, data: DataAccess, llm: LLMService, app=None):
@@ -3401,6 +3760,17 @@ class ChatWithLLM(ChatFrame):
             if idx_ctx: parts += ["[Contexto (índice)]", idx_ctx]
             if rag_ctx: parts += ["[Contexto del repositorio]", rag_ctx]
             return "\n\n".join(parts).strip()
+
+        # justo antes de construir sys_full
+        concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
+        parts = [base_sys]
+        if concept_block:
+            parts += ["[CONCEPTOS]", concept_block]
+        if obs_block:
+            parts += ["[OBSERVACIONES]", obs_block]
+        if rutas_block:
+            parts += ["[RUTAS]", rutas_block]
+        sys_full = "\n\n".join(parts).strip()
 
         sys_full = build_system_text()
 
@@ -3809,6 +4179,52 @@ class ChatWithLLM(ChatFrame):
                     # 6) Añadir rutas deterministas (para ambos modos)
                     obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
                     final = text_llm
+                    # === Guardado directo del Q&A (fallback sin monkey-patch) ===
+                    try:
+                        from meta_store import MetaStore
+                        # misma BD que usa la app
+                        dbp = getattr(getattr(self, "app", None), "data", None)
+                        dbp = getattr(dbp, "db_path", "index_cache.sqlite")
+                        ms = MetaStore(db_path=str(dbp))
+
+                        # 1) pregunta del usuario
+                        q_text = ""
+                        if "q" in locals() and isinstance(q, str):
+                            q_text = q
+                        elif getattr(self, "_last_query", None):
+                            q_text = self._last_query
+                        else:
+                            try:
+                                q_text = (self.txt_in.get("1.0", "end") or "").strip()
+                            except Exception:
+                                q_text = ""
+
+                        # 2) respuesta final (ajusta 'answer_var' a tu variable: answer/final/out_text…)
+                        answer_var = final  # <-- si tu variable se llama 'final', cámbialo aquí
+
+                        # 3) fuentes/hits (si existen)
+                        srcs = []
+                        for h in (getattr(self, "_hits", []) or []):
+                            srcs.append({
+                                "path": h.get("path") or h.get("ruta") or "",
+                                "name": h.get("name") or h.get("nombre") or "",
+                                "score": float(h.get("score") or 0),
+                            })
+
+                        # 4) modelo
+                        model_name = getattr(getattr(self.app, "llm", None), "model_path", "")
+                        if not model_name:
+                            try:
+                                model_name = self.app.lbl_model.cget("text")
+                            except Exception:
+                                model_name = ""
+
+                        # 5) persistir
+                        ms.log_qa(query=q_text, answer=answer_var, model=str(model_name), sources=srcs)
+                    except Exception as e:
+                        print("[QA-LOG] fallo (fallback):", e)
+                    # === fin guardado Q&A ===
+
                     if rutas_block.strip():
                         final += f"\n\nRutas sugeridas:\n\n{rutas_block}"
 
@@ -3822,6 +4238,23 @@ class ChatWithLLM(ChatFrame):
                     except Exception:
                         pass
 
+                    # === Guardado del Q&A en Históricos (fallback a prueba de bombas) ===
+                    try:
+                        ms = MetaStore(self.app.data.db_path)
+                        # Toma hasta 5 fuentes de 'hits' para dejar rastro útil
+                        srcs = []
+                        for h in ((hits if 'hits' in locals() else getattr(self, "_hits", [])) or [])[:5]:
+                            srcs.append({
+                                "name": (h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "")[:200],
+                                "path": h.get("path", "")[:800],
+                                "note": (h.get("note") or "")[:500],
+                                "score": float(h.get("score") or 0),
+                            })
+
+                        ms.log_qa(query=(q or ""), answer=(final or ""), model=str(model_name), sources=srcs)
+
+                    except Exception as e:
+                        print(f"[QA-LOG] fallo (fallback): {e}")
 
                     self.after(0, lambda: self._append_chat("PACqui", final))
                 finally:

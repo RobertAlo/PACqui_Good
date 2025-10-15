@@ -243,6 +243,69 @@ class MetaStore:
             c.execute("CREATE INDEX IF NOT EXISTS idx_doc_notes_fp_expr ON doc_notes( lower(fullpath) )")
             conn.commit()
 
+            # --- Fuentes ancladas manualmente (persistentes) ---
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pinned_sources (
+                    path       TEXT PRIMARY KEY,
+                    name       TEXT,
+                    note       TEXT,
+                    weight     REAL DEFAULT 1.0,
+                    created_at TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now','localtime'))
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_pinned_sources_path ON pinned_sources( lower(path) )")
+
+            # >>> HISTORICOS + CONCEPTOS
+            c.executescript("""
+            CREATE TABLE IF NOT EXISTS qa_log (
+              id INTEGER PRIMARY KEY,
+              ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              session_id TEXT,
+              query TEXT NOT NULL,
+              answer TEXT,
+              model TEXT,
+              tokens_in INTEGER,
+              tokens_out INTEGER,
+              took_ms INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS qa_sources (
+              qa_id INTEGER NOT NULL,
+              path TEXT NOT NULL,
+              name TEXT,
+              note TEXT,
+              score REAL,
+              PRIMARY KEY (qa_id, path)
+            );
+
+            CREATE TABLE IF NOT EXISTS qa_feedback (
+              qa_id INTEGER PRIMARY KEY,
+              rating INTEGER CHECK (rating BETWEEN 0 AND 10),
+              notes TEXT,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS concepts (
+              id INTEGER PRIMARY KEY,
+              slug TEXT UNIQUE,
+              title TEXT NOT NULL,
+              body TEXT NOT NULL,
+              tags TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS concept_alias (
+              id INTEGER PRIMARY KEY,
+              concept_id INTEGER NOT NULL,
+              alias TEXT NOT NULL UNIQUE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_concepts_text ON concepts(title, body);
+            CREATE INDEX IF NOT EXISTS idx_qa_log_ts ON qa_log(ts);
+            """)
+            # <<< HISTORICOS + CONCEPTOS
+
     # ---------- keywords ----------
     def add_keywords(self, fullpath: str, keywords: Iterable[str], source: str = "manual", replace: bool = False) -> int:
         """Inserta keywords. Si replace=True, borra antes todas las previas del doc (case-insensitive)."""
@@ -316,6 +379,185 @@ class MetaStore:
                 (q, int(limit or 1000))
             ).fetchall()
             return [(r[0], r[1]) for r in rows]
+
+    # === HISTÓRICOS ===
+    def log_qa(self, query: str, answer: str, model: str = "", sources: list | None = None,
+               session_id: str = None, tokens_in: int = None, tokens_out: int = None, took_ms: int = None) -> int:
+        with self._connect() as con:
+            cur = con.cursor()
+            cur.execute("""INSERT INTO qa_log(ts,session_id,query,answer,model,tokens_in,tokens_out,took_ms)
+                           VALUES(CURRENT_TIMESTAMP,?,?,?,?,?,?,?)""",
+                        (session_id, query, answer, model, tokens_in, tokens_out, took_ms))
+            qa_id = cur.lastrowid
+            if sources:
+                rows = []
+                for s in sources:
+                    rows.append((qa_id, s.get("path", ""), s.get("name"), s.get("note"), float(s.get("score") or 0)))
+                cur.executemany("""INSERT OR IGNORE INTO qa_sources(qa_id,path,name,note,score)
+                                   VALUES(?,?,?,?,?)""", rows)
+            con.commit()
+        return int(qa_id)
+
+    def set_feedback(self, qa_id: int, rating: int, notes: str = ""):
+        with self._connect() as con:
+            con.execute("""INSERT INTO qa_feedback(qa_id, rating, notes, updated_at)
+                           VALUES(?,?,?,CURRENT_TIMESTAMP)
+                           ON CONFLICT(qa_id) DO UPDATE SET
+                             rating=excluded.rating,
+                             notes=excluded.notes,
+                             updated_at=CURRENT_TIMESTAMP""", (qa_id, int(rating), notes))
+            con.commit()
+
+    def list_qa(self, q: str = None, limit: int = 300):
+        like = f"%{(q or '').lower()}%"
+        sql = """SELECT L.id, L.ts, L.query, COALESCE(F.rating,-1) AS rating
+                 FROM qa_log L
+                 LEFT JOIN qa_feedback F ON F.qa_id=L.id
+                 {flt}
+                 ORDER BY L.ts DESC LIMIT ?"""
+        flt = "" if not q else "WHERE lower(L.query) LIKE ?"
+        with self._connect() as con:
+            cur = con.execute(sql.format(flt=flt), ((limit,) if not q else (like, limit)))
+            return [dict(id=r[0], ts=r[1], query=r[2], rating=r[3]) for r in cur.fetchall()]
+
+    def get_qa(self, qa_id: int):
+        with self._connect() as con:
+            qa = con.execute("""SELECT id, ts, query, answer, model, tokens_in, tokens_out, took_ms
+                                FROM qa_log WHERE id=?""", (qa_id,)).fetchone()
+            src = con.execute("""SELECT path, name, note, score
+                                 FROM qa_sources WHERE qa_id=? ORDER BY score DESC NULLS LAST, path""",
+                              (qa_id,)).fetchall()
+        return {
+            "id": qa[0], "ts": qa[1], "query": qa[2], "answer": qa[3], "model": qa[4],
+            "tokens_in": qa[5], "tokens_out": qa[6], "took_ms": qa[7],
+            "sources": [{"path": s[0], "name": s[1], "note": s[2], "score": s[3]} for s in src]
+        } if qa else None
+
+    # === CONCEPTOS ===
+    def upsert_concept(self, slug: str, title: str, body: str, tags: str = "", aliases: list[str] | None = None,
+                       concept_id: int = None):
+        slug = (slug or title).strip().lower().replace(" ", "-")
+        with self._connect() as con:
+            cur = con.cursor()
+            if concept_id:
+                cur.execute("""UPDATE concepts SET slug=?, title=?, body=?, tags=?, updated_at=CURRENT_TIMESTAMP
+                               WHERE id=?""", (slug, title, body, tags, concept_id))
+                cid = concept_id
+            else:
+                cur.execute("""INSERT INTO concepts(slug,title,body,tags) VALUES(?,?,?,?)""",
+                            (slug, title, body, tags))
+                cid = cur.lastrowid
+            if aliases:
+                for a in aliases:
+                    a = (a or "").strip().lower()
+                    if not a: continue
+                    try:
+                        cur.execute("INSERT OR IGNORE INTO concept_alias(concept_id, alias) VALUES(?,?)", (cid, a))
+                    except Exception:
+                        pass
+            con.commit()
+        return int(cid)
+
+    def delete_concept(self, concept_id: int):
+        with self._connect() as con:
+            con.execute("DELETE FROM concept_alias WHERE concept_id=?", (concept_id,))
+            con.execute("DELETE FROM concepts WHERE id=?", (concept_id,))
+            con.commit()
+
+    def list_concepts(self, q: str = None, limit: int = 500):
+        flt = ""
+        args = []
+        if q and q.strip():
+            flt = "WHERE lower(title) LIKE ? OR lower(body) LIKE ? OR id IN (SELECT concept_id FROM concept_alias WHERE lower(alias) LIKE ?)"
+            like = f"%{q.lower()}%";
+            args = [like, like, like]
+        with self._connect() as con:
+            rows = con.execute(f"""SELECT id, slug, title, substr(body,1,160), tags
+                                   FROM concepts {flt} ORDER BY updated_at DESC LIMIT ?""", (*args, limit)).fetchall()
+        return [dict(id=r[0], slug=r[1], title=r[2], body=r[3], tags=r[4]) for r in rows]
+
+    # ---------- pinned sources (fuentes persistentes) ----------
+    def save_pinned_sources(self, items: list[dict]) -> int:
+        """Guarda/actualiza una lista de {'path','name','note','weight'}."""
+        if not items: return 0
+        with self._lock, self._connect() as conn:
+            cur = conn.cursor()
+            n = 0
+            for it in items:
+                p = (it.get("path") or "").strip()
+                if not p: continue
+                cur.execute("""
+                    INSERT INTO pinned_sources(path,name,note,weight)
+                    VALUES(?,?,?,COALESCE(?,1.0))
+                    ON CONFLICT(path) DO UPDATE SET
+                      name=excluded.name,
+                      note=excluded.note,
+                      weight=COALESCE(excluded.weight, pinned_sources.weight)
+                """, (p, it.get("name"), it.get("note"), it.get("weight")))
+                n += 1
+            conn.commit()
+            return n
+
+    def clear_pinned_sources(self) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM pinned_sources")
+            conn.commit()
+
+    def list_pinned_sources(self) -> list[dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT path,name,note,weight FROM pinned_sources ORDER BY created_at DESC").fetchall()
+        return [{"path": r[0], "name": r[1], "note": r[2], "weight": float(r[3] or 1.0)} for r in rows]
+
+    def count_pinned_sources(self) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM pinned_sources").fetchone()
+        return int(row[0] if row and row[0] else 0)
+
+    def delete_pinned_sources(self, paths) -> int:
+        items = [(p or "").strip() for p in (paths or [])]
+        if not items:
+            return 0
+        with self._lock, self._connect() as conn:
+            cur = conn.cursor()
+            n = 0
+            for p in items:
+                if not p:
+                    continue
+                n += cur.execute("DELETE FROM pinned_sources WHERE lower(path)=lower(?)", (p,)).rowcount
+            conn.commit()
+            return n
+
+    def concept_context_for(self, text: str, max_chars: int = 600, top_k: int = 5) -> str:
+        """Devuelve un bloque corto con los conceptos que ‘matchean’ la consulta."""
+        import re
+        toks = set(re.findall(r"[a-z0-9áéíóúüñ]{3,}", (text or "").lower()))
+        if not toks: return ""
+        like_list = [f"%{t}%" for t in toks]
+        placeholders = ",".join(["?"] * len(like_list))
+        sql = f"""
+          SELECT c.title, c.body, c.tags
+          FROM concepts c
+          WHERE {" OR ".join(["lower(c.title) LIKE ?", "lower(c.body) LIKE ?"])}
+             OR c.id IN (SELECT concept_id FROM concept_alias WHERE lower(alias) IN ({placeholders}))
+          LIMIT {top_k}
+        """
+        args = []
+        for t in toks:
+            args += [f"%{t}%", f"%{t}%"]
+        args += list(toks)
+        with self._connect() as con:
+            rows = con.execute(sql, args).fetchall()
+        items = []
+        used = 0
+        for title, body, tags in rows:
+            frag = (body.strip() if len(body) <= 220 else body.strip()[:220].rstrip() + "…")
+            chunk = f"— {title}: {frag}"
+            if tags: chunk += f"  [#{tags}]"
+            if used + len(chunk) > max_chars: break
+            used += len(chunk)
+            items.append(chunk)
+        return "\n".join(items)
+
 
 if __name__ == "__main__":
     # Pequeño CLI de apoyo:

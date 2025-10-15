@@ -165,6 +165,8 @@ def _patched_worker_chat_stream(self):
             except Exception:
                 pass
 
+
+
         final = "".join(out).strip()
         if not final and stream is None:
             try:
@@ -174,6 +176,30 @@ def _patched_worker_chat_stream(self):
                 final = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
             except Exception:
                 final = ""
+
+        # >>> QA LOG (colocado tras construir `final`)
+        try:
+            from meta_store import MetaStore
+            ms = MetaStore(self.app.data.db_path if hasattr(self.app, 'data')
+                           else getattr(self.app, 'db_path', "index_cache.sqlite"))
+            # último input del usuario
+            last_user = ""
+            for m in reversed(self.messages):
+                if m.get("role") == "user":
+                    last_user = m.get("content", "")
+                    break
+            # fuentes si existen (no dupliques inserción)
+            srcs = getattr(self, "_hits", []) or None
+            ms.log_qa(query=last_user,
+                      answer=final,
+                      model=getattr(getattr(self.app, 'llm', None), 'model_path', ""),
+                      sources=srcs)
+        except Exception as _e:
+            try:
+                print("[QA-LOG] fallo:", _e)
+            except Exception:
+                pass
+        # <<< QA LOG
 
         if final:
             self.messages.append({"role": "assistant", "content": final})

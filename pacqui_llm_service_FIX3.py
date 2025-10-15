@@ -214,6 +214,14 @@ class LLMService:
             from collections import defaultdict
             acc = defaultdict(lambda: {"kw": 0, "fname": 0, "notes": 0})
 
+            # fuentes pinneadas (persistentes) → dict normalizado: path -> weight
+            pinned = {}
+            try:
+                cur.execute("SELECT path, COALESCE(weight,1.0) FROM pinned_sources")
+                pinned = {os.path.normcase(os.path.normpath(p)): float(w or 1.0) for (p, w) in cur.fetchall()}
+            except Exception:
+                pinned = {}
+
             # 1) keywords
             for t in toks:
                 cur.execute("SELECT fullpath FROM doc_keywords WHERE lower(keyword) LIKE lower(?) LIMIT 5000",
@@ -276,7 +284,36 @@ class LLMService:
                 rank = sc["kw"] * 12 + sc["notes"] * 8 + sc["fname"] * 2 + ext_adj * 8
                 if only_fname:
                     rank -= 10
+
+                # --- BOOST por fuentes pinneadas ---
+                try:
+                    if fp in pinned:
+                        # factor afinable: 10 puntos por weight≈1.0
+                        rank += int(round(10.0 * pinned[fp]))
+                except Exception:
+                    pass
+
                 ranked.append((rank, sc["kw"], sc["notes"], sc["fname"], fp))
+
+                # >>> FEEDBACK BOOST
+                try:
+                    cur2 = con.cursor()
+                    cur2.execute("""
+                        SELECT COALESCE(SUM(CASE
+                            WHEN f.rating >= 8 THEN 3
+                            WHEN f.rating >= 6 THEN 1
+                            WHEN f.rating BETWEEN 0 AND 3 THEN -1
+                            ELSE 0 END), 0)
+                        FROM qa_sources s
+                        JOIN qa_feedback f ON f.qa_id = s.qa_id
+                        WHERE lower(s.path) = lower(?)
+                    """, (fp,))
+                    rank += float(cur2.fetchone()[0] or 0)
+                except Exception:
+                    pass
+                # <<< FEEDBACK BOOST
+
+
 
             if not ranked:
                 return []
@@ -300,6 +337,25 @@ class LLMService:
             return out
         finally:
             con.close()
+
+        # >>> FEEDBACK BOOST
+            try:
+                cur2 = con.cursor()
+                cur2.execute("""
+                    SELECT COALESCE(SUM(CASE
+                        WHEN f.rating >= 8 THEN 3
+                        WHEN f.rating >= 6 THEN 1
+                        WHEN f.rating BETWEEN 0 AND 3 THEN -1
+                        ELSE 0 END), 0)
+                    FROM qa_sources s
+                    JOIN qa_feedback f ON f.qa_id = s.qa_id
+                    WHERE s.path = ?
+                """, (fp,))
+                fb = cur2.fetchone()[0] or 0
+                score_final += float(fb)
+            except Exception:
+                pass
+        # <<< FEEDBACK BOOST
 
     def _get_keywords(self, cur, fullpath: str):
         cur.execute("SELECT keyword FROM doc_keywords WHERE lower(fullpath)=lower(?) ORDER BY keyword COLLATE NOCASE", (fullpath,))
@@ -414,6 +470,14 @@ class LLMService:
                 i=h%dim; s=1.0 if (h>>1)&1 else -1.0; v[i]+=s
         n=(sum(x*x for x in v)**0.5) or 1.0
         return [x/n for x in v]
+
+    def concept_context(self, query_text: str, max_chars: int = 600, top_k: int = 5) -> str:
+        try:
+            from meta_store import MetaStore
+            ms = MetaStore(self.db_path)
+            return ms.concept_context_for(query_text, max_chars=max_chars, top_k=top_k)
+        except Exception:
+            return ""
 
     # --------- chat ---------
     # pacqui_llm_service_FIX3.py  (dentro de class LLMService)
