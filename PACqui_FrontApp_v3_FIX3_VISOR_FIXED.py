@@ -707,17 +707,40 @@ class PinnedSourcesDialog(tk.Toplevel):
             pass
 
         # si quieres seguir siendo modal respecto al master:
-        self.transient(master)
-        self.grab_set()
+        #self.transient(master)
+        #self.grab_set()
 
         self.db_path = db_path
         self.on_change = on_change
+
+        # --- backfill de nombres en BD al abrir el visor ---
+        from meta_store import MetaStore
+        self.ms = MetaStore(self.db_path)             # ← sin dos puntos :)
+        try:
+            fixed = self.ms.backfill_pinned_names()
+            if fixed:
+                print(f"[pinned] Nombres corregidos en DB: {fixed}")
+        except Exception:
+            pass
+
 
         # ========= BARRA SUPERIOR =========
         bar = ttk.Frame(self); bar.pack(fill="x", padx=8, pady=6)
         ttk.Button(bar, text="Refrescar", command=self._reload).pack(side="left")
         ttk.Button(bar, text="Borrar seleccionadas", command=self._delete_selected).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Borrar TODAS", command=self._delete_all).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Editar peso…", command=self._edit_weight).pack(side="left", padx=(6, 0))
+        # --- Buscador (% y _ como comodines estilo SQL LIKE) ---
+        self.var_find = tk.StringVar()
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Label(bar, text="Buscar:").pack(side="left", padx=(0, 4))
+        ent_find = ttk.Entry(bar, textvariable=self.var_find, width=36)
+        ent_find.pack(side="left", padx=(0, 4))
+        ent_find.bind("<Return>", lambda e: self._reload())  # Enter para buscar rápido
+        ttk.Button(bar, text="Ir", command=self._reload).pack(side="left")
+        ttk.Button(bar, text="Limpiar", command=lambda: (self.var_find.set(""), self._reload())).pack(side="left",
+                                                                                                      padx=(4, 0))
+
         ttk.Button(bar, text="Cerrar", command=self.destroy).pack(side="right")
 
         # ========= ÁREA DE TABLA + SCROLLS =========
@@ -760,6 +783,48 @@ class PinnedSourcesDialog(tk.Toplevel):
 
         self._reload()
 
+    def _edit_weight(self):
+        sel = self.tv.selection()
+        if not sel:
+            return
+        # Tomamos la primera selección
+        item = sel[0]
+        name, path, note, cur_w = self.tv.item(item, "values")
+
+        # Diálogo simple
+        win = tk.Toplevel(self)
+        win.title("Editar peso")
+        ttk.Label(win, text=os.path.basename(path) or path).grid(row=0, column=0, columnspan=2, sticky="w", padx=8,
+                                                                 pady=(8, 4))
+        ttk.Label(win, text="Peso:").grid(row=1, column=0, sticky="e", padx=(8, 4), pady=4)
+        var_w = tk.StringVar(value=str(cur_w or "1.0"))
+        ent = ttk.Entry(win, textvariable=var_w, width=10);
+        ent.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=4)
+        ent.focus_set()
+
+        def _ok():
+            try:
+                w = float(var_w.get())
+                if not (0.1 <= w <= 10.0):
+                    raise ValueError
+            except Exception:
+                messagebox.showerror("Peso inválido", "Introduce un valor numérico entre 0.1 y 10.")
+                return
+            try:
+                # Guardamos solo path+weight: MetaStore actualiza por CONFLICT(path)
+                self.ms.save_pinned_sources([{"path": path, "weight": w}])
+                if callable(self.on_change):
+                    self.on_change()
+                self._reload()
+            except Exception:
+                pass
+            finally:
+                win.destroy()
+
+        ttk.Button(win, text="Cancelar", command=win.destroy).grid(row=2, column=0, padx=8, pady=(4, 8))
+        ttk.Button(win, text="Guardar", command=_ok).grid(row=2, column=1, padx=8, pady=(4, 8))
+        win.grab_set()
+
     # ---- maximizar/restaurar con Alt+Enter ----
     def _toggle_max_restore(self, _evt=None):
         try:
@@ -773,25 +838,54 @@ class PinnedSourcesDialog(tk.Toplevel):
             self.geometry(f"{max(820,w)}x{max(360,h)}+60+40")
         return "break"
 
+    def _like_regex(self, pat: str):
+        """Convierte un patrón estilo SQL LIKE (%, _) a regex (case-insensitive)."""
+        import re
+        p = (pat or "").strip()
+        if not p:
+            return None
+        # 1) Escapa todo
+        p = re.escape(p)
+        # 2) Restaura comodines de LIKE: % -> .*   _ -> .
+        p = p.replace("%", ".*").replace("_", ".")
+        p = p.replace(r"\*", ".*")  # permite * como comodín adicional
+
+        return re.compile(p, re.IGNORECASE)
+
+    def _row_matches(self, row: dict, rx) -> bool:
+        """Devuelve True si la regex casa con name/path/note."""
+        if not rx:
+            return True
+        return (
+                rx.search((row.get("name") or "")) or
+                rx.search((row.get("path") or "")) or
+                rx.search((row.get("note") or ""))
+        )
+
     def _reload(self):
-        from meta_store import MetaStore
         # limpia
         for i in self.tv.get_children():
             self.tv.delete(i)
-        # recarga
+
+        # recarga desde BD (todas las fuentes)
         try:
-            rows = MetaStore(self.db_path).list_pinned_sources()
+            rows = self.ms.list_pinned_sources()
         except Exception:
             rows = []
+
+        # --- filtro por patrón LIKE en memoria ---
+        pat = (self.var_find.get() if hasattr(self, "var_find") else "").strip()
+        rx = self._like_regex(pat)
+        if rx:
+            rows = [r for r in rows if self._row_matches(r, rx)]
+
+        # vuelca a la tabla
+        import os
         for r in rows:
+            name = (r.get("name") or "").strip() or os.path.basename(r.get("path") or "")
             self.tv.insert(
                 "", "end",
-                values=(
-                    r.get("name") or "",
-                    r.get("path") or "",
-                    r.get("note") or "",
-                    r.get("weight") or 1.0
-                )
+                values=(name, r.get("path") or "", r.get("note") or "", r.get("weight") or 1.0)
             )
 
     def _delete_selected(self):
@@ -3418,21 +3512,87 @@ class AdminPanel(ttk.Notebook):
                 pass
 
     def _save_sources(self):
-        hits = getattr(self.asst, "_hits", []) or []
-        if not hits:
-            messagebox.showinfo(APP_NAME, "No hay fuentes para grabar. Lanza una consulta primero.", parent=self)
-            return
+        """Graba TODAS las fuentes del índice (sin límite de 100)."""
+        from tkinter import messagebox
+        import os, sqlite3, time
+
+        t0 = time.time()
+
+        # 1) Recojo TODAS las rutas candidatas directamente del índice
+        #    (unión de doc_keywords y doc_notes), sin pasar por el ranking.
+        all_paths = []
+        notes = {}
         try:
-            ms = MetaStore(self.app.data.db_path)
-            # confirmación si son muchas
-            if len(hits) > 300:
-                if not messagebox.askyesno(APP_NAME, f"Vas a grabar {len(hits)} fuentes. ¿Continuar?", parent=self):
-                    return
-            n = ms.save_pinned_sources(hits)  # ← SIN [:100]
-            messagebox.showinfo(APP_NAME, f"Fuentes grabadas: {n}", parent=self)
-            self._refresh_pinned_badge()  # ← ver método nuevo
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"No se pudieron grabar las fuentes:\n{e}", parent=self)
+            con = sqlite3.connect(self.app.data.db_path)
+            cur = con.cursor()
+
+            # Todas las rutas conocidas por el índice
+            rows = cur.execute("""
+                SELECT LOWER(fullpath) FROM doc_keywords
+                UNION
+                SELECT LOWER(fullpath) FROM doc_notes
+            """).fetchall()
+            all_paths = sorted({r[0] for r in rows})
+
+            # Notas (si existen) por ruta
+            notes = dict(cur.execute("""
+                SELECT LOWER(fullpath), MAX(note)
+                FROM doc_notes
+                WHERE note IS NOT NULL AND TRIM(note) <> ''
+                GROUP BY LOWER(fullpath)
+            """).fetchall())
+            con.close()
+        except Exception:
+            all_paths, notes = [], {}
+
+        # 2) Si por lo que sea el índice no devuelve nada, uso fallback:
+        #    reconsulta ancha del índice con la última query y top_k muy alto.
+        if not all_paths:
+            try:
+                q_last = (getattr(self.asst, "_last_query", "") or "").strip()
+            except Exception:
+                q_last = ""
+            try:
+                big = self.asst.llm._index_hits(q_last, top_k=50000, max_note_chars=0, prefer_only=None) or []
+                # normalizo a la misma estructura
+                all_paths = []
+                for h in big:
+                    p = (h.get("path") or "").strip()
+                    if p:
+                        all_paths.append(p.lower())
+                        if h.get("note"):
+                            notes[p.lower()] = h["note"]
+                all_paths = sorted(set(all_paths))
+            except Exception:
+                pass
+
+        if not all_paths:
+            messagebox.showinfo("PACqui", "No hay fuentes para grabar. Lanza una consulta primero.", parent=self)
+            return
+
+        # 3) Construyo items únicos con nombre (=basename) y nota (si hay)
+        items = [{"path": p, "name": os.path.basename(p), "note": notes.get(p, ""), "weight": 1.0}
+                 for p in all_paths]
+
+        # 4) Guardo TODO en pinned_sources (sin ningún corte)
+        from meta_store import MetaStore
+        ms = MetaStore(self.app.data.db_path)
+        n = ms.save_pinned_sources(items)
+        try:
+            fixed = ms.backfill_pinned_names()
+            if fixed:
+                print(f"[pinned] Nombres corregidos en DB: {fixed}")
+        except Exception:
+            pass
+
+        dt = int((time.time() - t0) * 1000)
+        messagebox.showinfo("PACqui", f"Fuentes grabadas: {n} (de {len(items)} candidatas) · {dt} ms", parent=self)
+
+        # refresco badge
+        try:
+            self._refresh_pinned_badge()
+        except Exception:
+            pass
 
     def _open_pinned_sources_viewer(self):
         """Abre el visor/gestor de 'Fuentes grabadas'."""
@@ -4319,7 +4479,17 @@ class ChatWithLLM(ChatFrame):
             r"\b(elige|escoge|selecciona|recomiend[aoeá]|recomiénd[aoeá]|"
             r"(cu[aá]l|que|qué).{0,14}(mejor|adecuad[oa]|m[aá]s\s+relevante))\b", ql))
 
-    def _score_choice(self, hit: dict, q: str) -> tuple:
+    # --- pesos de 'pinned_sources' para sesgo positivo en el ranking ---
+    try:
+        from meta_store import MetaStore
+        _pinned = {
+            (r.get("path") or "").lower(): float(r.get("weight") or 1.0)
+            for r in MetaStore(self.app.data.db_path).list_pinned_sources()
+        }
+    except Exception:
+        _pinned = {}
+
+    def _score_choice(self, hit: dict, q: str, _pinned: dict) -> tuple:
         """Devuelve una tupla de score para ordenar (mayor es mejor)."""
         import os, re
         from pathlib import Path
@@ -4367,12 +4537,20 @@ class ChatWithLLM(ChatFrame):
                 # Frase en la RUTA (carpeta) → boost medio
                 phrase_bonus += 30
 
+        # --- BONUS por estar fijado como fuente ---
+        pin_boost = 0.0
+        w = _pinned.get(path.lower())  # usa la 'path' ya normalizada arriba
+        if w is not None:
+            # presencia: +12; ponderación: +8*(w-1)  (w=1 → +0 adicional)
+            pin_boost = 12.0 + max(0.0, 8.0 * (w - 1.0))
+
         # ÚLTIMO tie-break: rutas más cortas tienden a ser “oficiales”
         tiebreak_shorter_path = -len(path)
 
-        return (ext_bonus + token_bonus + feaga_bias + note_bonus + phrase_bonus,
+        return (ext_bonus + token_bonus + feaga_bias + note_bonus + phrase_bonus + pin_boost,
                 base,
                 tiebreak_shorter_path)
+
 
     def _pick_best_hit(self, hits: list[dict], q: str) -> dict | None:
         import re
@@ -4389,8 +4567,17 @@ class ChatWithLLM(ChatFrame):
             if exact:
                 hits = exact
 
+        from meta_store import MetaStore
+        try:
+            ms = MetaStore(self.app.data.db_path)
+            _pinned = {(r.get("path") or "").lower(): float(r.get("weight") or 1.0)
+                       for r in ms.list_pinned_sources()}
+        except Exception:
+            _pinned = {}
+
         # 2) Puntúa y ordena con el resto de criterios
-        scored = [(self._score_choice(h, q), h) for h in (hits or [])]
+        scored = [(self._score_choice(h, q, _pinned), h) for h in (hits or [])]
+
         if not scored:
             return None
         scored.sort(key=lambda x: x[0], reverse=True)

@@ -124,7 +124,9 @@ class LLMService:
         return self._embedder_cached
 
     # --------- índice (keywords/observaciones) ---------
-    def _index_hits(self, query: str, top_k: int = 8, max_note_chars: int = 240, prefer_only=None):
+    def _index_hits(self, query: str, top_k: int = 8, max_note_chars: int = 240, prefer_only=None,
+                        prefer_pdf_doc: bool = True):
+
         """
         Búsqueda en índice con:
         - normalización (acentos, minúsculas)
@@ -322,10 +324,12 @@ class LLMService:
             ranked = ranked[:max(1, int(top_k))]
 
             # Si entre los top_k hay PDF/DOC/DOCX, nos quedamos SOLO con esos
-            prefer_exts = {".pdf", ".docx", ".doc"}
-            prefer_only_list = [t for t in ranked if Path(t[4]).suffix.lower() in prefer_exts]
-            if prefer_only_list:
-                ranked = prefer_only_list[:max(1, int(top_k))]
+            # Si se desea priorizar PDF/DOC/DOCX, filtra (por defecto: True)
+            if prefer_pdf_doc:
+                prefer_exts = {".pdf", ".docx", ".doc"}
+                prefer_only_list = [t for t in ranked if Path(t[4]).suffix.lower() in prefer_exts]
+                if prefer_only_list:
+                    ranked = prefer_only_list[:max(1, int(top_k))]
 
             out = []
             for _rank, _kw, _notes, _fn, fp in ranked:

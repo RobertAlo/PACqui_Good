@@ -513,6 +513,26 @@ class MetaStore:
             row = conn.execute("SELECT COUNT(*) FROM pinned_sources").fetchone()
         return int(row[0] if row and row[0] else 0)
 
+    def backfill_pinned_names(self) -> int:
+        """Rellena 'name' con basename(path) cuando esté vacío."""
+        import os
+        with self._lock, self._connect() as conn:
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT path FROM pinned_sources WHERE name IS NULL OR trim(name)=''"
+            ).fetchall()
+            n = 0
+            for (p,) in rows:
+                if not p:
+                    continue
+                nm = os.path.basename(p)
+                n += cur.execute(
+                    "UPDATE pinned_sources SET name=? WHERE path=?",
+                    (nm, p)
+                ).rowcount
+            conn.commit()
+            return n
+
     def delete_pinned_sources(self, paths) -> int:
         items = [(p or "").strip() for p in (paths or [])]
         if not items:
