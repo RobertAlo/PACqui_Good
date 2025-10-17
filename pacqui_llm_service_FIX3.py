@@ -576,6 +576,16 @@ class LLMService:
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
 
+        # --- FORZAR POLÍTICA DE IDIOMA (ES) ---
+        ES_POLICY = ("Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
+                        "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español.")
+        has_es = any(
+            (m.get("role") == "system" and "español" in (m.get("content", "").lower()))
+            for m in (messages or [])
+        )
+        if not has_es:
+            messages = [{"role": "system", "content": ES_POLICY}] + list(messages or [])
+
         try:
             with self._model_lock:
                 try:

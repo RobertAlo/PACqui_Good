@@ -58,7 +58,13 @@ class ObservacionesDialog(tk.Toplevel):
             note = self.store.get_note(fullpath)
         except Exception:
             note = ""
-        self.txt.insert("1.0", note or "")
+        self.txt_sys.insert(
+            "1.0",
+            ("Eres PACqui, asistente de documentación para la PAC. "
+             "Responde SIEMPRE en español neutro. Si la pregunta está en otro idioma, "
+             "traduce mentalmente y contesta en español. Sé conciso (3–5 frases) y, "
+             "cuando cites datos concretos del corpus, usa [n].")
+        )
 
         self.protocol("WM_DELETE_WINDOW", self._close)
 

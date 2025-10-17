@@ -322,7 +322,11 @@ def export_massive_index(base_path: str | os.PathLike[str],
 
 APP_NAME = "IndexGenerator"
 APP_VERSION = "3.2-fast+llmopt"
-CONFIG_PATH = Path.home() / ".organizador_red.json"
+from pathlib import Path
+import os
+CONFIG_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "PACqui"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = CONFIG_DIR / "settings.json"
 
 
 def open_in_explorer(path: Path) -> None:
@@ -430,22 +434,7 @@ class OrganizadorFrame(ttk.Frame):
         import os
         return os.path.join(self._config_dir(), "config.json")
 
-    def _load_config(self):
-        import json
-        self.config = {
-            "last_base_path": "",
-            "window_geometry": "",
-            "split_pos": 320,
-            "theme": "light"
-        }
-        try:
-            with open(self._config_path(), "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self.config.update(data)
-        except Exception:
-            # Si no hay config previa, seguimos con defaults
-            pass
+
 
     def _save_config(self):
         import json
@@ -761,8 +750,19 @@ class OrganizadorFrame(ttk.Frame):
 
         self.btn_ayuda = ttk.Button(row_search, text="Ayuda", command=self.cmd_ayuda)
         self.btn_ayuda.grid(row=0, column=7, padx=(6, 0))
-        self.btn_llm = tk.Button(row_search, text="PACqui (Asistente)", command=self._open_llm, bg="#e8f5e9", activebackground="#e8f5e9")
-        self.btn_llm.grid(row=0, column=8, padx=(6, 0))
+        # Si estamos en visor FRONT, mostramos "Refrescar" en lugar del botón LLM
+        if getattr(self, "visor_mode", False):
+            self.btn_refresh = ttk.Button(row_search, text="Refrescar", command=self._refrescar_front)
+            self.btn_refresh.grid(row=0, column=8, padx=(6, 0))
+        else:
+            # En visor FRONT mostramos "Refrescar"; en back mantenemos el botón LLM
+            if getattr(self, "visor_mode", False):
+                self.btn_refresh = ttk.Button(row_search, text="Refrescar", command=self._refrescar_front)
+                self.btn_refresh.grid(row=0, column=8, padx=(6, 0))
+            else:
+                self.btn_llm = tk.Button(row_search, text="PACqui (Asistente)", command=self._open_llm,
+                                         bg="#e8f5e9", activebackground="#e8f5e9")
+                self.btn_llm.grid(row=0, column=8, padx=(6, 0))
 
         # ===== Row 1: BOTONERA =====
         row_buttons = ttk.Frame(topbar)
@@ -835,13 +835,7 @@ class OrganizadorFrame(ttk.Frame):
         # Atajo global de ayuda
         self.master.bind("<F1>", self._open_help)
 
-        # --- Fila 2: info base e índice, a la derecha ---
 
-        row2 = 1
-        self.lbl_base = ttk.Label(row_info, text=self._base_label(), anchor="w")
-        self.lbl_base.grid(row=row2, column=0, columnspan=12, sticky="e", pady=(8, 0))
-        self.lbl_indexinfo = ttk.Label(row_info, text="Índice: 0 archivos", anchor="e", foreground="#555")
-        self.lbl_indexinfo.grid(row=row2, column=0, columnspan=12, sticky="e", pady=(8, 0), padx=(0, 220))
 
     # ============================ BLINK ============================
     def _start_blink(self, buttons, base_color: str, duration_ms: int = 10_000, interval_ms: int = 500):
@@ -985,11 +979,18 @@ class OrganizadorFrame(ttk.Frame):
 
     # ============================ SQLITE HELPERS (MÉTODOS) ============================
     def _db_path(self) -> str:
+        """Ruta ÚNICA para el índice 'files' del visor (front y backend)."""
         try:
-            base = os.path.dirname(os.path.abspath(__file__))
+            base_dir = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         except Exception:
-            base = os.getcwd()
-        return os.path.join(base, "index_cache.sqlite")
+            base_dir = os.path.expanduser("~")
+        cfg_dir = os.path.join(base_dir, "PACqui")
+        try:
+            os.makedirs(cfg_dir, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(cfg_dir, "index_cache.sqlite")
+
     def _db_migrate_schema(self, conn):
         """Garantiza que la tabla 'files' existe y migra columnas nuevas."""
         try:
@@ -1251,6 +1252,69 @@ class OrganizadorFrame(ttk.Frame):
                         e.get("mod_str",""), e.get("carpeta",""), e.get("ruta",""))
             )
         self.lbl_resumen.configure(text=f"{len(rows)} resultado(s)")
+
+    def _refrescar_front(self):
+        """Refresca el visor FRONT: lee config/base, rehace árbol, cuenta índice y repite la búsqueda."""
+        # 1) Releer config (puede traer base_path guardada por el back)
+        try:
+            self._load_config()
+        except Exception:
+            pass
+
+        # 2) Actualizar etiqueta de base y árbol
+        try:
+            self.lbl_base.configure(text=self._base_label())
+            self._build_dir_tree()
+        except Exception:
+            pass
+
+        # 3) Releer nº de archivos indexados desde SQLite compartido
+        try:
+            import sqlite3
+            con = sqlite3.connect(self._db_path(), check_same_thread=False)
+            cur = con.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS files(
+                    id INTEGER PRIMARY KEY,
+                    name TEXT, ext TEXT, size INTEGER,
+                    mtime_ts REAL, mtime_str TEXT, dir TEXT, fullpath TEXT
+                )
+            """)
+            row = cur.execute("SELECT COUNT(1) FROM files").fetchone()
+            n = int(row[0] or 0)
+            con.close()
+            self.lbl_indexinfo.configure(text=f"Índice: {n} archivos")
+            self._append_msg(f"Refrescado. Índice: {n} archivo(s).", "OK")
+        except Exception as e:
+            self._append_msg(f"No se pudo refrescar el índice: {e}", "WARN")
+
+        # 4) Si hay texto, repetir la búsqueda; si no, listar la base
+        try:
+            q = (self.q_text.get() or "").strip()
+            if q:
+                self.cmd_buscar()
+            else:
+                # listar contenido de la carpeta base si existe
+                from datetime import datetime
+                from pathlib import Path
+                if self.base_path and Path(self.base_path).exists():
+                    rows = []
+                    for p in sorted(Path(self.base_path).iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                        if p.is_file():
+                            st = p.stat()
+                            rows.append({
+                                "nombre": p.name,
+                                "ext": p.suffix.lower().lstrip("."),
+                                "tam": st.st_size,
+                                "mod_str": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                                "carpeta": str(p.parent),
+                                "ruta": str(p),
+                            })
+                    self._poblar_resultados(rows)
+        except Exception:
+            pass
+
+
 
     def _limpiar_filtros(self):
         self.q_text.delete(0, tk.END)
@@ -1951,12 +2015,7 @@ class OrganizadorFrame(ttk.Frame):
         except Exception:
             pass
 
-    def _save_config(self):
-        try:
-            data = {"base_path": str(self.base_path) if self.base_path else "", "llm_model_path": getattr(self, "llm_model_path", "")}
-            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            self._append_msg(f"No se pudo guardar la configuración: {e}", "WARN")
+
 
     def _place_sash_initial(self):
         try:
@@ -3784,10 +3843,13 @@ class LLMChatDialog(tk.Toplevel):
                 return
 
             # Añadir system si es el primer turno
+            # Añadir system si es el primer turno (aunque la caja esté vacía)
             if not any(m.get("role") == "system" for m in self.messages):
-                sys_text = (self.txt_sys.get("1.0", "end") or "").strip()
-                if sys_text:
-                    self.messages.append({"role": "system", "content": sys_text})
+                sys_text = (self.txt_sys.get("1.0", "end") or "").strip() or \
+                           ("Eres PACqui, asistente de documentación para la PAC. "
+                            "Responde SIEMPRE en español neutro. Si el usuario escribe en otro idioma, "
+                            "traduce mentalmente y contesta en español.")
+                self.messages.append({"role": "system", "content": sys_text})
 
             # --- Contexto desde el índice (keywords/observaciones) + RAG ---
             # 1) Fuentes del índice -> panel + bloque de contexto

@@ -9,6 +9,7 @@ from meta_store import MetaStore
 from ui_fuentes import SourcesPanel
 # ——— INSERTA / ASEGURA ESTE IMPORT ———
 from tkinter import messagebox
+from path_utils import open_in_explorer
 
 
 
@@ -430,6 +431,7 @@ class AppRoot(tk.Tk):
 
     def _toggle_admin(self):
         if not self._is_admin:
+            ensure_admin_password(self)
             if admin_login(self):
                 self._is_admin = True
                 self.btn_lock.configure(text="🔓 Admin (activo)")
@@ -3301,7 +3303,6 @@ class AdminPanel(ttk.Notebook):
         for path, kw in rows:
             tv.insert("", "end", values=(path, kw or ""))
 
-
     def _open_legacy(self):
         try:
             base = _import_organizador()
@@ -3309,7 +3310,6 @@ class AdminPanel(ttk.Notebook):
             messagebox.showerror(APP_NAME, f"No puedo abrir Admin (Organizador):\n{e}")
             return
 
-        # (opcional) aplicar el mismo patch aquí también
         try:
             _import_rag_patch()
         except Exception:
@@ -3320,7 +3320,27 @@ class AdminPanel(ttk.Notebook):
         top.geometry("1400x820")
         app = base.OrganizadorFrame(top)
         app.pack(fill="both", expand=True)
-        top.protocol("WM_DELETE_WINDOW", top.destroy)
+
+        def _on_close():
+            # Al cerrar el Admin, refrescamos el visor del FRONT con la base elegida.
+            try:
+                cfg = _load_cfg()  # mismo helper del front
+                base_path = cfg.get("base_path")
+                v = getattr(self.master, "visor", None)
+                if base_path and v:
+                    v.base_path = Path(base_path)
+                    try:
+                        v.lbl_base.configure(text=v._base_label())
+                    except Exception:
+                        pass
+                    try:
+                        v._build_dir_tree()
+                    except Exception:
+                        pass
+            finally:
+                top.destroy()
+
+        top.protocol("WM_DELETE_WINDOW", _on_close)
 
     def _choose_model(self):
         p = filedialog.askopenfilename(title="Selecciona modelo GGUF", filetypes=[("GGUF","*.gguf"), ("Todos","*.*")])
@@ -3777,6 +3797,20 @@ class ChatWithLLM(ChatFrame):
                               command=lambda: setattr(self, "notes_only", bool(self.var_notes_only.get())))
         chk.pack(side="left", padx=(8, 0))
 
+    def _open_file_os(self, path: str):
+        try:
+            open_in_explorer(Path(path))
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Abrir", f"No se pudo abrir:\n{path}\n\n{e}", parent=self)
+
+    def _open_folder_os(self, path: str):
+        try:
+            from pathlib import Path as _P
+            open_in_explorer(_P(path).parent)
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Abrir carpeta", f"No se pudo abrir la carpeta de:\n{path}\n\n{e}", parent=self)
 
     # --- NUEVO: helpers para el spinner ---
     def _spinner_start(self):
@@ -4277,8 +4311,9 @@ class ChatWithLLM(ChatFrame):
                     # 3) Reglas duras según el modo (con RAG vs. solo índice)
                     if has_rag:
                         base_sys = (
-                            "Eres el asistente de PACqui. Responde SIEMPRE en español. "
+                            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
                             "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
+                            "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español. "
                             "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
                         )
                         header_user = (
@@ -4287,9 +4322,10 @@ class ChatWithLLM(ChatFrame):
                         )
                     else:
                         base_sys = (
-                            "Eres el asistente de PACqui. Responde SIEMPRE en español. "
-                            "NO tienes fragmentos RAG. SOLO puedes usar el [ÍNDICE] (observaciones cortas del índice). "
-                            "No inventes definiciones ni datos externos. Responde en 2–4 frases breves y luego yo añadiré rutas."
+                            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
+                            "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
+                            "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español. "
+                            "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
                         )
                         header_user = (
                             "INSTRUCCIONES: resume brevemente la relevancia de los documentos del [ÍNDICE] para la pregunta. "

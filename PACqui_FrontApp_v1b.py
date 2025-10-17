@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox, simpledialog
 APP_NAME = "PACqui"
 CONFIG_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "PACqui"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-CONFIG_PATH = CONFIG_DIR / "settings.json"
+CONFIG_PATH = CONFIG_DIR / "viewer_settings.json"
 
 DEFAULT_DB = "index_cache.sqlite"
 
@@ -236,9 +236,25 @@ class ChatFrame(ttk.Frame):
         center = ttk.Frame(paned, padding=(10,10))
         paned.add(center, weight=3)
         ttk.Label(center, text="PACqui — Asistente (modo público)", style="Header.TLabel").pack(anchor="w", pady=(0,6))
+        # --- Chat text (único widget, sin duplicados) ---
         self.txt_chat = tk.Text(center, height=18, wrap="word")
+        self.txt_chat.configure(font=("Segoe UI", 10))  # base uniforme
         self.txt_chat.pack(fill="both", expand=True)
+
+        # Quién habla (colores/estilos de prefijo)
+        self.txt_chat.tag_configure("user_who", font=("Segoe UI", 9, "bold"), foreground="#16a34a")  # Tú → VERDE VIVO
+        self.txt_chat.tag_configure("bot_who", font=("Segoe UI", 9, "bold"), foreground="#0b5bd3")  # PACqui → azul
+
+        # Markdown básico
+        self.txt_chat.tag_configure("md_bold", font=("Segoe UI", 10, "bold"))
+        self.txt_chat.tag_configure("md_italic", font=("Segoe UI", 10, "italic"))
+
+        # Mensaje de bienvenida (opcional)
         self.txt_chat.insert("end", "Bienvenido/a. Pregúntame algo y te sugeriré rutas relevantes.\n")
+
+        # (a partir de aquí continúa el código existente)
+        input_row = ttk.Frame(center)
+
         input_row = ttk.Frame(center)
         input_row.pack(fill="x", pady=(8,0))
         self.ent_input = ttk.Entry(input_row)
@@ -315,74 +331,65 @@ class ChatFrame(ttk.Frame):
         # Suggest sources
         self._populate_sources(text)
 
-    def _append_chat(self, who: str, content: str):
-        import time, re, uuid, os, sys, subprocess
-        from pathlib import Path
+    def _append_chat(self, who: str, text: str):
+        import re
+        txt = self.txt_chat
+        txt.configure(state="normal")
 
-        # 1) anti-doble eco para el usuario
+        who = (who or "").strip()
+        prefix = f"{who}: "
+
+        start = txt.index("end-1c")  # inicio del insert
+        # prefijo (quién habla) con estilo
+        tag_who = "user_who" if who.lower().startswith("tú") else "bot_who"
+        txt.insert("end", prefix, (tag_who,))
+
+        # CUERPO del mensaje (UNA sola vez)
+        cuerpo = (text or "").strip() + "\n"
+        txt.insert("end", cuerpo)
+
+        # --- Linkificar líneas "Ruta: <path>" dentro del CUERPO ---
+        # Creamos tags únicos por enlace para no sobreescribir callbacks
+        # --- Linkificar líneas "Ruta: <path>" dentro del CUERPO --- + Markdown inline
         try:
-            if who == "Tú":
-                now = time.time()
-                key = (who, (content or "").strip())
-                last_key = getattr(self, "_last_user_echo", None)
-                last_ts = getattr(self, "_last_user_ts", 0.0)
-                if last_key == key and (now - last_ts) < 3.5:
-                    return
-                self._last_user_echo = key
-                self._last_user_ts = now
+            # Solo buscamos dentro del segmento recién insertado
+            seg_start = start
+            seg_end = txt.index("end-1c")
+            raw = txt.get(seg_start, seg_end)
+
+            # (1) Linkificar "Ruta: ..."
+            base_off = 0
+            nlink = 0
+            for ln in raw.splitlines(keepends=True):
+                m = re.match(r"^(Ruta:\s*)(.+)$", ln.strip(), flags=re.IGNORECASE)
+                if m:
+                    # posiciones relativas dentro del segmento
+                    s_line = f"{seg_start}+{base_off}c"
+                    s_path = f"{s_line}+{len(m.group(1))}c"
+                    e_path = f"{s_path}+{len(m.group(2))}c"
+                    tag_name = f"link_{int(self.tk.call('clock','milliseconds'))}_{nlink}"
+                    txt.tag_add(tag_name, s_path, e_path)
+                    txt.tag_configure(tag_name, foreground="#0b5bd3", underline=True)
+                    txt.tag_bind(tag_name, "<Button-1>", lambda _e, p=m.group(2): self._open_file_os(p))
+                    nlink += 1
+                base_off += len(ln)
+
+            # (2) Markdown inline: **negrita** y *cursiva*
+            for m in re.finditer(r"\*\*(.+?)\*\*", raw):
+                s = f"{seg_start}+{m.start(1)}c"
+                e = f"{seg_start}+{m.end(1)}c"
+                txt.tag_add("md_bold", s, e)
+
+            for m in re.finditer(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", raw):
+                s = f"{seg_start}+{m.start(1)}c"
+                e = f"{seg_start}+{m.end(1)}c"
+                txt.tag_add("md_italic", s, e)
         except Exception:
             pass
 
-        # 2) pinta y captura el rango recién insertado  ⬇️  (ESTO ES LO QUE FALTABA)
-        start = self.txt_chat.index("end-1c")
-        prefix = (f"{who}: " if (who or "").strip() else "")
-        text = (content or "").rstrip() + "\n"
-        self.txt_chat.insert("end", prefix + text)
 
-        # >>> INSERTAR ESTAS LÍNEAS <<<
-        prefix = (f"{who}: " if (who or "").strip() else "")
-        text = (content or "").rstrip() + "\n"
-        self.txt_chat.insert("end", prefix + text)
-        # >>> FIN INSERCIÓN <<<
-
-        end = self.txt_chat.index("end-1c")
-        segment = self.txt_chat.get(start, end)
-
-        # 3) linkifica líneas "Ruta: <path>" del bloque insertado
-        for m in re.finditer(r"(?m)^Ruta:\s+(.+)$", segment):
-            raw_path = m.group(1).strip()
-            try:
-                p = Path(raw_path)  # normaliza (no falla si es carpeta)
-            except Exception:
-                p = Path(raw_path)
-
-            s_idx = f"{start}+{m.start(1)}c"
-            e_idx = f"{start}+{m.end(1)}c"
-            tag = f"pathlink_{uuid.uuid4().hex[:8]}"
-
-            self.txt_chat.tag_add(tag, s_idx, e_idx)
-            self.txt_chat.tag_config(tag, underline=True, foreground="#0b5bd3")
-            self.txt_chat.tag_bind(tag, "<Enter>", lambda e: self.txt_chat.config(cursor="hand2"))
-            self.txt_chat.tag_bind(tag, "<Leave>", lambda e: self.txt_chat.config(cursor=""))
-
-            def _open(_e=None, _p=p):
-                try:
-                    if os.name == "nt":
-                        # si es archivo, selecciónalo en el explorer; si es carpeta, ábrela
-                        if _p.is_file():
-                            subprocess.run(["explorer", "/select,", str(_p)], check=False)
-                        else:
-                            os.startfile(str(_p))  # type: ignore[attr-defined]
-                    elif sys.platform == "darwin":
-                        subprocess.run(["open", str(_p if _p.is_dir() else _p.parent)], check=False)
-                    else:
-                        subprocess.run(["xdg-open", str(_p if _p.is_dir() else _p.parent)], check=False)
-                except Exception:
-                    pass
-
-            self.txt_chat.tag_bind(tag, "<Button-1>", _open)
-
-        self.txt_chat.see("end")
+        txt.see("end")
+        txt.configure(state="disabled")
 
     def _populate_sources(self, text: str):
         self.tv.delete(*self.tv.get_children())
@@ -495,6 +502,7 @@ class AdminFrame(ttk.Frame):
             # Crear la UI clásica dentro del Toplevel (tal y como fue diseñada)
             legacy = OrganizadorFrame(self._legacy_win)
             legacy.pack(fill="both", expand=True)
+            self._legacy_win.protocol("WM_DELETE_WINDOW", self._on_legacy_close)
         except Exception as e:
             if self._legacy_win:
                 try:
@@ -528,8 +536,7 @@ class AppRoot(tk.Tk):
         # UI
         self._build_ui()
 
-        # First-run check
-        ensure_admin_password(self)
+
 
         # Status
         self._refresh_status()
