@@ -591,11 +591,13 @@ class LLMService:
             try:
                 if self.model is not None:
                     with self._model_lock:
-                        self.model.self.app.llm.chat(
+                        # usa TU propio wrapper .chat() (no intentes encadenar self.model.self.app...)
+                        self.chat(
                             messages=[{"role": "system", "content": "ok"},
                                       {"role": "user", "content": "ok"}],
                             max_tokens=1, temperature=0.0, stream=False
                         )
+
             except Exception:
                 pass
         finally:

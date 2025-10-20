@@ -3947,7 +3947,9 @@ class ChatWithLLM(ChatFrame):
             # Enter → LLM
             self.ent_input.bind("<Return>", lambda e: self._send_llm())
             # Reconfigura el botón "Enviar" creado en ChatFrame
+            # Reconfigura el botón "Enviar" creado en ChatFrame y guárdalo
             input_row = self.ent_input.master
+            self.btn_send = None
             for ch in input_row.winfo_children():
                 try:
                     if str(ch.cget("text")).strip().lower() == "enviar":
@@ -3956,19 +3958,35 @@ class ChatWithLLM(ChatFrame):
                             ch.configure(width=max(10, ch.cget("width")))
                         except Exception:
                             pass
+                        self.btn_send = ch
                         break
                 except Exception:
                     continue
+
         except Exception:
             pass
 
         parent = self.ent_input.master
+
+
+
+        # ... (spinner y checkbox ya están) ...
+
 
         # --- Spinner indeterminado (oculto por defecto) ---
         self.pb = ttk.Progressbar(parent, mode="indeterminate", length=120)
         self.pb.pack(side="left", padx=(8, 0))
         self.pb.stop()
         self.pb.pack_forget()
+        # Evento de parada para el streaming
+        import threading as _threading  # ya importado arriba, pero esto no molesta
+        self.stop_event = getattr(self, "stop_event", None) or _threading.Event()
+        self.stop_event.clear()
+
+        # Botón Detener (queda deshabilitado hasta que empiece un stream)
+        self.btn_stop = ttk.Button(parent, text="Detener", state="disabled",
+                                   command=lambda: self.stop_event.set())
+        self.btn_stop.pack(side="left", padx=(8, 0))
 
         # --- Checkbox "Solo índice (sin LLM)" ---
         self.var_notes_only = tk.BooleanVar(value=False)
@@ -4000,13 +4018,29 @@ class ChatWithLLM(ChatFrame):
         try:
             self.pb.pack(side="left", padx=(8, 0))
             self.pb.start(12)  # velocidad del spinner
-            # Si tu ChatFrame tiene set_status, lo aprovechamos:
+            # Deshabilita input + botón Enviar
+            try:
+                self.ent_input.configure(state="disabled")
+            except Exception:
+                pass
+            try:
+                if getattr(self, "btn_send", None):
+                    self.btn_send.configure(state="disabled")
+            except Exception:
+                pass
+            try:
+                if getattr(self, "btn_stop", None):
+                    self.btn_stop.configure(state="normal")
+            except Exception:
+                pass
             try:
                 self.set_status("Generando con el LLM…")
             except Exception:
                 pass
         except Exception:
             pass
+
+
 
     def _import_index_sheet(self):
         from tkinter import messagebox
@@ -4043,18 +4077,32 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
-
-
     def _spinner_stop(self):
         try:
             self.pb.stop()
             self.pb.pack_forget()
+            # Habilita input + botón Enviar y deshabilita Stop
             try:
-                self.set_status("")  # o restaura tu estado base si lo prefieres
+                self.ent_input.configure(state="normal")
+            except Exception:
+                pass
+            try:
+                if getattr(self, "btn_send", None):
+                    self.btn_send.configure(state="normal")
+            except Exception:
+                pass
+            try:
+                if getattr(self, "btn_stop", None):
+                    self.btn_stop.configure(state="disabled")
+            except Exception:
+                pass
+            try:
+                self.set_status("")
             except Exception:
                 pass
         except Exception:
             pass
+
 
     def _persona_line_from_llm(self, query_text: str, titles: list[str], n: int) -> str:
         """
@@ -4552,6 +4600,12 @@ class ChatWithLLM(ChatFrame):
                         {"role": "system", "content": base_sys},
                         {"role": "user", "content": f"{header_user}\n\n{contexto}PREGUNTA: {q}"}
                     ]
+                    # === STREAMING REAL (corto-circuito) ===
+                    obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
+                    suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
+                    self._stream_llm_with_fallback(messages, max_tokens=tok_out, temperature=0.1, suffix=suffix)
+                    return  # <- importante: sal del worker para no ejecutar la rama no-stream
+
                     out = self.llm.chat(messages=messages, temperature=0.1, max_tokens=tok_out, stream=False)
                     content = ((out.get("choices") or [{}])[0].get("message") or {}).get("content", "") \
                               or ((out.get("choices") or [{}])[0].get("text", "") or "")
@@ -4972,32 +5026,68 @@ class ChatWithLLM(ChatFrame):
         # 4) Volcar al chat
         self._append_chat("PACqui", msg)
 
-    def _stream_llm_with_fallback(self, messages, max_tokens=256):
-        # abre turno PACqui y arranca spinner
-        self._append_chat("PACqui", "")
-        self._spinner_start()
+    def _append_stream_text(self, txt: str, end_turn: bool = False):
+        # Normaliza (si tu AppRoot tiene normalizador)
+        try:
+            norm = self.app._normalize_text(txt) if hasattr(self.app, "_normalize_text") else str(txt)
+        except Exception:
+            norm = str(txt)
 
-        # habilita el Text para poder inyectar tokens
         try:
             self.txt_chat.configure(state="normal")
         except Exception:
             pass
 
-        # inserta texto de forma segura desde el hilo
-        def push(txt: str):
+        # Etiqueta de turno (solo la primera vez)
+        if not hasattr(self, "_in_stream"):
+            self._in_stream = False
+        if not self._in_stream:
             try:
-                # usa tu helper (respeta formato y estado)
-                self._append_stream_text(txt)
+                self.txt_chat.insert("end", "PACqui:\n", ("who",))
+                self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
+            except Exception:
+                pass
+            self._in_stream = True
+
+        try:
+            self.txt_chat.insert("end", norm)
+            if end_turn:
+                self.txt_chat.insert("end", "\n")
+                self._in_stream = False
+            self.txt_chat.see("end")
+        except Exception:
+            pass
+
+        try:
+            self.txt_chat.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _stream_llm_with_fallback(self, messages, max_tokens=256, temperature=0.2, suffix: str = ""):
+        # abre turno y spinner
+        self._append_chat("PACqui", "")
+        self._spinner_start()
+
+        # reinicia la bandera de parada
+        if getattr(self, "stop_event", None):
+            self.stop_event.clear()
+
+        # inserción segura desde el hilo worker
+        def push(txt: str, end: bool = False):
+            try:
+                self._append_stream_text(txt, end_turn=end)
             except Exception:
                 # fallback defensivo
                 try:
                     self.txt_chat.configure(state="normal")
+                    self.txt_chat.insert("end", str(txt))
+                    if end:
+                        self.txt_chat.insert("end", "\n")
+                    self.txt_chat.see("end")
+                    self.txt_chat.configure(state="disabled")
                 except Exception:
                     pass
-                self.txt_chat.insert("end", txt)
-                self.txt_chat.see("end")
 
-        # cierre correcto del stream
         def _end_stream():
             try:
                 self.txt_chat.configure(state="disabled")
@@ -5007,38 +5097,45 @@ class ChatWithLLM(ChatFrame):
 
         def worker():
             try:
-                stream = self.llm.chat(messages, temperature=0.3,
-                                       max_tokens=max_tokens, stream=True)
+                stream = self.llm.chat(messages=messages, max_tokens=max_tokens,
+                                       temperature=temperature, stream=True)
                 for chunk in stream:
-                    # extrae token sea delta.content (chat) o text (completion)
+                    # Soporta Stop
+                    if getattr(self, "stop_event", None) and self.stop_event.is_set():
+                        break
+
                     token = ""
                     try:
-                        ch0 = (chunk.get("choices") or [{}])[0]
-                        token = ch0.get("delta", {}).get("content", "") or ch0.get("text", "") or ""
+                        ch0 = (chunk or {}).get("choices", [{}])[0]
+                        delta = ch0.get("delta") or {}
+                        token = delta.get("content") or ch0.get("text") or ""
                     except Exception:
                         token = ""
-                    if token:
-                        # ¡ESTO es lo que faltaba!
-                        self.after(0, push, token)
 
-                # cierra línea
-                self.after(0, push, "\n")
+                    if token:
+                        self.after(0, push, token, False)
+
+                # Sufijo (rutas) antes de cerrar
+                if suffix:
+                    self.after(0, push, ("\n\n" + suffix), False)
+
+                # Cierre de turno
+                self.after(0, push, "", True)
 
             except Exception as e:
-                # fallback sin stream: devolvemos algo sí o sí
+                # Fallback sin streaming
                 try:
-                    resp = self.llm.chat(messages, temperature=0.3,
-                                         max_tokens=max_tokens, stream=False)
-                    txt = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "") or \
-                          (resp.get("choices") or [{}])[0].get("text", "") or f"[error] {e}"
-                    self.after(0, push, txt + "\n")
+                    resp = self.llm.chat(messages=messages, max_tokens=max_tokens,
+                                         temperature=temperature, stream=False)
+                    txt = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "") \
+                          or ((resp.get("choices") or [{}])[0].get("text", "") or f"[error] {e}")
+                    self.after(0, push, txt + ("\n\n" + suffix if suffix else "") + "\n", True)
                 except Exception as ee:
-                    self.after(0, push, f"\n[error] {ee}\n")
+                    self.after(0, push, f"\n[error] {ee}\n", True)
             finally:
                 self.after(0, _end_stream)
 
         import threading
-        # ¡y esto también! arranca el hilo
         threading.Thread(target=worker, daemon=True).start()
 
 
