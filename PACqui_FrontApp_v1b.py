@@ -238,7 +238,7 @@ class ChatFrame(ttk.Frame):
         ttk.Label(center, text="PACqui — Asistente (modo público)", style="Header.TLabel").pack(anchor="w", pady=(0,6))
         # --- Chat text (único widget, sin duplicados) ---
         self.txt_chat = tk.Text(center, height=18, wrap="word")
-        self.txt_chat.configure(font=("Segoe UI", 10))  # base uniforme
+        self.txt_chat.configure(font=("Segoe UI", 12))  # base uniforme
         self.txt_chat.pack(fill="both", expand=True)
 
         # Quién habla (colores/estilos de prefijo)

@@ -613,7 +613,7 @@ class AppRoot(tk.Tk):
       - “limpiar filtros” → elimina cualquier filtro de extensión activo
 
     • Botones
-      - Enviar / Responder con LLM: genera respuesta breve usando el modelo cargado.
+      - - Enviar: genera respuesta breve usando el modelo cargado (si está disponible).
       - Solo índice (sin LLM): muestra sólo rutas/observaciones del índice (sin generar texto).
     """.strip()
 
@@ -3758,20 +3758,37 @@ class ChatWithLLM(ChatFrame):
         return "; ".join(parts)
 
     def _build_ui(self):
+        # Construye la UI base del ChatFrame (incluye Entry + botón "Enviar")
         super()._build_ui()
-        # --- NUEVO: reencaminar Enter y el botón "Enviar" al LLM ---
+
+        # --- Estilos y tamaño (Entry más alto, botón más grande) ---
         try:
-            self.ent_input.bind("<Return>", lambda e: self._send_llm())
+            st = ttk.Style()
+            # Aumenta tamaño global del estilo del botón grande
+            st.configure("Big.TButton", font=("Segoe UI", 12, "bold"), padding=(18, 10))
+            # Nuevo estilo para el Entry
+            st.configure("Big.TEntry", padding=(8, 6))
+
+            # Aplica estilo y fuente 12 al Entry; sube la altura visual
+            self.ent_input.configure(style="Big.TEntry", font=("Segoe UI", 12))
+            self.ent_input.pack_configure(ipady=10, padx=(6, 8), fill="x", expand=True)
         except Exception:
             pass
 
-        # Buscar un botón con texto "Enviar" en la fila de entrada y reconfigurarlo
+        # --- Reencaminar ENTER y el botón "Enviar" al LLM ---
         try:
+            # Enter → LLM
+            self.ent_input.bind("<Return>", lambda e: self._send_llm())
+            # Reconfigura el botón "Enviar" creado en ChatFrame
             input_row = self.ent_input.master
             for ch in input_row.winfo_children():
                 try:
                     if str(ch.cget("text")).strip().lower() == "enviar":
-                        ch.configure(command=self._send_llm)
+                        ch.configure(command=self._send_llm, style="Big.TButton")
+                        try:
+                            ch.configure(width=max(10, ch.cget("width")))
+                        except Exception:
+                            pass
                         break
                 except Exception:
                     continue
@@ -3780,21 +3797,20 @@ class ChatWithLLM(ChatFrame):
 
         parent = self.ent_input.master
 
-        # Botón de envío al LLM
-        self.btn_llm = ttk.Button(parent, text="Responder con LLM", command=self._send_llm)
-        self.btn_llm.pack(side="left", padx=(8, 0))
-
-        # *** NUEVO: spinner indeterminado (se oculta al inicio) ***
+        # --- Spinner indeterminado (oculto por defecto) ---
         self.pb = ttk.Progressbar(parent, mode="indeterminate", length=120)
         self.pb.pack(side="left", padx=(8, 0))
         self.pb.stop()
         self.pb.pack_forget()
 
-        # Toggle: solo índice (sin LLM)
+        # --- Checkbox "Solo índice (sin LLM)" ---
         self.var_notes_only = tk.BooleanVar(value=False)
-        chk = ttk.Checkbutton(parent, text="Solo índice (sin LLM)",
-                              variable=self.var_notes_only,
-                              command=lambda: setattr(self, "notes_only", bool(self.var_notes_only.get())))
+        chk = ttk.Checkbutton(
+            parent,
+            text="Solo índice (sin LLM)",
+            variable=self.var_notes_only,
+            command=lambda: setattr(self, "notes_only", bool(self.var_notes_only.get()))
+        )
         chk.pack(side="left", padx=(8, 0))
 
     def _open_file_os(self, path: str):
@@ -3951,20 +3967,21 @@ class ChatWithLLM(ChatFrame):
 
         def build_system_text():
             parts = [base_sys]
-            if idx_ctx: parts += ["[Contexto (índice)]", idx_ctx]
-            if rag_ctx: parts += ["[Contexto del repositorio]", rag_ctx]
+            if concept_block:
+                parts += ["[CONCEPTOS]", concept_block]
+            if obs_block:
+                parts += ["[OBSERVACIONES]", obs_block]
+            if rutas_block:
+                parts += ["[RUTAS]", rutas_block]
+            if idx_ctx:
+                parts += ["[Contexto (índice)]", idx_ctx]
+            if rag_ctx:
+                parts += ["[Contexto del repositorio]", rag_ctx]
             return "\n\n".join(parts).strip()
 
-        # justo antes de construir sys_full
         concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
-        parts = [base_sys]
-        if concept_block:
-            parts += ["[CONCEPTOS]", concept_block]
-        if obs_block:
-            parts += ["[OBSERVACIONES]", obs_block]
-        if rutas_block:
-            parts += ["[RUTAS]", rutas_block]
-        sys_full = "\n\n".join(parts).strip()
+
+        # ❌ (bloque parts/join eliminado aquí)
 
         sys_full = build_system_text()
 
