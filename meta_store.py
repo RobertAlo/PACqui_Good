@@ -232,6 +232,7 @@ class MetaStore:
                 # Si existen duplicados ya, al menos dejamos un índice normal para acelerar
                 c.execute("CREATE INDEX IF NOT EXISTS idx_doc_keywords_fp_kw ON doc_keywords(fullpath, keyword)")
 
+
             # Observaciones
             c.execute("""
                 CREATE TABLE IF NOT EXISTS doc_notes (
@@ -304,7 +305,24 @@ class MetaStore:
             CREATE INDEX IF NOT EXISTS idx_concepts_text ON concepts(title, body);
             CREATE INDEX IF NOT EXISTS idx_qa_log_ts ON qa_log(ts);
             """)
+
+
             # <<< HISTORICOS + CONCEPTOS
+
+            # --- Fuentes por concepto (para ranking específico) ---
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS concept_sources (
+                    concept_id INTEGER NOT NULL,
+                    path       TEXT NOT NULL,
+                    weight     REAL DEFAULT 1.2,
+                    note       TEXT,
+                    PRIMARY KEY (concept_id, path)
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_concept_sources_path ON concept_sources( lower(path) )")
+            conn.commit()
+
+
 
     # ---------- keywords ----------
     def add_keywords(self, fullpath: str, keywords: Iterable[str], source: str = "manual", replace: bool = False) -> int:
@@ -475,6 +493,56 @@ class MetaStore:
             rows = con.execute(f"""SELECT id, slug, title, substr(body,1,160), tags
                                    FROM concepts {flt} ORDER BY updated_at DESC LIMIT ?""", (*args, limit)).fetchall()
         return [dict(id=r[0], slug=r[1], title=r[2], body=r[3], tags=r[4]) for r in rows]
+
+    # ---------- concept sources (rutas ponderadas por concepto) ----------
+    def list_concept_sources(self, concept_id: int) -> list[dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT path, COALESCE(weight,1.2), note FROM concept_sources WHERE concept_id=?",
+                (int(concept_id),)
+            ).fetchall()
+        return [{"path": r[0], "weight": float(r[1] or 1.2), "note": r[2]} for r in rows]
+
+    def save_concept_sources(self, concept_id: int, items: list[dict], replace: bool = False) -> int:
+        """Upsert en lote de rutas (path, weight, note) ligadas a un concepto."""
+        if not items:
+            return 0
+        with self._lock, self._connect() as conn:
+            cur = conn.cursor()
+            cid = int(concept_id)
+            if replace:
+                cur.execute("DELETE FROM concept_sources WHERE concept_id=?", (cid,))
+            n = 0
+            import os
+            for it in (items or []):
+                p = (it.get("path") or "").strip()
+                if not p:
+                    continue
+                p = os.path.normcase(os.path.normpath(p))
+                w = float(it.get("weight") or 1.2)
+                note = it.get("note")
+                cur.execute("""
+                    INSERT INTO concept_sources(concept_id, path, weight, note)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(concept_id, path) DO UPDATE SET
+                        weight=excluded.weight,
+                        note=excluded.note
+                """, (cid, p, w, note))
+                n += 1
+            conn.commit()
+            return n
+
+    def delete_concept_source(self, concept_id: int, path: str) -> int:
+        with self._lock, self._connect() as conn:
+            import os
+            p = os.path.normcase(os.path.normpath(path or ""))
+            cur = conn.execute(
+                "DELETE FROM concept_sources WHERE concept_id=? AND lower(path)=lower(?)",
+                (int(concept_id), p)
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
 
     # ---------- pinned sources (fuentes persistentes) ----------
     def save_pinned_sources(self, items: list[dict]) -> int:

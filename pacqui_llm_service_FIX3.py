@@ -254,6 +254,29 @@ class LLMService:
             if not acc:
                 return []
 
+            # --- BOOST por "concept_sources" (cuando la consulta encaja con conceptos) ---
+            concept_boost = {}
+            try:
+                from meta_store import MetaStore
+                ms_ = MetaStore(self.db_path)
+
+                # Usa la consulta normalizada (qnorm) para buscar conceptos relevantes
+                q_for_concepts = qnorm  # título/cuerpo/alias
+                concepts = ms_.list_concepts(q_for_concepts, limit=5)
+                import os
+                def _nrm(p):
+                    return os.path.normcase(os.path.normpath(p or ""))
+
+                for c in concepts:
+                    for cs in ms_.list_concept_sources(c["id"]):
+                        p = _nrm(cs["path"])
+                        w = float(cs.get("weight") or 1.2)
+                        # Conserva el mayor peso si aparece varias veces
+                        if p:
+                            concept_boost[p] = max(concept_boost.get(p, 0.0), w)
+            except Exception:
+                concept_boost = {}
+
             ranked = []
             for fp, sc in acc.items():
                 ext = Path(fp).suffix.lower()
@@ -316,6 +339,13 @@ class LLMService:
                 # <<< FEEDBACK BOOST
 
 
+                # --- BOOST por "concept_sources" (más fuerte que pinned) ---
+                try:
+                    if fp in concept_boost:
+                        # ~12 puntos por weight≈1.0 (ligeramente por encima de "pinned_sources")
+                        rank += int(round(12.0 * concept_boost[fp]))
+                except Exception:
+                    pass
 
             if not ranked:
                 return []

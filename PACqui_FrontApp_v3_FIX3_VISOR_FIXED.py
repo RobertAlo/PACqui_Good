@@ -1351,6 +1351,40 @@ class AdminPanel(ttk.Notebook):
             self.tv_hist.column(c, width=w, anchor=a)
         self.tv_hist.pack(fill="both", expand=True, pady=(6, 0))
         self.tv_hist.bind("<<TreeviewSelect>>", lambda _e: _load_detail())
+        # --- Menú contextual para valorar rápidamente ---
+        menu = tk.Menu(left, tearoff=0)
+
+        def _rate_selected(rating:int|None):
+            sel = self.tv_hist.selection()
+            if not sel:
+                return
+            qa_id = int(self.tv_hist.item(sel[0], "values")[0])
+            if rating is None:
+                ms.set_feedback(qa_id, 0, "")  # borra poniendo 0 y nota vacía (ajusta si quieres triestado)
+                with self.app.data._connect() as con:
+                    con.execute("DELETE FROM qa_feedback WHERE qa_id=?", (qa_id,))
+                    con.commit()
+            else:
+                ms.set_feedback(qa_id, int(rating), self.var_note.get().strip())
+            _reload()
+
+        # construye opciones 0..10 y “Borrar valoración”
+        for r in range(0, 11):
+            menu.add_command(label=f"Valorar {r}", command=lambda rr=r: _rate_selected(rr))
+        menu.add_separator()
+        menu.add_command(label="Borrar valoración", command=lambda: _rate_selected(None))
+
+        def _show_menu(event):
+            try:
+                iid = self.tv_hist.identify_row(event.y)
+                if iid:
+                    self.tv_hist.selection_set(iid)
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        self.tv_hist.bind("<Button-3>", _show_menu)   # clic derecho
+
 
         # ---- DER: detalle + valoración ----
         right = ttk.Notebook(cols);
@@ -1438,52 +1472,152 @@ class AdminPanel(ttk.Notebook):
                 self.tv_con.insert("", "end", values=(c["id"], c["slug"], c["title"], c.get("tags", "") or ""))
 
         def _edit_concept(cid):
-            top = tk.Toplevel(self);
-            top.title("Concepto");
+            top = tk.Toplevel(self)
+            top.title("Concepto")
             top.grab_set()
-            frm = ttk.Frame(top, padding=10);
-            frm.pack(fill="both", expand=True)
-            vars = {k: tk.StringVar() for k in ("slug", "title", "tags", "aliases")}
-            txt = tk.Text(frm, height=12, wrap="word")
 
+            frm = ttk.Frame(top, padding=10)
+            frm.pack(fill="both", expand=True)
+
+            vars = {k: tk.StringVar() for k in ("slug", "title", "tags", "aliases")}
+            txt_body = tk.Text(frm, height=10, wrap="word")
+
+            # --- Fuentes por concepto (UI simple) ---
+            src_vars = {
+                "path": tk.StringVar(),
+                "weight": tk.StringVar(value="1.2"),
+                "note": tk.StringVar(),
+            }
+
+            src_frame = ttk.Labelframe(frm, text="Fuentes (ruta + peso + nota)", padding=8)
+            tv_src = ttk.Treeview(src_frame, columns=("path", "weight", "note"), show="headings", height=6)
+            tv_src.heading("path", text="Ruta")
+            tv_src.heading("weight", text="Peso")
+            tv_src.heading("note", text="Nota")
+            tv_src.column("path", width=560, anchor="w")
+            tv_src.column("weight", width=60, anchor="center")
+            tv_src.column("note", width=220, anchor="w")
+
+            def _browse_path():
+                p = filedialog.askopenfilename(parent=top, title="Selecciona un archivo")
+                if p:
+                    src_vars["path"].set(p)
+
+            def _add_src():
+                p = (src_vars["path"].get() or "").strip()
+                if not p:
+                    _browse_path()
+                    p = (src_vars["path"].get() or "").strip()
+                if not p:
+                    return
+                try:
+                    w = float(src_vars["weight"].get() or "1.2")
+                except Exception:
+                    w = 1.2
+                    src_vars["weight"].set("1.2")
+                note = (src_vars["note"].get() or "").strip()
+                # evita duplicados por ruta
+                for iid in tv_src.get_children():
+                    if tv_src.set(iid, "path").lower() == p.lower():
+                        tv_src.set(iid, "weight", str(w))
+                        tv_src.set(iid, "note", note)
+                        return
+                tv_src.insert("", "end", values=(p, f"{w:.2f}", note))
+
+            def _del_src():
+                sel = tv_src.selection()
+                for iid in sel:
+                    tv_src.delete(iid)
+
+            # --- Carga/guardado ---
             def _load():
-                if not cid: return
+                if not cid:
+                    return
                 with root.data._connect() as con:
                     r = con.execute("SELECT slug,title,body,tags FROM concepts WHERE id=?", (cid,)).fetchone()
-                vars["slug"].set(r[0]);
-                vars["title"].set(r[1]);
-                txt.insert("1.0", r[2]);
+                vars["slug"].set(r[0])
+                vars["title"].set(r[1])
+                txt_body.insert("1.0", r[2])
                 vars["tags"].set(r[3] or "")
-                als = [a[0] for a in
-                       con.execute("SELECT alias FROM concept_alias WHERE concept_id=?", (cid,)).fetchall()]
+                with root.data._connect() as con:
+                    als = [a[0] for a in con.execute(
+                        "SELECT alias FROM concept_alias WHERE concept_id=?", (cid,)).fetchall()]
                 vars["aliases"].set(", ".join(als))
+
+                # fuentes del concepto
+                try:
+                    from meta_store import MetaStore
+                    ms = MetaStore(self.app.data.db_path)
+                    for it in ms.list_concept_sources(cid):
+                        tv_src.insert("", "end", values=(it["path"], f'{float(it["weight"]):.2f}', it.get("note") or ""))
+                except Exception:
+                    pass
 
             def _save():
                 aliases = [a.strip() for a in (vars["aliases"].get() or "").split(",") if a.strip()]
-                ms.upsert_concept(vars["slug"].get(), vars["title"].get(), txt.get("1.0", "end").strip(),
-                                  vars["tags"].get(), aliases=aliases, concept_id=cid)
-                top.destroy();
+                from meta_store import MetaStore
+                ms = MetaStore(self.app.data.db_path)
+
+                # 1) upsert del concepto (devuelve id)
+                new_id = ms.upsert_concept(
+                    vars["slug"].get(), vars["title"].get(),
+                    txt_body.get("1.0", "end").strip(),
+                    vars["tags"].get(), aliases=aliases, concept_id=cid
+                )
+
+                # 2) recopilar fuentes de la tabla y persistir (replace=True)
+                items = []
+                for iid in tv_src.get_children():
+                    vals = tv_src.item(iid, "values")
+                    items.append({
+                        "path": vals[0],
+                        "weight": float(vals[1]),
+                        "note": vals[2],
+                    })
+                ms.save_concept_sources(new_id, items, replace=True)
+
+                top.destroy()
                 _reload_concepts()
 
-            row = ttk.Frame(frm);
-            row.pack(fill="x")
-            ttk.Label(row, text="slug:").pack(side="left");
+            # --- Campos superiores ---
+            row = ttk.Frame(frm); row.pack(fill="x")
+            ttk.Label(row, text="slug:").pack(side="left")
             ttk.Entry(row, textvariable=vars["slug"], width=32).pack(side="left", padx=6)
-            ttk.Label(row, text="título:").pack(side="left");
+            ttk.Label(row, text="título:").pack(side="left")
             ttk.Entry(row, textvariable=vars["title"], width=48).pack(side="left", padx=6)
-            row2 = ttk.Frame(frm);
-            row2.pack(fill="x", pady=(6, 0))
-            ttk.Label(row2, text="tags:").pack(side="left");
+
+            row2 = ttk.Frame(frm); row2.pack(fill="x", pady=(6, 0))
+            ttk.Label(row2, text="tags:").pack(side="left")
             ttk.Entry(row2, textvariable=vars["tags"], width=40).pack(side="left", padx=6)
-            ttk.Label(row2, text="alias (coma):").pack(side="left");
+            ttk.Label(row2, text="alias (coma):").pack(side="left")
             ttk.Entry(row2, textvariable=vars["aliases"], width=40).pack(side="left", padx=6)
-            ttk.Label(frm, text="Cuerpo").pack(anchor="w", pady=(6, 0));
-            txt.pack(fill="both", expand=True)
-            btns = ttk.Frame(frm);
-            btns.pack(fill="x", pady=(8, 0))
+
+            # --- Fuentes (tabla + editor de línea) ---
+            src_frame.pack(fill="both", expand=True, pady=(8, 6))
+            tv_src.pack(fill="both", expand=True, side="top")
+
+            editor = ttk.Frame(src_frame); editor.pack(fill="x", pady=(6, 0))
+            ttk.Label(editor, text="Ruta:").pack(side="left")
+            ttk.Entry(editor, textvariable=src_vars["path"], width=55).pack(side="left", padx=4)
+            ttk.Button(editor, text="Examinar…", command=_browse_path).pack(side="left")
+            ttk.Label(editor, text="Peso:").pack(side="left", padx=(12, 0))
+            ttk.Entry(editor, textvariable=src_vars["weight"], width=6).pack(side="left", padx=4)
+            ttk.Label(editor, text="Nota:").pack(side="left", padx=(12, 0))
+            ttk.Entry(editor, textvariable=src_vars["note"], width=28).pack(side="left", padx=4)
+            ttk.Button(editor, text="Añadir/Actualizar", command=_add_src).pack(side="right")
+            ttk.Button(editor, text="Quitar seleccionados", command=_del_src).pack(side="right", padx=(0, 6))
+
+            # --- Cuerpo del concepto ---
+            ttk.Label(frm, text="Cuerpo").pack(anchor="w", pady=(6, 0))
+            txt_body.pack(fill="both", expand=True)
+
+            # --- Botonera ---
+            btns = ttk.Frame(frm); btns.pack(fill="x", pady=(8, 0))
             ttk.Button(btns, text="Guardar", command=_save).pack(side="right")
             ttk.Button(btns, text="Cancelar", command=lambda: top.destroy()).pack(side="right", padx=8)
+
             _load()
+
 
         # Arranque
         _reload();
@@ -1815,6 +1949,9 @@ class AdminPanel(ttk.Notebook):
         ttk.Button(right, text="Crear índices recomendados", command=self._danger_create_indices).pack(anchor="w",
                                                                                                        pady=2)
 
+        ttk.Button(right, text="Deduplicar Históricos (qa_log)", command=self._danger_dedupe_qa_log)\
+           .pack(anchor="w", pady=2)
+
         ttk.Separator(right).pack(fill="x", pady=(8,4))
         ttk.Button(right, text="PRAGMA integrity_check + VACUUM", command=self._danger_integrity_vacuum).pack(anchor="w", pady=2)
 
@@ -2112,6 +2249,36 @@ class AdminPanel(ttk.Notebook):
                 messagebox.showinfo(title, "Operación cancelada.")
                 return False
         return True
+
+    def _danger_dedupe_qa_log(self):
+        from tkinter import messagebox
+        sql_dups = """
+            WITH d AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY ts, query, answer, model
+                         ORDER BY id DESC
+                       ) AS rn
+                FROM qa_log
+            )
+            SELECT id FROM d WHERE rn > 1
+        """
+        try:
+            with self.app.data._connect() as con:
+                dup_ids = [r[0] for r in con.execute(sql_dups).fetchall()]
+                if not dup_ids:
+                    messagebox.showinfo("Deduplicar", "No se han encontrado duplicados en qa_log.", parent=self)
+                    return
+                # Borra primero fuentes asociadas
+                con.executemany("DELETE FROM qa_sources WHERE qa_id=?", [(i,) for i in dup_ids])
+                # Borra los duplicados en qa_log
+                con.executemany("DELETE FROM qa_log WHERE id=?", [(i,) for i in dup_ids])
+                con.commit()
+            self.app._log("danger_dedupe_qa_log", removed=len(dup_ids))
+            messagebox.showinfo("Deduplicar", f"Eliminados {len(dup_ids)} duplicados en qa_log.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Deduplicar", f"Error:\n{e}", parent=self)
+
 
     def _danger_create_indices(self):
         from tkinter import messagebox
@@ -4269,6 +4436,7 @@ class ChatWithLLM(ChatFrame):
             self._spinner_start()
 
             def worker():
+                saved_qa = False
 
                 try:
                     # 1) Contexto (ÍNDICE + RAG)
@@ -4393,6 +4561,7 @@ class ChatWithLLM(ChatFrame):
                     obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
                     final = text_llm
                     # === Guardado directo del Q&A (fallback sin monkey-patch) ===
+
                     try:
                         from meta_store import MetaStore
                         # misma BD que usa la app
@@ -4434,6 +4603,8 @@ class ChatWithLLM(ChatFrame):
 
                         # 5) persistir
                         ms.log_qa(query=q_text, answer=answer_var, model=str(model_name), sources=srcs)
+                        saved_qa = True
+
                     except Exception as e:
                         print("[QA-LOG] fallo (fallback):", e)
                     # === fin guardado Q&A ===
@@ -4452,24 +4623,27 @@ class ChatWithLLM(ChatFrame):
                         pass
 
                     # === Guardado del Q&A en Históricos (fallback a prueba de bombas) ===
-                    try:
-                        ms = MetaStore(self.app.data.db_path)
-                        # Toma hasta 5 fuentes de 'hits' para dejar rastro útil
-                        srcs = []
-                        for h in ((hits if 'hits' in locals() else getattr(self, "_hits", [])) or [])[:5]:
-                            srcs.append({
-                                "name": (h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "")[:200],
-                                "path": h.get("path", "")[:800],
-                                "note": (h.get("note") or "")[:500],
-                                "score": float(h.get("score") or 0),
-                            })
+                    if not saved_qa:
+                    # (deja dentro TODO el bloque que construye srcs y llama a ms.log_qa)
 
-                        ms.log_qa(query=(q or ""), answer=(final or ""), model=str(model_name), sources=srcs)
+                        try:
+                            ms = MetaStore(self.app.data.db_path)
+                            # Toma hasta 5 fuentes de 'hits' para dejar rastro útil
+                            srcs = []
+                            for h in ((hits if 'hits' in locals() else getattr(self, "_hits", [])) or [])[:5]:
+                                srcs.append({
+                                    "name": (h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "")[:200],
+                                    "path": h.get("path", "")[:800],
+                                    "note": (h.get("note") or "")[:500],
+                                    "score": float(h.get("score") or 0),
+                                })
 
-                    except Exception as e:
-                        print(f"[QA-LOG] fallo (fallback): {e}")
+                            ms.log_qa(query=(q or ""), answer=(final or ""), model=str(model_name), sources=srcs)
 
-                    self.after(0, lambda: self._append_chat("PACqui", final))
+                        except Exception as e:
+                            print(f"[QA-LOG] fallo (fallback): {e}")
+
+                        self.after(0, lambda: self._append_chat("PACqui", final))
                 finally:
                     self.after(0, self._spinner_stop)
 
@@ -4799,17 +4973,44 @@ class ChatWithLLM(ChatFrame):
         self._append_chat("PACqui", msg)
 
     def _stream_llm_with_fallback(self, messages, max_tokens=256):
+        # abre turno PACqui y arranca spinner
         self._append_chat("PACqui", "")
-        self._spinner_start()  # <<< arranca el spinner
+        self._spinner_start()
 
-        def push(txt):
-            self.txt_chat.insert("end", txt)
-            self.txt_chat.see("end")
+        # habilita el Text para poder inyectar tokens
+        try:
+            self.txt_chat.configure(state="normal")
+        except Exception:
+            pass
+
+        # inserta texto de forma segura desde el hilo
+        def push(txt: str):
+            try:
+                # usa tu helper (respeta formato y estado)
+                self._append_stream_text(txt)
+            except Exception:
+                # fallback defensivo
+                try:
+                    self.txt_chat.configure(state="normal")
+                except Exception:
+                    pass
+                self.txt_chat.insert("end", txt)
+                self.txt_chat.see("end")
+
+        # cierre correcto del stream
+        def _end_stream():
+            try:
+                self.txt_chat.configure(state="disabled")
+            except Exception:
+                pass
+            self._spinner_stop()
 
         def worker():
             try:
-                stream = self.llm.chat(messages, temperature=0.3, max_tokens=max_tokens, stream=True)
+                stream = self.llm.chat(messages, temperature=0.3,
+                                       max_tokens=max_tokens, stream=True)
                 for chunk in stream:
+                    # extrae token sea delta.content (chat) o text (completion)
                     token = ""
                     try:
                         ch0 = (chunk.get("choices") or [{}])[0]
@@ -4817,22 +5018,27 @@ class ChatWithLLM(ChatFrame):
                     except Exception:
                         token = ""
                     if token:
+                        # ¡ESTO es lo que faltaba!
                         self.after(0, push, token)
+
+                # cierra línea
                 self.after(0, push, "\n")
+
             except Exception as e:
-                # Fallback sin stream (y siempre devolvemos "algo")
+                # fallback sin stream: devolvemos algo sí o sí
                 try:
-                    resp = self.llm.chat(messages, temperature=0.3, max_tokens=max_tokens, stream=False)
+                    resp = self.llm.chat(messages, temperature=0.3,
+                                         max_tokens=max_tokens, stream=False)
                     txt = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "") or \
-                          (resp.get("choices") or [{}])[0].get("text", "") or ""
-                    if not txt:
-                        txt = f"[error] {e}"
+                          (resp.get("choices") or [{}])[0].get("text", "") or f"[error] {e}"
                     self.after(0, push, txt + "\n")
                 except Exception as ee:
                     self.after(0, push, f"\n[error] {ee}\n")
             finally:
-                self.after(0, self._spinner_stop)  # <<< detiene el spinner
+                self.after(0, _end_stream)
 
+        import threading
+        # ¡y esto también! arranca el hilo
         threading.Thread(target=worker, daemon=True).start()
 
 
