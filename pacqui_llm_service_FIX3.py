@@ -19,7 +19,7 @@ class LLMService:
         self.threads = max(2, (os.cpu_count() or 4) - 2)
 
         # Más conservador para primer run (evita picos)
-        self.n_batch = 128
+        self.n_batch = 256
 
         # --- NUEVO: sincronización y flags de warmup ---
         import threading
@@ -31,6 +31,22 @@ class LLMService:
         self._embedder_cached = None
 
     # --------- carga ---------
+    def _cpu_autotune(self, ctx_tokens: int):
+        import os, multiprocessing
+        cores = multiprocessing.cpu_count() or 4
+        # Hilos: usa todos menos 1 si hay >=6; si no, todos
+        n_threads = int(os.getenv("PACQUI_THREADS", str(cores - 1 if cores >= 6 else cores)))
+        # Batch: tope razonable para CPU; sobreescribible por env
+        n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "512")))
+        # CPU-only
+        n_gpu_layers = 0
+        # I/O rápido
+        use_mmap = True
+        # mlock opcional (1 para activarlo si tu OS lo permite)
+        use_mlock = bool(int(os.getenv("PACQUI_MLOCK", "0")))
+        return dict(n_threads=n_threads, n_batch=n_batch,
+                    n_gpu_layers=n_gpu_layers, use_mmap=use_mmap, use_mlock=use_mlock)
+
     def load(self, model_path: str, ctx: int = 2048):
         from llama_cpp import Llama
         name = Path(model_path).name.lower()
@@ -46,21 +62,33 @@ class LLMService:
         self.model_path = model_path
         self.ctx = int(ctx or 2048)
         # Reserva CPU para la UI
-        self.threads = max(2, (os.cpu_count() or 4) - 2)
+        perf = self._cpu_autotune(self.ctx)
         self.model = Llama(
             model_path=self.model_path,
             n_ctx=self.ctx,
-            n_threads=self.threads,
-            n_batch=self.n_batch,
-            n_gpu_layers=0,
+            n_threads=perf["n_threads"],
+            n_batch=perf["n_batch"],
+            n_gpu_layers=perf["n_gpu_layers"],  # CPU-only
             f16_kv=True,
-            use_mmap=True,
+            use_mmap=perf["use_mmap"],
             vocab_only=False,
             chat_format=chat_fmt,
+            # use_mlock es opcional en algunas builds/OS; si tu build lo soporta:
+            use_mlock=perf["use_mlock"],
         )
 
     def is_loaded(self) -> bool:
         return self.model is not None
+
+    def cancel(self):
+        """Cancelación best-effort: si la build de llama-cpp expone cancel/reset, intentalo."""
+        try:
+            if hasattr(self.model, "cancel") and callable(self.model.cancel):
+                self.model.cancel()
+            elif hasattr(self.model, "reset") and callable(self.model.reset):
+                self.model.reset()
+        except Exception:
+            pass
 
     # --------- token count util ---------
     def count_tokens(self, text: str) -> int:
@@ -175,7 +203,8 @@ class LLMService:
                 expanded.add(t[:-1])
             else:
                 expanded.add(t + "s")
-        toks = list(expanded)
+        toks = list(expanded)[:8]   # máx 8 términos efectivos (acelera consultas)
+
 
         EXT_BONUS = {".pdf": 3, ".docx": 3, ".doc": 2, ".pptx": 1}
         EXT_MALUS = {".png": -2, ".jpg": -2, ".jpeg": -2, ".gif": -2, ".py": -2, ".java": -1, ".sql": -1}
@@ -226,14 +255,14 @@ class LLMService:
 
             # 1) keywords
             for t in toks:
-                cur.execute("SELECT fullpath FROM doc_keywords WHERE lower(keyword) LIKE lower(?) LIMIT 5000",
+                cur.execute("SELECT fullpath FROM doc_keywords WHERE lower(keyword) LIKE lower(?) LIMIT 1500",
                             (f"%{t}%",))
                 for (fp,) in cur.fetchall():
                     acc[os.path.normcase(os.path.normpath(fp))]["kw"] += 1
 
             # 2) observaciones
             for t in toks:
-                cur.execute("SELECT fullpath FROM doc_notes WHERE lower(note) LIKE lower(?) LIMIT 5000", (f"%{t}%",))
+                cur.execute("SELECT fullpath FROM doc_notes WHERE lower(note) LIKE lower(?) LIMIT 1500", (f"%{t}%",))
                 for (fp,) in cur.fetchall():
                     acc[os.path.normcase(os.path.normpath(fp))]["notes"] += 1
 
@@ -245,7 +274,7 @@ class LLMService:
                         like = f"%{t}%"
                         cur.execute("""SELECT fullpath FROM files
                                        WHERE lower(name) LIKE ? OR lower(dir) LIKE ?
-                                       LIMIT 5000""", (like, like))
+                                       LIMIT 1500""", (like, like))
                         for (fp,) in cur.fetchall():
                             acc[os.path.normcase(os.path.normpath(fp))]["fname"] += 1
             except Exception:

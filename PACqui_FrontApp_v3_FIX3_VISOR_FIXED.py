@@ -244,6 +244,7 @@ class AppRoot(tk.Tk):
         self._is_admin = False
         self.data = DataAccess(db_path or DEFAULT_DB)
         self.llm = LLMService(self.data.db_path)
+        self.llm.warmup_async()  # precalienta modelo/índice para evitar lag en la 1ª respuesta
 
         # --- Event bus (ring buffer de 500 eventos) ---
         self._events = []
@@ -3990,8 +3991,23 @@ class ChatWithLLM(ChatFrame):
         self.stop_event.clear()
 
         # Botón Detener (queda deshabilitado hasta que empiece un stream)
-        self.btn_stop = ttk.Button(parent, text="Detener", state="disabled",
-                                   command=lambda: self.stop_event.set())
+        def _do_stop():
+            self.stop_event.set()
+            try:
+                canc = getattr(self.llm, "cancel", None)
+                if callable(canc): canc()
+            except Exception:
+                pass
+            try:
+                self._spinner_stop()
+            except Exception:
+                pass
+
+        self.btn_stop = ttk.Button(parent, text="Detener",
+                                   state="disabled", command=_do_stop)
+
+        self.btn_stop = ttk.Button(parent, text="Detener", state="disabled", command=_do_stop)
+
         self.btn_stop.pack(side="left", padx=(8, 0))
 
         # --- Checkbox "Solo índice (sin LLM)" ---
@@ -4022,31 +4038,49 @@ class ChatWithLLM(ChatFrame):
     # --- NUEVO: helpers para el spinner ---
     def _spinner_start(self):
         try:
-            self.pb.pack(side="left", padx=(8, 0))
-            self.pb.start(12)  # velocidad del spinner
-            # Deshabilita input + botón Enviar
+            self.stop_event.clear()
+        except Exception:
+            pass
+        try:
+            self.pb.grid(); self.pb.start(12)
+        except Exception:
             try:
-                self.ent_input.configure(state="disabled")
+                self.pb.pack(side="left", padx=4); self.pb.start(12)
             except Exception:
                 pass
-            try:
-                if getattr(self, "btn_send", None):
-                    self.btn_send.configure(state="disabled")
-            except Exception:
-                pass
-            try:
-                if getattr(self, "btn_stop", None):
-                    self.btn_stop.configure(state="normal")
-            except Exception:
-                pass
-            try:
-                self.set_status("Generando con el LLM…")
-            except Exception:
-                pass
+        try:
+            self.ent_input.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.btn_send.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.btn_stop.configure(state="normal")
         except Exception:
             pass
 
-
+    def _spinner_stop(self):
+        try:
+            self.pb.stop(); self.pb.grid_remove()
+        except Exception:
+            try:
+                self.pb.stop(); self.pb.pack_forget()
+            except Exception:
+                pass
+        try:
+            self.btn_stop.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.ent_input.configure(state="normal"); self.ent_input.focus_set()
+        except Exception:
+            pass
+        try:
+            self.btn_send.configure(state="normal")
+        except Exception:
+            pass
 
     def _import_index_sheet(self):
         from tkinter import messagebox
@@ -4083,31 +4117,6 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
-    def _spinner_stop(self):
-        try:
-            self.pb.stop()
-            self.pb.pack_forget()
-            # Habilita input + botón Enviar y deshabilita Stop
-            try:
-                self.ent_input.configure(state="normal")
-            except Exception:
-                pass
-            try:
-                if getattr(self, "btn_send", None):
-                    self.btn_send.configure(state="normal")
-            except Exception:
-                pass
-            try:
-                if getattr(self, "btn_stop", None):
-                    self.btn_stop.configure(state="disabled")
-            except Exception:
-                pass
-            try:
-                self.set_status("")
-            except Exception:
-                pass
-        except Exception:
-            pass
 
 
     def _persona_line_from_llm(self, query_text: str, titles: list[str], n: int) -> str:
@@ -4303,13 +4312,16 @@ class ChatWithLLM(ChatFrame):
         def worker():
             try:
                 # CONTEXTO del índice (ligero)
+                # CONTEXTO del índice (ligero)
                 idx_ctx, _ = self.llm.build_index_context(q, top_k=5, max_note_chars=200)
 
-                # CONTEXTO RAG (limitado y filtrado por extensión si procede)
-                rag_q = q + (" " + " ".join(ext.lstrip(".") for ext in self._ext_filter)) if getattr(self,
-                                                                                                     "_ext_filter",
-                                                                                                     None) else q
-                rag_ctx = self.llm._rag_retrieve(rag_q, k=4, max_chars=480)  # << más corto
+                # Solo si el índice viene “flojo”, usamos RAG (más caro)
+                rag_ctx = ""
+                if not idx_ctx.strip():
+                    rag_q = q + (" " + " ".join(ext.lstrip(".") for ext in self._ext_filter)) if getattr(self,
+                                                                                                         "_ext_filter",
+                                                                                                         None) else q
+                    rag_ctx = self.llm._rag_retrieve(rag_q, k=3, max_chars=360)  # un poco más corto aún
 
                 has_idx = bool(idx_ctx.strip())
                 has_rag = bool(rag_ctx.strip())
@@ -4345,7 +4357,7 @@ class ChatWithLLM(ChatFrame):
                 ]
 
                 # presupuesto: máximo ~96 tokens de salida
-                tok_out = 96
+                tok_out = 64
 
                 # rutas debajo de la respuesta
                 obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=200)
@@ -4360,7 +4372,8 @@ class ChatWithLLM(ChatFrame):
 
         # spinner mientras preparamos el contexto
         try:
-            self.set_status("Preparando contexto (RAG + Índice)…")
+            self.set_status("Preparando contexto…")
+
         except Exception:
             pass
         threading.Thread(target=worker, daemon=True).start()
@@ -4380,6 +4393,8 @@ class ChatWithLLM(ChatFrame):
                                         prefer_only=prefer_only) or []
         except Exception:
             return []
+
+
 
     def _build_obs_and_routes_blocks(self, hits, max_items: int = 3, max_obs_chars: int = 220):
         """Devuelve (obs_block, rutas_block, hits_usados).
@@ -4718,7 +4733,7 @@ class ChatWithLLM(ChatFrame):
 
     def _stream_llm_with_fallback(self, messages, max_tokens=256, temperature=0.2, suffix: str = ""):
         # abre turno y spinner
-        self._append_chat("PACqui", "")
+
         self._spinner_start()
 
         # reinicia la bandera de parada
@@ -4743,19 +4758,32 @@ class ChatWithLLM(ChatFrame):
 
         def _end_stream():
             try:
-                self.txt_chat.configure(state="disabled")
+                self._append_stream_text("", end_turn=True)
             except Exception:
                 pass
-            self._spinner_stop()
+            try:
+                self._spinner_stop()
+            except Exception:
+                pass
 
         def worker():
             try:
                 stream = self.llm.chat(messages=messages, max_tokens=max_tokens,
                                        temperature=temperature, stream=True)
                 for chunk in stream:
-                    # Soporta Stop
                     if getattr(self, "stop_event", None) and self.stop_event.is_set():
-                        break
+                        self.after(0, _end_stream)  # re-habilita entrada, oculta spinner
+                        try:
+                            close = getattr(stream, "close", None)
+                            if callable(close): close()
+                        except Exception:
+                            pass
+                        try:
+                            canc = getattr(self.llm, "cancel", None)
+                            if callable(canc): canc()
+                        except Exception:
+                            pass
+                        return  # aborta el worker ya
 
                     token = ""
                     try:
