@@ -412,17 +412,43 @@ class LLMService:
         return "Documentos sugeridos (por palabras clave del índice):\n" + "\n".join(lines), hits
 
     # --------- RAG simplificado (hash-embeddings) ---------
-    def _rag_rows(self):
+    def _rag_rows(self, query: str | None = None, max_candidates: int = 1500):
+        import re, sqlite3
         con = sqlite3.connect(self.db_path, check_same_thread=False)
         try:
             cur = con.cursor()
-            try:
+
+            # tokens significativos de la query
+            toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{4,}", (query or ""))]
+            STOP = {"para", "con", "por", "unos", "unas", "este", "esta", "esto", "sobre", "desde", "hasta",
+                    "entre", "que", "como", "cual", "cuales", "de", "la", "el", "los", "las", "y", "o", "u",
+                    "del", "al"}
+            toks = [t for t in toks if t not in STOP][:4]  # máximo 4
+
+            if toks:
+                clauses, params = [], []
+                for tok in toks:
+                    pat = f"%{tok}%"
+                    clauses.append("c.text LIKE ?");
+                    params.append(pat)
+                    clauses.append("c.file_path LIKE ?");
+                    params.append(pat)
+                where = " WHERE " + " OR ".join(clauses)
+                sql = ("SELECT c.id, c.text, c.file_path, e.vec "
+                       "FROM chunks c JOIN embeddings e ON e.chunk_id=c.id" + where +
+                       " ORDER BY c.id DESC LIMIT ?")
+                params.append(int(max_candidates))
+                rows = cur.execute(sql, params).fetchall()
+            else:
                 rows = cur.execute(
-                    "SELECT c.id, c.text, c.file_path, e.vec FROM chunks c JOIN embeddings e ON e.chunk_id=c.id"
+                    "SELECT c.id, c.text, c.file_path, e.vec "
+                    "FROM chunks c JOIN embeddings e ON e.chunk_id=c.id "
+                    "ORDER BY c.id DESC LIMIT ?", (int(max_candidates),)
                 ).fetchall()
-            except Exception:
-                rows = []
+
             return rows
+        except Exception:
+            return []
         finally:
             con.close()
 
@@ -434,7 +460,8 @@ class LLMService:
         import re, os, struct
         from pathlib import Path
 
-        rows = self._rag_rows()
+        rows = self._rag_rows(query, max_candidates=1500)
+
         if not rows:
             return ""
 

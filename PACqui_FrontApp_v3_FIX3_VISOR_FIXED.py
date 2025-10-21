@@ -314,6 +314,12 @@ class AppRoot(tk.Tk):
 
         ensure_admin_password(self)
         self._autoload_model()
+        try:
+            if hasattr(self, "llm") and self.llm:
+                self.llm.warmup_async()
+        except Exception:
+            pass
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # tras self._autoload_model() o justo después de crear self.llm
@@ -4235,12 +4241,9 @@ class ChatWithLLM(ChatFrame):
 
     def _send_llm(self):
         from tkinter import messagebox
-        import threading, os, re
+        import os, re, time, threading
 
-        # 1) Lee el texto del usuario (¡ANTES de usar q.lower()!)
-        q = self.ent_input.get().strip()
-
-
+        q = (self.ent_input.get() or "").strip()
         if not q:
             try:
                 messagebox.showinfo(APP_NAME, "Escribe algo para enviar.")
@@ -4248,469 +4251,119 @@ class ChatWithLLM(ChatFrame):
                 pass
             return
 
-        # 2) Eco al chat y limpia el input
+        # eco del usuario + limpiar caja
         self._append_chat("Tú", q)
         try:
             self.ent_input.delete(0, "end")
         except Exception:
             pass
 
-        # 3) Saludos / small-talk (no toca índice)
         qlow = q.lower().strip()
         qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
 
-        if re.match(r"^(hola|buenas(?:\s+(tardes|noches))?|buenos\s+dias|hey|hello|gracias|ok|vale)\b", qlow_clean):
-            self._append_chat("PACqui",
-                                "¡Hola! 👋 Puedo buscar en tu repositorio y priorizar **PDF/DOCX**. "
-                                "Dime una palabra clave (p. ej., *pagos FEADER*) o escribe *solo pdf* / *solo docx* para filtrar.")
-            return
-
-
-
-        # 4) Actualiza filtro persistente por extensión segun texto del usuario
-        if hasattr(self, "_update_ext_filter"):
-            try:
-                self._update_ext_filter(qlow)
-            except Exception:
-                pass
-
-        # 5) Guardarraíl: si la consulta NO aporta señal y no hay hits previos, evita llamar al LLM
-        toks = re.findall(r"[a-z0-9áéíóúüñ]{3,}", qlow)
-        if len(toks) <= 2 and not getattr(self, "_hits", []):
-            self._append_chat("PACqui",
-                                "Para recomendar algo, necesito al menos una palabra clave concreta o que elijas una de las fuentes listadas.")
-            return
-
-        # (A partir de aquí CONTINÚA tu código — la siguiente línea debe ser exactamente:)
-
-
-        if self._user_asks_why_this(q):
-            # 2.1) Si hubo recomendación única previa → explica esa
-            if self._last_choice:
-                h = self._last_choice["hit"]
-                reasons = self._last_choice["reasons"]
-                import os
-                name = h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)"
-                path = h.get("path", "")
-                self._append_chat("PACqui", f"Elegí **{name}**\nRuta: {path}\nporque {reasons}.")
-                return
-
-            # 2.2) Si no hubo recomendación única → explica el porqué del último listado (top 3)
-            hits = getattr(self, "_hits", []) or []
-            if hits:
-                import os
-                last_q = getattr(self, "_last_query", "") or q
-                out = []
-                for h in hits[:3]:
-                    reasons = self._choice_reasons(h, last_q)
-                    name = h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "(sin nombre)"
-                    path = h.get("path", "")
-                    out.append(f"- **{name}**\n  Ruta: {path}\n  Motivo: {reasons}.")
-                self._append_chat("PACqui", "He priorizado estas fuentes por:\n\n" + "\n".join(out))
-
-                return
-
-            # 2.3) Fallback si no tengo contexto todavía
-            self._append_chat("PACqui",
-                              "Necesito primero listar o elegir alguna fuente para poder explicarte el motivo.")
-            return
-
-        # --- NUEVO: detección de saludo / ruido corto ---
-        # --- Detección de saludo / small-talk (no toca índice) ---
-        import re
-        qlow = q.lower().strip()
-        # Actualiza (o mantiene) el filtro de extensiones persistente
-        self._update_ext_filter(qlow)
-
-
-        # quita menciones al bot para que "hola pacqui" cuente como saludo
-        qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
-
-        # saludo laxo: "hola", "hola pacqui", "buenas", etc.
+        # saludos / small-talk sin índice
         if re.match(r"^(hola|buenas(?:\s+(tardes|noches))?|buenos\s+dias|hey|hello|gracias|ok|vale)\b", qlow_clean):
             self._append_chat("PACqui",
                               "¡Hola! 👋 Puedo buscar en tu repositorio y priorizar **PDF/DOCX**. "
-                              "Dime una palabra clave (p. ej., *pagos FEADER*) o escribe *solo pdf* / *solo docx* para filtrar.")
+                              "Dime una palabra clave (p. ej., *pagos FEADER*) o escribe *solo pdf* / *solo docx* para filtrar."
+                              )
             return
-
-        # small-talk típico: no consultes índice
-        if re.search(
-                r"\b(cómo\s+estás|como\s+estas|qué\s+tal|que\s+tal|cómo\s+te\s+va|como\s+te\s+va|qué\s+tal\s+todo|que\s+tal\s+todo)\b",
-                qlow_clean):
+        if re.search(r"\b(cómo\s+estás|como\s+estas|qué\s+tal|que\s+tal|cómo\s+te\s+va|como\s+te\s+va)\b", qlow_clean):
             self._append_chat("PACqui",
                               "¡Todo bien! 🙂 ¿En qué te ayudo del repositorio (puedo priorizar **PDF/DOCX**)?")
             return
 
-        # --- INTENCIÓN “elige/escoge/selecciona… el mejor” ---------------------------------
-        if self._user_wants_choice(q):
-            t0 = time.time()
-            # 1) Intenta recoger hits nuevos; si la frase de “elige” no aporta tokens, caemos a los previos
-            hits = self._collect_hits(
-                q, top_k=5, note_chars=240,
-                prefer_only=(sorted(self._ext_filter) if getattr(self, "_ext_filter", None) else None)
-            ) or []
+        # actualizar filtro por extensión si el usuario dice "solo pdf/docx"
+        try:
+            if hasattr(self, "_update_ext_filter"): self._update_ext_filter(qlow)
+        except Exception:
+            pass
 
-            # Si no hay hits nuevos pero venimos de un listado previo, usa los últimos
-            if not hits:
-                hits = getattr(self, "_hits", []) or []
-
-            dt_ms = int((time.time() - t0) * 1000)
-
-            if hits:
-                # pinta árbol lateral y guarda últimos hits
-                try:
-                    self._fill_sources_tree(hits)
-                except Exception:
-                    pass
-                self._hits = hits
-
-                try:
-                    if hits and hasattr(self, "_open_fuentes_panel"):
-                        # Solo la primera vez de la sesión o si estaba vacío
-                        if not getattr(self, "_fuentes_auto_opened", False):
-                            self._fuentes_auto_opened = True
-                            self._open_fuentes_panel()
-                except Exception:
-                    pass
-
-                best = self._pick_best_hit(hits, q)
-                if best:
-                    reasons = self._choice_reasons(best, q)
-                    self._last_choice = {"hit": best, "reasons": reasons, "query": q}
-                    self._last_query = q
-                    name = best.get("name") or (best.get("path") and os.path.basename(best["path"])) or "(sin nombre)"
-                    path = best.get("path", "")
-                    msg = f"Te recomiendo **{name}**.\nRuta: {path}\nMotivo: {reasons}."
-                    self._append_chat("PACqui", msg)
-                    return
-
-                # sin best claro: seguimos flujo normal
-
-            # si no hubo hits, continuamos con el flujo habitual (tendrá fallback)
-
-
-        # --- INTENCIÓN “¿tienes/hay/existen…?” (ahora sí, tras registrar la entrada) ---
-        import re
-        from pathlib import Path
-
-        qlow = q.lower()
-        if re.search(r"(tienes|hay|existen).*(documento|documentos|pdf|docx|base de datos|repositorio)", qlow):
-            # Filtros de extensión pedidos explícitamente
-            prefer = None
-            if "solo pdf" in qlow:
-                prefer = [".pdf"]
-            elif "solo docx" in qlow:
-                prefer = [".docx", ".doc"]
-            # Prioridad al filtro persistente del chat (si está activo)
-            if getattr(self, "_ext_filter", None):
-                prefer = sorted(self._ext_filter)
-
-
-            t0 = time.time()
-            hits = self._collect_hits(q, top_k=8, note_chars=240, prefer_only=prefer) or []
-            dt_ms = int((time.time() - t0) * 1000)
-
-            # pintar árbol lateral y guardar últimos hits
-            try:
-                self._fill_sources_tree(hits)
-            except Exception:
-                pass
-            self._hits = hits
-            # NEW: si el usuario dio términos fuertes (p.ej. "seresco") y ninguno aparece, invalida hits
-            import re, os
-            ql = (q or "").lower()
-            toks = re.findall(r"[a-z0-9]{3,}", ql)
-            GENERIC = {
-                "documento", "documentos", "doc", "docs", "pdf", "docx", "archivo", "archivos",
-                "base", "datos", "repositorio", "sistema", "proceso", "procesos",
-                "nuevo", "nueva", "tecnico", "tecnicos", "incorporacion", "onboarding",
-                "proyecto", "proyectos", "lanzadera", "ticketing", "severidad", "analisis",
-                "requerimiento", "requerimientos"
-            }
-            strong = [t for t in toks if t not in GENERIC and len(t) >= 5]
-            if strong and hits:
-                def _blob(h):
-                    return (" ".join([
-                        (h.get("name") or "").lower(),
-                        (h.get("path") or "").lower(),
-                        (h.get("keywords") or "").lower(),
-                        (h.get("note") or "").lower()
-                    ]))
-
-                if not any(any(t in _blob(h) for t in strong) for h in hits):
-                    hits = []
-                    self._hits = []
-
-            try:
-                self.app._log("query_hits", query=q, hits=len(hits), ms=dt_ms)
-            except Exception:
-                pass
-
-            # construir bloques de "Observaciones" y "Rutas" desde el ÍNDICE SQLite
-            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=5, max_obs_chars=220)
-
-            titles = [h.get("name") or "" for h in hits]
-            lead = self._persona_line_from_llm(q, titles, n=len(titles)) if hits else \
-                "No veo resultados claros aún. ¿Probamos con otra palabra clave o acotamos a *solo pdf*/*solo docx*?"
-
-            if hits:
-                try:
-                    db_name = Path(self.app.data.db_path).name
-                except Exception:
-                    db_name = "index_cache.sqlite"
-                foot = f"\n\n— Origen: índice {db_name} · {len(hits)} aciertos · {dt_ms} ms."
-                msg = f"{lead}\n\nObservaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}{foot}"
-            else:
-                msg = lead
-            self._last_query = q
-            self._append_chat("PACqui", msg)
-            return
-
-        # Asegura el patch de índice (no rompe si no está)
-        _ensure_rag_patch()
-
-        # 1) Recuperación para pintar el panel de fuentes desde YA
-        hits = self._collect_hits(q, top_k=5, note_chars=240) or []
+        # pintar fuentes sugeridas YA (ligero)
+        hits = self._collect_hits(
+            q, top_k=5, note_chars=220,
+            prefer_only=(sorted(self._ext_filter) if getattr(self, "_ext_filter", None) else None)
+        ) or []
         self._hits = hits
         self._last_query = q
-
         try:
             self._fill_sources_tree(hits)
         except Exception:
             pass
 
-        # 2) Responder con LLM ANCLADO AL CONTEXTO (si hay modelo y no es "solo índice")
-        if self.llm.is_loaded() and not self.notes_only:
-            self._spinner_start()
-
-            def worker():
-                saved_qa = False
-
-                try:
-                    # 1) Contexto (ÍNDICE + RAG)
-                    idx_ctx, idx_hits = self.llm.build_index_context(q, top_k=5, max_note_chars=220)
-                    rag_q = q
-                    if getattr(self, "_ext_filter", None):
-                        rag_q = q + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
-                    rag_ctx = self.llm._rag_retrieve(rag_q, k=6, max_chars=750)
-
-                    has_idx = bool((idx_ctx or "").strip())
-                    has_rag = bool((rag_ctx or "").strip())
-
-
-                    # 2) Si NO hay NINGÚN contexto → salida determinista (tono cercano + sugerencia PDF/DOCX)
-                    if not has_idx and not has_rag:
-                        rutas = []
-                        src = hits or []
-                        for s in src[:3]:
-                            name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
-                            rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
-                        msg = ""
-                        # Diagnóstico del índice y sugerencias
-                        try:
-                            with self.app.data._connect() as con:
-                                kw = con.execute("SELECT COUNT(1) FROM doc_keywords").fetchone()[0] or 0
-                                nt = con.execute("SELECT COUNT(1) FROM doc_notes").fetchone()[0] or 0
-                                ff = con.execute("SELECT COUNT(1) FROM files").fetchone()[0] or 0
-                        except Exception:
-                            kw = nt = ff = 0
-
-                        try:
-                            top_kw = [t for t, _ in self.app.data.keywords_top(limit=6)]
-                        except Exception:
-                            top_kw = []
-
-                        filtro_txt = ""
-                        if getattr(self, "_ext_filter", None):
-                            filtro_txt = " (filtro activo: " + ", ".join(sorted(ext.lstrip(".") for ext in self._ext_filter)) + ")"
-
-                        if (kw + nt + ff) == 0:
-                            msg = (
-                                "No encuentro contenido porque el **índice está vacío**.\n\n"
-                                "→ Ve a *Admin ▸ Índice* y carga el índice desde SQLite o ejecuta un escaneo inicial.\n"
-                            )
-                        else:
-                            msg = (
-                                f"No he localizado fragmentos suficientemente relevantes{filtro_txt}.\n\n"
-                                "Puedes afinar con una palabra clave concreta"
-                                + (" o quitar el filtro con *quitar filtro*" if filtro_txt else "")
-                                + "."
-                            )
-
-
-
-
-
-                    # 3) Reglas duras según el modo (con RAG vs. solo índice)
-                    if has_rag:
-                        base_sys = (
-                            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-                            "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
-                            "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español. "
-                            "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
-                        )
-                        header_user = (
-                            "INSTRUCCIONES: responde a la pregunta con 2–4 frases fundamentadas en los FRAGMENTOS. "
-                            "Incluye citas [n] en las frases que usen datos concretos."
-                        )
-                    else:
-                        base_sys = (
-                            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-                            "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
-                            "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español. "
-                            "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
-                        )
-                        header_user = (
-                            "INSTRUCCIONES: resume brevemente la relevancia de los documentos del [ÍNDICE] para la pregunta. "
-                            "No añadas contenido que no esté en esas observaciones."
-                        )
-
-                    # 4) Ensamblar contexto y recortar a presupuesto
-                    contexto = ""
-                    if has_idx:
-                        contexto += "[ÍNDICE]\n" + idx_ctx.strip() + "\n\n"
-                    if has_rag:
-                        contexto += "[FRAGMENTOS]\n" + rag_ctx.strip() + "\n\n"
-
-                    ctx_max = getattr(self.llm, "ctx", 2048)
-                    tok_out = max(128, min(256, int(ctx_max * 0.12)))
-                    tok_in_budget = max(256, ctx_max - tok_out - 64)
-
-                    def _tok(s: str) -> int:
-                        return self.llm.count_tokens(s)
-
-                    def _recorta_ctx(ctx_text: str, budget: int) -> str:
-                        if _tok(ctx_text) <= budget:
-                            return ctx_text
-                        if "[FRAGMENTOS]" in ctx_text:  # recorta primero RAG
-                            head, frag = ctx_text.split("[FRAGMENTOS]", 1)
-                            frag = "[FRAGMENTOS]" + frag
-                            lines = frag.splitlines()
-                            while lines and _tok(head + "\n".join(lines)) > budget:
-                                lines = lines[:-4]
-                            ctx_text = head + "\n".join(lines)
-                        while _tok(ctx_text) > budget and "\n" in ctx_text:
-                            ctx_text = "\n".join(ctx_text.splitlines()[:-4])
-                        return ctx_text
-
-                    contexto = _recorta_ctx(contexto, tok_in_budget)
-
-                    # 5) Mensajes y llamada al modelo
-                    messages = [
-                        {"role": "system", "content": base_sys},
-                        {"role": "user", "content": f"{header_user}\n\n{contexto}PREGUNTA: {q}"}
-                    ]
-                    # === STREAMING REAL (corto-circuito) ===
-                    obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
-                    suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
-                    self._stream_llm_with_fallback(messages, max_tokens=tok_out, temperature=0.1, suffix=suffix)
-                    return  # <- importante: sal del worker para no ejecutar la rama no-stream
-
-                    out = self.llm.chat(messages=messages, temperature=0.1, max_tokens=tok_out, stream=False)
-                    content = ((out.get("choices") or [{}])[0].get("message") or {}).get("content", "") \
-                              or ((out.get("choices") or [{}])[0].get("text", "") or "")
-                    text_llm = (content or "").strip()
-
-                    # 6) Añadir rutas deterministas (para ambos modos)
-                    obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
-                    final = text_llm
-                    # === Guardado directo del Q&A (fallback sin monkey-patch) ===
-
-                    try:
-                        from meta_store import MetaStore
-                        # misma BD que usa la app
-                        dbp = getattr(getattr(self, "app", None), "data", None)
-                        dbp = getattr(dbp, "db_path", "index_cache.sqlite")
-                        ms = MetaStore(db_path=str(dbp))
-
-                        # 1) pregunta del usuario
-                        q_text = ""
-                        if "q" in locals() and isinstance(q, str):
-                            q_text = q
-                        elif getattr(self, "_last_query", None):
-                            q_text = self._last_query
-                        else:
-                            try:
-                                q_text = (self.txt_in.get("1.0", "end") or "").strip()
-                            except Exception:
-                                q_text = ""
-
-                        # 2) respuesta final (ajusta 'answer_var' a tu variable: answer/final/out_text…)
-                        answer_var = final  # <-- si tu variable se llama 'final', cámbialo aquí
-
-                        # 3) fuentes/hits (si existen)
-                        srcs = []
-                        for h in (getattr(self, "_hits", []) or []):
-                            srcs.append({
-                                "path": h.get("path") or h.get("ruta") or "",
-                                "name": h.get("name") or h.get("nombre") or "",
-                                "score": float(h.get("score") or 0),
-                            })
-
-                        # 4) modelo
-                        model_name = getattr(getattr(self.app, "llm", None), "model_path", "")
-                        if not model_name:
-                            try:
-                                model_name = self.app.lbl_model.cget("text")
-                            except Exception:
-                                model_name = ""
-
-                        # 5) persistir
-                        ms.log_qa(query=q_text, answer=answer_var, model=str(model_name), sources=srcs)
-                        saved_qa = True
-
-                    except Exception as e:
-                        print("[QA-LOG] fallo (fallback):", e)
-                    # === fin guardado Q&A ===
-
-                    if rutas_block.strip():
-                        final += f"\n\nRutas sugeridas:\n\n{rutas_block}"
-
-                    # ... después de calcular text_llm y rutas_block ...
-                    # --- NUEVO: línea de cortesía muy breve al inicio ---
-                    try:
-                        titles = [h.get("name") or "" for h in (hits or [])]
-                        lead = self._persona_line_from_llm(q, titles, n=len(titles))
-                        if lead:
-                            final = lead + "\n\n" + final
-                    except Exception:
-                        pass
-
-                    # === Guardado del Q&A en Históricos (fallback a prueba de bombas) ===
-                    if not saved_qa:
-                    # (deja dentro TODO el bloque que construye srcs y llama a ms.log_qa)
-
-                        try:
-                            ms = MetaStore(self.app.data.db_path)
-                            # Toma hasta 5 fuentes de 'hits' para dejar rastro útil
-                            srcs = []
-                            for h in ((hits if 'hits' in locals() else getattr(self, "_hits", [])) or [])[:5]:
-                                srcs.append({
-                                    "name": (h.get("name") or (h.get("path") and os.path.basename(h["path"])) or "")[:200],
-                                    "path": h.get("path", "")[:800],
-                                    "note": (h.get("note") or "")[:500],
-                                    "score": float(h.get("score") or 0),
-                                })
-
-                            ms.log_qa(query=(q or ""), answer=(final or ""), model=str(model_name), sources=srcs)
-
-                        except Exception as e:
-                            print(f"[QA-LOG] fallo (fallback): {e}")
-
-                        self.after(0, lambda: self._append_chat("PACqui", final))
-                finally:
-                    self.after(0, self._spinner_stop)
-
-            threading.Thread(target=worker, daemon=True).start()
+        # modo “Solo índice” o sin modelo → respuesta determinista
+        if (not self.llm.is_loaded()) or self.notes_only:
+            try:
+                self._reply_with_observations(q)
+            except Exception:
+                self._append_chat("PACqui", "No hay modelo o está en modo 'Solo índice'.")
             return
 
-        # 3) Si no hay modelo, salida determinista (sin LLM)
-        obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=220)
-        final = (
-            "Aquí tienes las fuentes que encajan. ¿Te abro alguna?\n\n"
-            f"Observaciones (índice):\n\n{obs_block}\n\nRutas sugeridas:\n\n{rutas_block}"
-        )
-        self._append_chat("PACqui", final)
+        # worker: construye contexto corto y lanza streaming
+        def worker():
+            try:
+                # CONTEXTO del índice (ligero)
+                idx_ctx, _ = self.llm.build_index_context(q, top_k=5, max_note_chars=200)
+
+                # CONTEXTO RAG (limitado y filtrado por extensión si procede)
+                rag_q = q + (" " + " ".join(ext.lstrip(".") for ext in self._ext_filter)) if getattr(self,
+                                                                                                     "_ext_filter",
+                                                                                                     None) else q
+                rag_ctx = self.llm._rag_retrieve(rag_q, k=4, max_chars=480)  # << más corto
+
+                has_idx = bool(idx_ctx.strip())
+                has_rag = bool(rag_ctx.strip())
+
+                # si no hay contexto, salida amable con rutas
+                if not (has_idx or has_rag):
+                    rutas = []
+                    for s in (hits or [])[:3]:
+                        name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
+                        rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
+                    msg = "Aquí tienes las fuentes que encajan. ¿Te abro alguna?" + (
+                        "\n\nRutas sugeridas:\n\n" + "\n".join(rutas) if rutas else "")
+                    self.after(0, lambda: self._append_chat("PACqui", msg))
+                    return
+
+                # Mensajes con presupuesto reducido (respuesta ágil en CPU)
+                base_sys = (
+                    "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
+                    "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
+                    "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español. "
+                    "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
+                )
+                header_user = ("INSTRUCCIONES: responde en 2–4 frases apoyándote en los FRAGMENTOS/ÍNDICE. "
+                               "Incluye citas [n] cuando uses datos concretos.")
+
+                contexto = ""
+                if has_idx: contexto += "[ÍNDICE]\n" + idx_ctx.strip() + "\n\n"
+                if has_rag: contexto += "[FRAGMENTOS]\n" + rag_ctx.strip() + "\n\n"
+
+                messages = [
+                    {"role": "system", "content": base_sys},
+                    {"role": "user", "content": f"{header_user}\n\n{contexto}PREGUNTA: {q}"}
+                ]
+
+                # presupuesto: máximo ~96 tokens de salida
+                tok_out = 96
+
+                # rutas debajo de la respuesta
+                obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=200)
+                suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
+
+                # lanzar streaming real
+                self.after(0, lambda: self._stream_llm_with_fallback(messages, max_tokens=tok_out, temperature=0.1,
+                                                                     suffix=suffix))
+
+            except Exception as e:
+                self.after(0, lambda: self._append_chat("PACqui", f"[error] {e}"))
+
+        # spinner mientras preparamos el contexto
+        try:
+            self.set_status("Preparando contexto (RAG + Índice)…")
+        except Exception:
+            pass
+        threading.Thread(target=worker, daemon=True).start()
 
     def _fill_sources_tree(self, hits):
         tv = getattr(self, "tv", None)
