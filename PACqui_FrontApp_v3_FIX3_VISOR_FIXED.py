@@ -3,7 +3,8 @@ import os, json, threading, tkinter as tk
 import time
 import traceback
 from datetime import datetime
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
+from types import MethodType
 from pathlib import Path
 from meta_store import MetaStore
 from ui_fuentes import SourcesPanel
@@ -21,6 +22,27 @@ from pacqui_llm_service_FIX3 import LLMService
 # --- Robust import of organizer module + auto-patch index-context ---
 
 # ---- Carga del Organizador por ruta fija (sin ruidos) ----
+# --- KW helpers (es) para Históricos ----------------------------------------
+import re
+SPANISH_STOPWORDS = {
+    "de","la","el","los","las","y","o","u","del","al","que","como","cual","cuales",
+    "en","con","por","para","entre","sobre","desde","hasta","este","esta","esto",
+    "un","una","unos","unas","es","son","se","a","no","si","sin","más","menos"
+}
+def _kw_slug(s: str) -> str:
+    s = re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", "-", s.strip().lower()).strip("-")
+    return re.sub(r"-{2,}", "-", s) or "concepto"
+
+def _kw_extract_es(text: str, max_terms: int = 30) -> list[str]:
+    toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]{3,}", (text or "").lower())
+    toks = [t for t in toks if t not in SPANISH_STOPWORDS and len(t) >= 3]
+    # frecuencia simple
+    freq = {}
+    for t in toks: freq[t] = freq.get(t, 0) + 1
+    out = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [w for (w,_) in out[:max_terms]]
+# ---------------------------------------------------------------------------
+
 def _import_organizador():
     """
     Carga el módulo del Visor aceptando dos nombres:
@@ -1403,6 +1425,12 @@ class AdminPanel(ttk.Notebook):
         self.txt_q.pack(fill="x")
         self.txt_a = tk.Text(t_det, height=14, wrap="word");
         self.txt_a.pack(fill="both", expand=True, pady=(6, 0))
+        # tras crear self.txt_q y self.txt_a (los Text de Detalle):
+        for _t in (self.txt_q, self.txt_a):
+            _t.tag_configure("kw", background="#FFF4CC")  # resaltado suave
+            _t.tag_configure("kw_active", background="#FFE08A")  # al pasar/usar
+            _t.bind("<Button-3>", lambda e, w=_t: self._hist_ctx_on_right_click(e, w))
+
         row = ttk.Frame(t_det);
         row.pack(fill="x", pady=(6, 0))
         ttk.Label(row, text="Valoración (0–10):").pack(side="left")
@@ -1410,7 +1438,14 @@ class AdminPanel(ttk.Notebook):
         ttk.Spinbox(row, from_=0, to=10, textvariable=self.var_rate, width=4).pack(side="left", padx=6)
         self.var_note = tk.StringVar()
         ttk.Entry(row, textvariable=self.var_note, width=60).pack(side="left", padx=6)
+        ttk.Button(
+            row,
+            text="Refrescar KW",
+            command=lambda: getattr(self, "_hist_refresh_keywords", lambda: None)()
+        ).pack(side="left", padx=(6, 0))
+
         ttk.Button(row, text="Guardar valoración", command=lambda: _save_rating()).pack(side="right")
+        #ttk.Button(bar_detalle, text="Refrescar KW", command=self._hist_refresh_keywords).pack(side="left", padx=(6, 0))
 
         # ---- Subpestaña Conceptos (CRUD) ----
         t_con = ttk.Frame(right, padding=8);
@@ -1422,6 +1457,15 @@ class AdminPanel(ttk.Notebook):
         ttk.Entry(upper, textvariable=self.var_con_f, width=30).pack(side="left", padx=6)
         ttk.Button(upper, text="Buscar", command=lambda: _reload_concepts()).pack(side="left")
         ttk.Button(upper, text="Nuevo", command=lambda: _edit_concept(None)).pack(side="left", padx=6)
+        ttk.Button(upper, text="Refrescar", command=lambda: _reload_concepts()).pack(side="left", padx=6)
+        ttk.Button(upper, text="Importar desde keywords…", command=lambda: _import_concepts_from_kws()).pack(
+            side="left", padx=6)
+
+        def _import_concepts_from_kws():
+            ms = MetaStore(self.app.data.db_path)
+            n = ms.bootstrap_concepts_from_keywords(limit=500)  # ajusta el límite si quieres
+            messagebox.showinfo(APP_NAME, f"Importados {n} conceptos desde keywords.")
+            _reload_concepts()
 
         self.tv_con = ttk.Treeview(t_con, columns=("id", "slug", "title", "tags"), show="headings", height=14)
         for c, t, w, a in (
@@ -1430,6 +1474,35 @@ class AdminPanel(ttk.Notebook):
             self.tv_con.column(c, width=w, anchor=a)
         self.tv_con.pack(fill="both", expand=True, pady=(6, 4))
         self.tv_con.bind("<Double-1>", lambda _e: _edit_concept(_sel_con()))
+
+        # --- menú contextual en la tabla Conceptos ---
+        menu_con = tk.Menu(t_con, tearoff=0)
+
+        def _del_concept():
+            cid = _sel_con()
+            if not cid:
+                return
+            if not messagebox.askyesno(APP_NAME, "¿Eliminar el concepto seleccionado?"):
+                return
+            MetaStore(self.app.data.db_path).delete_concept(cid)
+            _reload_concepts()
+
+        menu_con.add_command(label="Editar…", command=lambda: _edit_concept(_sel_con()))
+        menu_con.add_command(label="Eliminar", command=_del_concept)
+        menu_con.add_separator()
+        menu_con.add_command(label="Nuevo", command=lambda: _edit_concept(None))
+        menu_con.add_command(label="Refrescar", command=lambda: _reload_concepts())
+
+        def _show_con_menu(e):
+            iid = self.tv_con.identify_row(e.y)
+            if iid:
+                self.tv_con.selection_set(iid)
+            try:
+                menu_con.tk_popup(e.x_root, e.y_root)
+            finally:
+                menu_con.grab_release()
+
+        self.tv_con.bind("<Button-3>", _show_con_menu)
 
         # --- helpers de datos ---
         ms = MetaStore(root.data.db_path)
@@ -1460,6 +1533,8 @@ class AdminPanel(ttk.Notebook):
                     self.var_note.set(rat[1] or "")
             except Exception:
                 pass
+            self._hist_refresh_keywords()
+
 
         def _save_rating():
             sel = self.tv_hist.selection()
@@ -1629,6 +1704,167 @@ class AdminPanel(ttk.Notebook):
         # Arranque
         _reload();
         _reload_concepts()
+
+        # --- Históricos: extraer, resaltar y menú contextual ------------------------
+        def _hist_refresh_keywords(self):
+            try:
+                q = self.txt_q.get("1.0", "end-1c")
+                a = self.txt_a.get("1.0", "end-1c")
+            except Exception:
+                return
+            # limpia marcas previas
+            for t in (self.txt_q, self.txt_a):
+                try:
+                    t.tag_remove("kw", "1.0", "end")
+                    t.tag_remove("kw_active", "1.0", "end")
+                except Exception:
+                    pass
+            terms = list(dict.fromkeys(_kw_extract_es(q + " " + a, max_terms=30)))
+            for widget in (self.txt_q, self.txt_a):
+                start = "1.0"
+                while True:
+                    # buscamos cada término por separado
+                    found_any = False
+                    for term in terms:
+                        pos = widget.search(rf"\m{term}\M", start, "end", nocase=True, regexp=True)
+                        if pos:
+                            end = f"{pos}+{len(term)}c"
+                            widget.tag_add("kw", pos, end)
+                            start = end
+                            found_any = True
+                            break
+                    if not found_any:
+                        break
+
+        def _hist_ctx_on_right_click(self, event, widget):
+            index = widget.index(f"@{event.x},{event.y}")
+            tags = widget.tag_names(index)
+            if "kw" not in tags:
+                return  # no keyword debajo del cursor
+
+            # delimitar palabra bajo cursor
+            word_start = widget.search(r"\m", index, backwards=True, regexp=True) or index
+            word_end = widget.search(r"\M", index, regexp=True) or index
+            term = widget.get(word_start, word_end).strip()
+            if not term:
+                return
+
+            menu = tk.Menu(widget, tearoff=0)
+            menu.add_command(label=f"Crear/editar concepto «{term}»",
+                             command=lambda t=term: self._hist_open_concept_from_term(t))
+            menu.add_command(label="Añadir fuente (ruta → concepto)…",
+                             command=lambda t=term: self._hist_add_source_to_concept(t))
+            menu.add_command(label="Añadir alias…",
+                             command=lambda t=term: self._hist_add_alias_to_concept(t))
+            menu.add_separator()
+            menu.add_command(label="Eliminar concepto…",
+                             command=lambda t=term: self._hist_delete_concept(t))
+            menu.add_separator()
+            menu.add_command(label="Preguntar al chat (Solo índice)",
+                             command=lambda t=term: self._hist_send_only_index(t))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        def _hist_find_concept(self, term: str):
+            ms = MetaStore(self.app.data.db_path)
+            slug = _kw_slug(term)
+            c = ms.get_concept_by_slug(slug)
+            if c:
+                return c
+            found = ms.list_concepts(term, limit=1)
+            return found[0] if found else None
+
+        def _hist_open_concept_from_term(self, term: str):
+            ms = MetaStore(self.app.data.db_path)
+            c = self._hist_find_concept(term)
+            if not c:
+                slug = _kw_slug(term)
+                title = term.capitalize()
+                cid = ms.upsert_concept(slug, title, body="", tags=term, aliases=[], concept_id=None)
+                c = ms.get_concept(cid)
+            # Llama a la función local _edit_concept, no a un método inexistente:
+            _edit_concept(c["id"])
+
+        def _hist_add_source_to_concept(self, term: str):
+            ms = MetaStore(self.app.data.db_path)
+            c = self._hist_find_concept(term)
+            if not c:
+                # créalo al vuelo
+                slug = _kw_slug(term);
+                title = term.capitalize()
+                cid = ms.upsert_concept(slug, title, body="", tags=term, aliases=[], concept_id=None)
+                c = ms.get_concept(cid)
+            path = filedialog.askopenfilename(title="Selecciona la fuente (documento)")
+            if not path: return
+            try:
+                ms.save_concept_sources(
+                    c["id"],
+                    [{"path": path, "weight": 1.4, "note": f"desde histórico: {term}"}]
+                )
+                # peso alto
+                messagebox.showinfo(APP_NAME, "Fuente añadida al concepto.")
+                # si tienes lista de conceptos en la UI, refresca:
+                if hasattr(self, "_refresh_concepts_list"): self._refresh_concepts_list()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"No se pudo guardar la fuente:\n{e}")
+
+        def _hist_add_alias_to_concept(self, term: str):
+            ms = MetaStore(self.app.data.db_path)
+            c = self._hist_find_concept(term)
+            if not c:
+                messagebox.showwarning(APP_NAME, "Primero crea el concepto.")
+                return
+            alias = simpledialog.askstring("Alias", "Nuevo alias (usa coma para varios):", parent=self)
+            if not alias: return
+            aliases = [a.strip() for a in alias.split(",") if a.strip()]
+            try:
+                ms.upsert_concept(c["slug"], c["title"], c.get("body", ""), c.get("tags", ""),
+                                  aliases=aliases, concept_id=c["id"])
+                messagebox.showinfo(APP_NAME, "Alias guardado.")
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"No se pudo guardar el alias:\n{e}")
+
+        def _hist_delete_concept(self, term: str):
+            ms = MetaStore(self.app.data.db_path)
+            c = self._hist_find_concept(term)
+            if not c:
+                messagebox.showinfo(APP_NAME, "No existe concepto para ese término.")
+                return
+            if not messagebox.askyesno(APP_NAME, f"¿Eliminar el concepto «{c['title']}» y sus fuentes/alias?"):
+                return
+            try:
+                ms.delete_concept(c["id"])
+                messagebox.showinfo(APP_NAME, "Concepto eliminado.")
+                if hasattr(self, "_refresh_concepts_list"): self._refresh_concepts_list()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"No se pudo eliminar:\n{e}")
+
+        def _hist_send_only_index(self, term: str):
+            # Lanza el término al chat con “Solo índice (sin LLM)”
+            try:
+                self.asst.var_notes_only.set(True)  # activa el check
+                self.asst.ent_input.delete(0, "end")
+                self.asst.ent_input.insert(0, term)
+                self.asst._on_send()
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"No se pudo enviar al chat:\n{e}")
+        # ---------------------------------------------------------------------------
+        # === ENLACE DE HELPERS A self (imprescindible) ===
+        from types import MethodType
+        self._hist_refresh_keywords = MethodType(_hist_refresh_keywords, self)
+        self._hist_ctx_on_right_click = MethodType(_hist_ctx_on_right_click, self)
+        self._hist_find_concept = MethodType(_hist_find_concept, self)
+        self._hist_open_concept_from_term = MethodType(_hist_open_concept_from_term, self)
+        self._hist_add_source_to_concept = MethodType(_hist_add_source_to_concept, self)
+        self._hist_add_alias_to_concept = MethodType(_hist_add_alias_to_concept, self)
+        self._hist_delete_concept = MethodType(_hist_delete_concept, self)
+        self._hist_send_only_index = MethodType(_hist_send_only_index, self)
+
+
+        # Para poder refrescar la tabla de conceptos desde esos helpers:
+        self._refresh_concepts_list = _reload_concepts
 
     def _er_collect(self):
         """
@@ -4210,6 +4446,8 @@ class ChatWithLLM(ChatFrame):
             return "\n\n".join(parts).strip()
 
         concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
+        if concept_block:
+            parts += ["[CONCEPTOS CLAVE]", concept_block]
 
         # ❌ (bloque parts/join eliminado aquí)
 

@@ -27,6 +27,51 @@ class MetaStore:
         self._lock = threading.RLock()
         self._ensure_schema()
 
+
+
+    def delete_concept_by_slug(self, slug: str):
+        row = self.get_concept_by_slug(slug)
+        if row:
+            self.delete_concept(row["id"])
+
+    def get_concept(self, concept_id: int) -> dict | None:
+        with self._connect() as con:
+            r = con.execute("SELECT id, slug, title, body, tags FROM concepts WHERE id=?",
+                            (int(concept_id),)).fetchone()
+        return None if not r else {"id": r[0], "slug": r[1], "title": r[2], "body": r[3], "tags": r[4]}
+
+    def get_concept_by_slug(self, slug: str) -> dict | None:
+        with self._connect() as con:
+            r = con.execute("SELECT id, slug, title, body, tags FROM concepts WHERE lower(slug)=lower(?)",
+                            (slug,)).fetchone()
+        return None if not r else {"id": r[0], "slug": r[1], "title": r[2], "body": r[3], "tags": r[4]}
+
+    def _slugify(self, s: str) -> str:
+        import re
+        slug = re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", "-", (s or "").strip().lower()).strip("-")
+        return re.sub(r"-{2,}", "-", slug) or "concepto"
+
+    def bootstrap_concepts_from_keywords(self, limit: int | None = None) -> int:
+        """Crea conceptos (si no existen) a partir de doc_keywords agrupadas por término."""
+        with self._connect() as con:
+            rows = con.execute("""
+                SELECT lower(keyword) AS kw, COUNT(*) AS n
+                FROM doc_keywords
+                GROUP BY lower(keyword)
+                ORDER BY n DESC, kw
+            """).fetchall()
+        n_created = 0
+        for i, (kw, _n) in enumerate(rows, 1):
+            if limit and i > limit:
+                break
+            slug = self._slugify(kw)
+            try:
+                self.upsert_concept(slug, kw.capitalize(), body="", tags=kw, aliases=[kw])
+                n_created += 1
+            except Exception:
+                pass
+        return n_created
+
     # ---------- low level ----------
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
