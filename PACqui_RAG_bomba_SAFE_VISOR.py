@@ -3761,7 +3761,7 @@ class LLMChatDialog(tk.Toplevel):
         if not self._in_stream:
             self.txt_chat.insert("end", "PACqui:\n", ("who",))
             self._in_stream = True
-        self.txt_chat.insert("end", norm)
+        self.txt_chat.insert("end", txt)
         if end_turn:
             self.txt_chat.insert("end", "\n")
             self._in_stream = False
@@ -4128,13 +4128,11 @@ class LLMChatDialog(tk.Toplevel):
             stream = None
             try:
                 try:
-                    stream = self.model.self.app.llm.chat(
-                        messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
-                    )
+                    stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
                 except TypeError:
-                    stream = self.model.self.app.llm.chat(
-                        messages=msgs, temperature=temp, max_tokens=max_t, stream=True
-                    )
+                    stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
             except Exception:
                 stream = None
 
@@ -4163,13 +4161,11 @@ class LLMChatDialog(tk.Toplevel):
             if not final and not self.stop_event.is_set():
                 try:
                     try:
-                        resp = self.model.self.app.llm.chat(
-                            messages=msgs, temperature=temp, max_tokens=max_t, stream=False, cache_prompt=True
-                        )
+                        resp = stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
                     except TypeError:
-                        resp = self.model.self.app.llm.chat(
-                            messages=msgs, temperature=temp, max_tokens=max_t, stream=False
-                        )
+                        resp = stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
                     ch0 = (resp.get("choices") or [{}])[0]
                     final = ch0.get("message", {}).get("content", "") or ch0.get("text", "") or ""
                 except Exception:
@@ -4214,11 +4210,21 @@ class LLMChatDialog(tk.Toplevel):
             self.after(0, lambda: self.btn_stop.configure(state="disabled"))
 
     def _stop(self):
-        """Callback del botón Detener (evita AttributeError)."""
         try:
-            self.stop_event.set()
+            if hasattr(self, "stop_event"):
+                self.stop_event.set()
+            if hasattr(self, "llm") and hasattr(self.llm, "cancel"):
+                try:
+                    self.llm.cancel()
+                except Exception:
+                    pass
         except Exception:
             pass
+        finally:
+            try:
+                self.btn_stop.configure(state="disabled")
+            except Exception:
+                pass
 
     def _on_close(self):
         try:
@@ -4242,7 +4248,7 @@ class LLMChatDialog(tk.Toplevel):
         if not self._in_stream:
             self.txt_chat.insert("end", "PACqui:\n", ("who",))
             self._in_stream = True
-        self.txt_chat.insert("end", norm)
+        self.txt_chat.insert("end", txt)
         if end_turn:
             self.txt_chat.insert("end", "\n")
             self._in_stream = False
@@ -4404,13 +4410,11 @@ class LLMChatDialog(tk.Toplevel):
             stream = None
             try:
                 try:
-                    stream = self.model.self.app.llm.chat(
-                        messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
-                    )
+                    stream = stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
                 except TypeError:
-                    stream = self.model.self.app.llm.chat(
-                        messages=msgs, temperature=temp, max_tokens=max_t, stream=True
-                    )
+                    stream = stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
             except Exception:
                 stream = None
     
@@ -4439,13 +4443,11 @@ class LLMChatDialog(tk.Toplevel):
             if not final and not self.stop_event.is_set():
                 try:
                     try:
-                        resp = self.model.self.app.llm.chat(
-                            messages=msgs, temperature=temp, max_tokens=max_t, stream=False, cache_prompt=True
-                        )
+                        resp = stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
                     except TypeError:
-                        resp = self.model.self.app.llm.chat(
-                            messages=msgs, temperature=temp, max_tokens=max_t, stream=False
-                        )
+                        resp = stream = self.app.llm.chat(messages=msgs, temperature=0.2, max_tokens=320, stream=True)
+
                     ch0 = (resp.get("choices") or [{}])[0]
                     final = ch0.get("message", {}).get("content", "") or ch0.get("text", "") or ""
                 except Exception:
@@ -4488,12 +4490,7 @@ class LLMChatDialog(tk.Toplevel):
             self.after(0, lambda: messagebox.showerror(APP_NAME, f"Error en inferencia:\n{e}"))
         finally:
             self.after(0, lambda: self.btn_stop.configure(state="disabled"))
-    def _stop(self):
-        """Callback del botón Detener (evita AttributeError)."""
-        try:
-            self.stop_event.set()
-        except Exception:
-            pass
+
 
     def _on_close(self):
         try:

@@ -37,7 +37,7 @@ class LLMService:
         # Hilos: usa todos menos 1 si hay >=6; si no, todos
         n_threads = int(os.getenv("PACQUI_THREADS", str(cores - 1 if cores >= 6 else cores)))
         # Batch: tope razonable para CPU; sobreescribible por env
-        n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "512")))
+        n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "256")))
         # CPU-only
         n_gpu_layers = 0
         # I/O rápido
@@ -59,9 +59,17 @@ class LLMService:
         elif "phi" in name:
             chat_fmt = "phi3"
 
+        # --- Idempotencia: si ya está cargado lo mismo, retorna rápido ---
+        if self.model and self.model_path == model_path and int(self.ctx) == int(ctx or 2048):
+            return
+
+        # Reset flags de warmup
+        self._warmed = False
+        self._warming = False
+
         self.model_path = model_path
         self.ctx = int(ctx or 2048)
-        # Reserva CPU para la UI
+
         perf = self._cpu_autotune(self.ctx)
         self.model = Llama(
             model_path=self.model_path,
@@ -73,7 +81,6 @@ class LLMService:
             use_mmap=perf["use_mmap"],
             vocab_only=False,
             chat_format=chat_fmt,
-            # use_mlock es opcional en algunas builds/OS; si tu build lo soporta:
             use_mlock=perf["use_mlock"],
         )
 
@@ -113,6 +120,15 @@ class LLMService:
                 pass
 
     def _get_embedder(self):
+        import os
+        if os.getenv("PACQUI_FORCE_HASH", "1") == "1":
+            # siempre hash-embedder
+            def _encode_hash(text: str, _dim=256):
+                return self._hash_embedder(text, dim=_dim)
+
+            self._embedder_cached = {"encode": _encode_hash, "dim": 256, "backend": "hash", "sig": "hash:256"}
+            return self._embedder_cached
+
         # cache
         if hasattr(self, "_embedder_cached") and self._embedder_cached:
             return self._embedder_cached
@@ -441,7 +457,7 @@ class LLMService:
         return "Documentos sugeridos (por palabras clave del índice):\n" + "\n".join(lines), hits
 
     # --------- RAG simplificado (hash-embeddings) ---------
-    def _rag_rows(self, query: str | None = None, max_candidates: int = 1500):
+    def _rag_rows(self, query: str | None = None, max_candidates: int = 600):
         import re, sqlite3
         con = sqlite3.connect(self.db_path, check_same_thread=False)
         try:
@@ -489,7 +505,7 @@ class LLMService:
         import re, os, struct
         from pathlib import Path
 
-        rows = self._rag_rows(query, max_candidates=1500)
+        rows = self._rag_rows(query, max_candidates=600)
 
         if not rows:
             return ""

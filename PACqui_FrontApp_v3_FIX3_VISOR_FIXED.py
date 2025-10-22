@@ -443,6 +443,9 @@ class AppRoot(tk.Tk):
 
         try:
             self.llm.load(mp, ctx=ctx)
+            # tras cargar el gguf:
+            self.llm.warmup_async()
+
             # dentro de _autoload_model(), justo después de self.llm.load(...):
             import threading
             threading.Thread(target=self.llm.warmup_async, daemon=True).start()
@@ -4082,6 +4085,40 @@ class ChatWithLLM(ChatFrame):
 
         super().__init__(master, data)
 
+    def _log_qa_if_possible(self, full_answer: str):
+        try:
+            from meta_store import MetaStore
+            dbp = self.app.data.db_path if hasattr(self.app, "data") else getattr(self.llm, "db_path", None)
+            if not dbp:
+                return
+            ms = MetaStore(dbp)
+            q = getattr(self, "_last_query", "") or ""
+
+            srcs = []
+            for h in (getattr(self, "_last_hits", None) or [])[:5]:
+                if not isinstance(h, dict):
+                    continue
+                srcs.append({
+                    "path": (h.get("path") or "").strip(),
+                    "name": h.get("name"),
+                    "note": h.get("note"),
+                    "score": float(h.get("score") or 0.0),
+                })
+
+            took_ms = None
+            try:
+                import time
+                t0 = getattr(self, "_turn_start_ts", None)
+                if t0:
+                    took_ms = int((time.time() - t0) * 1000)
+            except Exception:
+                pass
+
+            ms.log_qa(query=q, answer=(full_answer or ""), model="PACqui-LLM",
+                      sources=srcs, tokens_in=None, tokens_out=None, took_ms=took_ms)
+        except Exception:
+            pass
+
     def _user_asks_why_this(self, q: str) -> bool:
         import re
         ql = (q or "").lower()
@@ -4486,6 +4523,44 @@ class ChatWithLLM(ChatFrame):
         msgs = [{"role": "system", "content": sys_full}, {"role": "user", "content": user_text}]
         return msgs, hits, max_final
 
+    def _log_qa_if_possible(self, full_answer: str):
+        """Guarda la Q/A en históricos (MetaStore) usando la DB del front."""
+        try:
+            from meta_store import MetaStore
+            dbp = self.app.data.db_path if hasattr(self.app, "data") else getattr(self.llm, "db_path", None)
+            if not dbp:
+                return
+            ms = MetaStore(dbp)
+            q = getattr(self, "_last_query", "") or ""
+
+            # mapear hits -> objetos compatibles con qa_sources (path, name, note, score)
+            srcs = []
+            for h in (getattr(self, "_last_hits", None) or [])[:5]:
+                if not isinstance(h, dict):
+                    continue
+                srcs.append({
+                    "path": (h.get("path") or "").strip(),
+                    "name": h.get("name"),
+                    "note": h.get("note"),
+                    "score": float(h.get("score") or 0.0),
+                })
+
+            # tokens y tiempo si los tenemos
+            took_ms = None
+            try:
+                import time
+                t0 = getattr(self, "_turn_start_ts", None)
+                if t0:
+                    took_ms = int((time.time() - t0) * 1000)
+            except Exception:
+                pass
+
+            # ¡OJO!: la firma es query=..., no "question"
+            ms.log_qa(query=q, answer=(full_answer or ""), model="PACqui-LLM",
+                      sources=srcs, tokens_in=None, tokens_out=None, took_ms=took_ms)
+        except Exception:
+            pass
+
     def _send_llm(self):
         from tkinter import messagebox
         import os, re, time, threading
@@ -4533,6 +4608,7 @@ class ChatWithLLM(ChatFrame):
         ) or []
         self._hits = hits
         self._last_query = q
+        self._last_hits = hits
         try:
             self._fill_sources_tree(hits)
         except Exception:
@@ -4602,8 +4678,14 @@ class ChatWithLLM(ChatFrame):
                 suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
 
                 # lanzar streaming real
-                self.after(0, lambda: self._stream_llm_with_fallback(messages, max_tokens=tok_out, temperature=0.1,
-                                                                     suffix=suffix))
+                # lanzar streaming real (pasamos la query para fallback determinista)
+                # lanzar streaming real
+                self._turn_start_ts = time.time()  # ← AÑADE ESTA LÍNEA (ya importas time al inicio del método)
+                self.after(0, lambda: self._stream_llm_with_fallback(
+                    messages, max_tokens=tok_out, temperature=0.1, suffix=suffix))
+
+
+
 
             except Exception as e:
                 self.after(0, lambda: self._append_chat("PACqui", f"[error] {e}"))
@@ -4956,7 +5038,7 @@ class ChatWithLLM(ChatFrame):
             self._in_stream = True
 
         try:
-            self.txt_chat.insert("end", norm)
+            self.txt_chat.insert("end", txt)
             if end_turn:
                 self.txt_chat.insert("end", "\n")
                 self._in_stream = False
@@ -4969,21 +5051,24 @@ class ChatWithLLM(ChatFrame):
         except Exception:
             pass
 
+        self._last_query = q
+        self._last_hits = hits  # para guardar fuentes
+
     def _stream_llm_with_fallback(self, messages, max_tokens=256, temperature=0.2, suffix: str = ""):
-        # abre turno y spinner
+        import threading, time
 
+        # UI: spinner on y limpiamos stop_event
         self._spinner_start()
-
-        # reinicia la bandera de parada
         if getattr(self, "stop_event", None):
             self.stop_event.clear()
 
-        # inserción segura desde el hilo worker
-        def push(txt: str, end: bool = False):
+        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False}
+        out_buf = []
+
+        def push_text(txt: str, end=False):
             try:
                 self._append_stream_text(txt, end_turn=end)
             except Exception:
-                # fallback defensivo
                 try:
                     self.txt_chat.configure(state="normal")
                     self.txt_chat.insert("end", str(txt))
@@ -4994,7 +5079,7 @@ class ChatWithLLM(ChatFrame):
                 except Exception:
                     pass
 
-        def _end_stream():
+        def finish_ui():
             try:
                 self._append_stream_text("", end_turn=True)
             except Exception:
@@ -5004,57 +5089,106 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
+        # --- apertura del stream en hilo separado + evento ---
+        stream_holder = {"obj": None, "err": None}
+        opened_evt = threading.Event()
+
+        def open_stream():
+            try:
+                stream_holder["obj"] = self.llm.chat(
+                    messages=messages, max_tokens=max_tokens, temperature=temperature, stream=True
+                )
+            except Exception as e:
+                stream_holder["err"] = e
+            finally:
+                opened_evt.set()
+
+        threading.Thread(target=open_stream, daemon=True).start()
+
+        # --- watchdog: cubre apertura y primer token ---
+        def watchdog():
+            TIMEOUT = 20.0
+            while not self.stop_event.is_set():
+                time.sleep(1.0)
+                if (not opened_evt.is_set()) or (state["tokens"] == 0):
+                    if time.time() - state["last_ts"] > TIMEOUT:
+                        state["timed_out"] = True
+                        try:
+                            if hasattr(self.llm, "cancel"):
+                                self.llm.cancel()
+                        except Exception:
+                            pass
+                        try:
+                            self.stop_event.set()
+                        except Exception:
+                            pass
+                        break
+                else:
+                    break
+
+        threading.Thread(target=watchdog, daemon=True).start()
+
         def worker():
             try:
-                stream = self.llm.chat(messages=messages, max_tokens=max_tokens,
-                                       temperature=temperature, stream=True)
+                # 1) esperar apertura o timeout y hacer fallback si algo falla
+                if not opened_evt.wait(22.0) or stream_holder["err"] is not None:
+                    try:
+                        resp = self.llm.chat(messages=messages, max_tokens=max_tokens,
+                                             temperature=temperature, stream=False)
+                        ch0 = (resp.get("choices") or [{}])[0]
+                        txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or ""
+                    except Exception as e:
+                        txt = f"[error] {e}"
+                    if suffix:
+                        txt = txt + "\n\n" + suffix
+                    out_buf.append(txt)
+                    self.after(0, push_text, txt, True)
+                    return
+
+                stream = stream_holder["obj"]
+
+                # 2) consumir stream
                 for chunk in stream:
                     if getattr(self, "stop_event", None) and self.stop_event.is_set():
-                        self.after(0, _end_stream)  # re-habilita entrada, oculta spinner
-                        try:
-                            close = getattr(stream, "close", None)
-                            if callable(close): close()
-                        except Exception:
-                            pass
-                        try:
-                            canc = getattr(self.llm, "cancel", None)
-                            if callable(canc): canc()
-                        except Exception:
-                            pass
-                        return  # aborta el worker ya
-
-                    token = ""
+                        break
                     try:
                         ch0 = (chunk or {}).get("choices", [{}])[0]
                         delta = ch0.get("delta") or {}
-                        token = delta.get("content") or ch0.get("text") or ""
+                        tok = delta.get("content") or ch0.get("text") or ""
                     except Exception:
-                        token = ""
+                        tok = ""
+                    if not tok:
+                        continue
+                    state["tokens"] += 1
+                    state["last_ts"] = time.time()
+                    out_buf.append(tok)
+                    self.after(0, push_text, tok, False)
 
-                    if token:
-                        self.after(0, push, token, False)
-
-                # Sufijo (rutas) antes de cerrar
+                # 3) sufijo de rutas y cierre visual
                 if suffix:
-                    self.after(0, push, ("\n\n" + suffix), False)
-
-                # Cierre de turno
-                self.after(0, push, "", True)
+                    out_buf.append("\n\n" + suffix)
+                    self.after(0, push_text, "\n\n" + suffix, False)
+                self.after(0, push_text, "", True)
 
             except Exception as e:
-                # Fallback sin streaming
+                # fallback final sin streaming
                 try:
                     resp = self.llm.chat(messages=messages, max_tokens=max_tokens,
                                          temperature=temperature, stream=False)
-                    txt = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "") \
-                          or ((resp.get("choices") or [{}])[0].get("text", "") or f"[error] {e}")
-                    self.after(0, push, txt + ("\n\n" + suffix if suffix else "") + "\n", True)
-                except Exception as ee:
-                    self.after(0, push, f"\n[error] {ee}\n", True)
+                    ch0 = (resp.get("choices") or [{}])[0]
+                    txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or f"[error] {e}"
+                except Exception:
+                    txt = f"[error] {e}"
+                out_buf.append(txt)
+                self.after(0, push_text, txt + ("\n\n" + suffix if suffix else ""), True)
             finally:
-                self.after(0, _end_stream)
+                # registrar histórico y apagar spinner
+                try:
+                    self._log_qa_if_possible("".join(out_buf))
+                except Exception:
+                    pass
+                self.after(0, finish_ui)
 
-        import threading
         threading.Thread(target=worker, daemon=True).start()
 
 
