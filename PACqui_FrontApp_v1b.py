@@ -204,7 +204,7 @@ class ChatFrame(ttk.Frame):
         self._hits = []
         self._build_styles()
         self._build_ui()
-        self._load_chips()
+        self.progress_reset("Listo. Escribe una pregunta y te iré contando los pasos.")
 
     def _build_styles(self):
         style = ttk.Style()
@@ -222,15 +222,14 @@ class ChatFrame(ttk.Frame):
         paned = ttk.Panedwindow(self, orient="horizontal")
         paned.pack(fill="both", expand=True)
 
-        # Left pane: keywords
-        left = ttk.Frame(paned, padding=(10,10))
+        # Left pane: progress console (sustituye "Palabras clave")
+        left = ttk.Frame(paned, padding=(10, 10))
         paned.add(left, weight=1)
-        ttk.Label(left, text="Palabras clave", style="Header.TLabel").pack(anchor="w", pady=(0,6))
-        self.chips = ScrollableFrame(left)
-        self.chips.pack(fill="both", expand=True, pady=(0,8))
-        row2 = ttk.Frame(left)
-        row2.pack(fill="x")
-        ttk.Button(row2, text="Buscar palabra clave…", command=self._ask_keyword).pack(side="left")
+        ttk.Label(left, text="Generación de respuesta", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+
+        self.txt_progress = tk.Text(left, height=18, wrap="word")
+        self.txt_progress.configure(font=("Segoe UI", 10), state="disabled")
+        self.txt_progress.pack(fill="both", expand=True, pady=(0, 8))
 
         # Center pane: chat
         center = ttk.Frame(paned, padding=(10,10))
@@ -300,6 +299,25 @@ class ChatFrame(ttk.Frame):
     def set_status(self, text: str):
         self.status.config(text=text)
 
+    def progress_reset(self, header: str | None = "Preparando respuesta…"):
+        try:
+            self.txt_progress.configure(state="normal")
+            self.txt_progress.delete("1.0", "end")
+            if header:
+                self.txt_progress.insert("end", header + "\n\n")
+            self.txt_progress.configure(state="disabled")
+        except Exception:
+            pass
+
+    def progress(self, msg: str):
+        try:
+            self.txt_progress.configure(state="normal")
+            self.txt_progress.insert("end", f"• {msg}\n")
+            self.txt_progress.see("end")
+            self.txt_progress.configure(state="disabled")
+        except Exception:
+            pass
+
     def _load_chips(self):
         # Clear chips
         for w in list(self.chips.inner.children.values()):
@@ -311,14 +329,16 @@ class ChatFrame(ttk.Frame):
             btn.pack(anchor="w", pady=2, fill="x")
 
     def _chip_click(self, kw: str):
-        self.ent_input.delete(0, "end")
+        self._clear_user_text()
+
         self.ent_input.insert(0, kw)
         self._on_send()
 
     def _ask_keyword(self):
         kw = simpledialog.askstring(APP_NAME, "Palabra clave:", parent=self.winfo_toplevel())
         if kw:
-            self.ent_input.delete(0, "end")
+            self._clear_user_text()
+
             self.ent_input.insert(0, kw)
             self._on_send()
 
@@ -327,7 +347,8 @@ class ChatFrame(ttk.Frame):
         if not text:
             return
         self._append_chat("Tú", text)
-        self.ent_input.delete(0, "end")
+        self._clear_user_text()
+
         # Suggest sources
         self._populate_sources(text)
 
