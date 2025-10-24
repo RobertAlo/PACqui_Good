@@ -412,6 +412,53 @@ class ChatFrame(ttk.Frame):
         txt.see("end")
         txt.configure(state="disabled")
 
+    def _append_stream_text(self, txt: str, end_turn: bool = False):
+        # 1) Validaciones e instrumentación básicas
+        try:
+            assert hasattr(self, "txt_chat"), "txt_chat no existe en este frame"
+            assert self.txt_chat is not None, "txt_chat es None"
+        except Exception:
+            return
+
+        # Normaliza (si tu AppRoot tiene normalizador)
+        try:
+            norm = self.app._normalize_text(txt) if hasattr(self.app, "_normalize_text") else str(txt)
+        except Exception:
+            norm = str(txt)
+
+        # Abrir el Text
+        try:
+            self.txt_chat.configure(state="normal")
+        except Exception:
+            pass
+
+        # Encabezado “PACqui:” solo la primera vez del turno
+        try:
+            if not hasattr(self, "_in_stream"):
+                self._in_stream = False
+            if not self._in_stream:
+                self._in_stream = True
+                self.txt_chat.insert("end", "PACqui:\n", ("who",))
+                self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
+        except Exception:
+            pass
+
+        # Cuerpo
+        try:
+            self.txt_chat.insert("end", norm)
+            if end_turn:
+                self.txt_chat.insert("end", "\n")
+                self._in_stream = False
+            self.txt_chat.see("end")
+        except Exception:
+            pass
+
+        # Cerrar el Text
+        try:
+            self.txt_chat.configure(state="disabled")
+        except Exception:
+            pass
+
     def _populate_sources(self, text: str):
         self.tv.delete(*self.tv.get_children())
         self.txt_note.delete("1.0", "end")

@@ -4475,22 +4475,17 @@ class ChatWithLLM(ChatFrame):
 
     def _compose_system_budgeted(self, user_text: str, max_tokens: int = 256):
         base_sys = (
-            "Eres PACqui. Tono cercano y profesional. PRIMERO ofrece 2–3 frases claras y útiles.\n"
-            "DESPUÉS, si hay [Contexto (índice)], lista rutas (viñetas) con nombre y ruta EXACTAMENTE como aparecen.\n"
-            "PROHIBIDO inventar rutas, títulos o documentos; si no hay [Contexto (índice)] no listes rutas.\n"
-            "Si hay [Contexto del repositorio], explica y CITA con [n] y muestra la ruta.\n"
-            "Si el contexto es insuficiente, dilo con amabilidad y sugiere cómo afinar la búsqueda.\n"
-            "Nunca menciones documentos que no estén en el [Contexto (índice)] ni introduzcas temas no pedidos."
+            "Eres PACqui. Español neutro. 1) Da 2–3 frases útiles. "
+            "2) Si hay [Contexto (índice)], lista rutas en viñetas EXACTAS. "
+            "3) Si hay [Contexto del repositorio], explica citando [n]. "
+            "No inventes ni menciones rutas no dadas. Si el contexto no basta, dilo y sugiere cómo afinar."
         )
 
         # Contexto inicial (auto-escala con el ctx del modelo)
         ctx = int(getattr(self.llm, "ctx", 2048) or 2048)
-        if ctx >= 4096:
-            idx_top, idx_note_chars = 4, 220
-            rag_k, rag_frag_chars = 3, 360
-        else:
-            idx_top, idx_note_chars = 3, 150
-            rag_k, rag_frag_chars = 1, 320
+        # Preset súper contenido para CPU: muy pocas rutas y RAG mínimo
+        idx_top, idx_note_chars = 2, 140
+        rag_k, rag_frag_chars = 1, 220
 
         def shrink(text: str, max_chars: int) -> str:
             t = (text or "").strip()
@@ -4511,6 +4506,20 @@ class ChatWithLLM(ChatFrame):
             rag_q = user_text + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
         # >>> ESTA LÍNEA ES LA QUE FALTABA <<<
         rag_ctx = self.llm._rag_retrieve(rag_q, k=rag_k, max_chars=rag_frag_chars)
+        # --- NUEVO: bloques que usa build_system_text() ---
+        try:
+            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(
+                hits, max_items=3, max_obs_chars=200
+            )
+        except Exception:
+            obs_block, rutas_block = "", ""
+
+        try:
+            concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5) or ""
+        except Exception:
+            concept_block = ""
+
+        # --------------------------------------------------
 
         def build_system_text():
             parts = [base_sys]
@@ -4526,9 +4535,9 @@ class ChatWithLLM(ChatFrame):
                 parts += ["[Contexto del repositorio]", rag_ctx]
             return "\n\n".join(parts).strip()
 
-        concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
-        if concept_block:
-            parts += ["[CONCEPTOS CLAVE]", concept_block]
+        #concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
+        #if concept_block:
+            #parts += ["[CONCEPTOS CLAVE]", concept_block]
 
         # ❌ (bloque parts/join eliminado aquí)
 
@@ -4563,7 +4572,7 @@ class ChatWithLLM(ChatFrame):
             sys_full = build_system_text()
             used = used_effective()
 
-        max_final = max(64, min(resp_budget, ctx - used - 64))
+        max_final = min(80, max(48, min(resp_budget, ctx - used - 64)))
         msgs = [{"role": "system", "content": sys_full}, {"role": "user", "content": user_text}]
         return msgs, hits, max_final
 
@@ -4674,20 +4683,17 @@ class ChatWithLLM(ChatFrame):
         # worker: construye contexto corto y lanza streaming
         def worker():
             try:
-                # CONTEXTO del índice (ligero)
-                # CONTEXTO del índice (ligero)
-                idx_ctx, _ = self.llm.build_index_context(q, top_k=5, max_note_chars=200)
+                # Prompt “budgetado” (siempre construye índice + RAG corto y ajusta tamaño)
+                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=96)
 
-                # Solo si el índice viene “flojo”, usamos RAG (más caro)
-                rag_ctx = ""
-                if not idx_ctx.strip():
-                    rag_q = q + (" " + " ".join(ext.lstrip(".") for ext in self._ext_filter)) if getattr(self,
-                                                                                                         "_ext_filter",
-                                                                                                         None) else q
-                    rag_ctx = self.llm._rag_retrieve(rag_q, k=3, max_chars=360)  # un poco más corto aún
+                # rutas debajo de la respuesta (para coexistir con el modelo)
+                obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=180)
+                suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
 
-                has_idx = bool(idx_ctx.strip())
-                has_rag = bool(rag_ctx.strip())
+                # lanzar streaming real
+                self._turn_start_ts = time.time()
+                self.after(0, lambda: self._stream_llm_with_fallback(messages, max_tokens=tok_out, temperature=0.1,
+                                                                     suffix=suffix))
 
                 # si no hay contexto, salida amable con rutas
                 if not (has_idx or has_rag):
@@ -4739,7 +4745,8 @@ class ChatWithLLM(ChatFrame):
 
 
             except Exception as e:
-                self.after(0, lambda: self._append_chat("PACqui", f"[error] {e}"))
+                _msg = f"[error] {type(e).__name__}: {e}"
+                self.after(0, lambda m=_msg: self._append_chat("PACqui", m))
 
         # spinner mientras preparamos el contexto
         try:
@@ -5066,80 +5073,204 @@ class ChatWithLLM(ChatFrame):
         self._append_chat("PACqui", msg)
 
     def _append_stream_text(self, txt: str, end_turn: bool = False):
+        # 1) Validaciones e instrumentación
+        try:
+            assert hasattr(self, "txt_chat"), "txt_chat no existe en este frame"
+            assert self.txt_chat is not None, "txt_chat es None"
+        except Exception as e:
+            try:
+                self.progress(f"_append_stream_text: {e}")
+            except Exception:
+                pass
+            return
+
         # Normaliza (si tu AppRoot tiene normalizador)
         try:
             norm = self.app._normalize_text(txt) if hasattr(self.app, "_normalize_text") else str(txt)
-        except Exception:
-            norm = str(txt)
-
-        try:
-            self.txt_chat.configure(state="normal")
-        except Exception:
-            pass
-
-        # Etiqueta de turno (solo la primera vez)
-        if not hasattr(self, "_in_stream"):
-            self._in_stream = False
-        if not self._in_stream:
+        except Exception as e:
             try:
-                self.txt_chat.insert("end", "PACqui:\n", ("who",))
-                self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
+                self.progress(f"_append_stream_text normalize: {e}")
             except Exception:
                 pass
-            self._in_stream = True
+            norm = str(txt)
 
+        # Abrir el Text para edición
         try:
-            self.txt_chat.insert("end", txt)
+            self.txt_chat.configure(state="normal")
+        except Exception as e:
+            try:
+                self.progress(f"_append_stream_text configure(normal): {e}")
+            except Exception:
+                pass
+
+        # Etiqueta de turno (solo la primera vez por respuesta)
+        try:
+            if not hasattr(self, "_in_stream"):
+                self._in_stream = False
+            if not self._in_stream:
+                # marca “estamos en stream” y pinta el encabezado de PACqui
+                self._in_stream = True
+                self.txt_chat.insert("end", "PACqui:\n", ("who",))
+                self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
+        except Exception as e:
+            try:
+                self.progress(f"_append_stream_text header: {e}")
+            except Exception:
+                pass
+
+        # Cuerpo
+        try:
+            self.txt_chat.insert("end", norm)
             if end_turn:
                 self.txt_chat.insert("end", "\n")
                 self._in_stream = False
             self.txt_chat.see("end")
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self.progress(f"_append_stream_text insert: {e}")
+            except Exception:
+                pass
 
+        # Cerrar el Text
         try:
             self.txt_chat.configure(state="disabled")
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self.progress(f"_append_stream_text configure(disabled): {e}")
+            except Exception:
+                pass
 
     def _stream_llm_with_fallback(self, messages, max_tokens=256, temperature=0.2, suffix: str = ""):
-        import threading
-        import time
-
+        import threading, time, queue
         # UI: arranque
         self._spinner_start()
         if getattr(self, "stop_event", None):
             self.stop_event.clear()
+        q = queue.Queue()
+        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False}
+        out_buf = []
 
-        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False}
-        out_buf: list[str] = []
-
-        # Helpers UI (progreso y pintado)
         def _p(msg: str):
             try:
                 self.after(0, lambda: self.progress(msg))
             except Exception:
                 pass
 
-        def _push_text(txt: str, end: bool = False):
+        # Pintado en el hilo principal (drain de la queue)
+        def _paint_loop():
+            painted = False
             try:
-                self._append_stream_text(txt, end_turn=end)
-            except Exception:
-                try:
-                    self.txt_chat.configure(state="normal")
-                    self.txt_chat.insert("end", str(txt))
-                    if end:
-                        self.txt_chat.insert("end", "\n")
-                    self.txt_chat.see("end")
-                finally:
+                while True:
+                    tok = q.get_nowait()
+                    if tok is None:
+                        state["done"] = True
+                        break
+                    out_buf.append(tok)
                     try:
-                        self.txt_chat.configure(state="disabled")
+                        self._append_stream_text(tok)
+                        painted = True
+                    except Exception:
+                        # último recurso
+                        try:
+                            self.txt_chat.configure(state="normal")
+                            self.txt_chat.insert("end", tok);
+                            self.txt_chat.see("end")
+                            self.txt_chat.configure(state="disabled")
+                            painted = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            finally:
+                if not state["done"]:
+                    self.after(15, _paint_loop)
+                else:
+                    # cierre UI
+                    try:
+                        self._append_stream_text("", end_turn=True)
+                    except Exception:
+                        pass
+                    try:
+                        self._spinner_stop()
+                    except Exception:
+                        pass
+                    try:
+                        t0 = getattr(self, "_turn_start_ts", None)
+                        if t0: self.progress(f"Listo ({int((time.time() - t0) * 1000)} ms).")
+                    except Exception:
+                        pass
+                    try:
+                        self._log_qa_if_possible("".join(out_buf))
                     except Exception:
                         pass
 
-        def _finish_ui():
+        self.after(0, _paint_loop)
+
+        # Fallback sin streaming (bloquea SOLO el worker)
+        def _fallback(reason: str):
+            _p(f"Fallback sin streaming ({reason})…")
+            import threading, time
+
+            # Estima tokens para decidir un deadline razonable [45 .. 180] s
             try:
-                self._append_stream_text("", end_turn=True)
+                est_in = sum(self.llm.count_tokens((m.get("content") or "")) for m in (messages or []))
+            except Exception:
+                est_in = 0
+            DEADLINE = max(45.0, min(180.0, 12.0 + 0.08 * float(est_in)))
+            _p(f"Fallback: tokens_in≈{est_in}, deadline≈{int(DEADLINE)}s.")
+
+            result = {"txt": None, "err": None, "done": False}
+
+            def _call():
+                try:
+                    # Si el motivo fue típico de stream roto, AÚN ASÍ intentamos 1 llamada no-stream con deadline
+                    resp = self.llm.chat(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=False,
+                    )
+                    ch0 = (resp.get("choices") or [{}])[0]
+                    txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or ""
+                    result["txt"] = txt if txt else ""
+                except Exception as e:
+                    result["err"] = str(e)
+                finally:
+                    result["done"] = True
+
+            t0 = time.time()
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+
+            while not result["done"] and (time.time() - t0) < DEADLINE:
+                time.sleep(0.25)
+
+            if not result["done"]:
+                # Cancelamos y devolvemos mensaje amable + rutas
+                try:
+                    if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
+                        self.llm.cancel()
+                except Exception:
+                    pass
+                txt = "Ahora mismo no he podido generar respuesta del modelo."
+            else:
+                txt = result["txt"] if result["txt"] is not None else f"[error] {result['err']}"
+
+            if suffix:
+                txt = (txt or "") + ("\n\n" + suffix)
+
+            # PINTADO GARANTIZADO por la ruta estable del chat
+            try:
+                self.after(0, lambda: self._append_chat("PACqui", txt or ""))
+            except Exception:
+                try:  # último recurso
+                    self._append_chat("PACqui", txt or "")
+                except Exception:
+                    pass
+
+            # CIERRE DEL TURNO (por si el worker quedó bloqueado):
+            try:
+                state["done"] = True
             except Exception:
                 pass
             try:
@@ -5147,80 +5278,92 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
             try:
-                t0 = getattr(self, "_turn_start_ts", None)
-                if t0:
-                    dt = int((time.time() - t0) * 1000)
-                    self.after(0, lambda: self.progress(f"Listo ({dt} ms)."))
+                t0s = getattr(self, "_turn_start_ts", None)
+                if t0s:
+                    self.progress(f"Listo ({int((time.time() - t0s) * 1000)} ms).")
             except Exception:
                 pass
 
-        # Fallback sin streaming (SIEMPRE pinta)
-        def _fallback(reason: str):
-            _p(f"Fallback sin streaming ({reason})…")
-            t0f = time.time()
+            # Guarda histórico
             try:
-                resp = self.llm.chat(
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=False,
-                )
-                ch0 = (resp.get("choices") or [{}])[0]
-                txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or ""
-            except Exception as e:
-                txt = f"[error] {e}"
-            if suffix:
-                txt += "\n\n" + suffix
-            out_buf.append(txt)
-            self.after(0, _push_text, txt, True)
-            _p(f"Fallback completado ({int((time.time() - t0f) * 1000)} ms).")
+                out_buf.append(txt or "")
+                self._log_qa_if_possible("".join(out_buf))
+            except Exception:
+                pass
 
-        # Watchdog: apertura + 1er token
+            try:
+                q.put(None)  # sentinel de cierre para el _paint_loop
+            except Exception:
+                pass
+
+            _p("Fallback completado.")
+
+        # --- Fallback guardado: evita dobles lanzamientos y lo ejecuta en hilo aparte ---
+        _fallback_lock = threading.Lock()
+
+        def _start_fallback(reason: str):
+            with _fallback_lock:
+                if state.get("fallback_started"):
+                    return
+                state["fallback_started"] = True
+            threading.Thread(target=lambda: _fallback(reason), daemon=True).start()
+
+        # Watchdog primer token
         def _watchdog():
-            TIMEOUT = 45.0 if not getattr(self.llm, "_warmed", False) else 15.0
+            # 1) Estimar tokens de entrada para dar margen realista al 1er token (CPU)
+            try:
+                est_in = sum(self.llm.count_tokens((m.get("content") or "")) for m in (messages or []))
+            except Exception:
+                est_in = 0
+
+            # 2) Timeout dinámico (más generoso):   base + 0.12s por token   [min 35/60 .. max 240]
+            #    - si está “caliente” (self.llm._warmed): mínimo 35s
+            #    - si está “frío”: mínimo 60s
+            base_min = 35.0 if getattr(self.llm, "_warmed", False) else 60.0
+            TIMEOUT = max(base_min, min(240.0, 15.0 + 0.12 * float(est_in)))
+            _p(f"Watchdog: tokens_in≈{est_in}, timeout≈{int(TIMEOUT)}s.")
+
+            # 3) Vigilancia simple: si no llega 1er token, cancelar stream y lanzar fallback
             while not self.stop_event.is_set():
                 time.sleep(1.0)
                 if state["tokens"] == 0 and (time.time() - state["last_ts"] > TIMEOUT):
                     state["timed_out"] = True
                     _p(f"Timeout {int(TIMEOUT)}s sin tokens → cancelando stream.")
                     try:
-                        if hasattr(self.llm, "cancel"):
+                        if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
                             self.llm.cancel()
                     except Exception:
                         pass
-                    self.stop_event.set()
+                    try:
+                        self.stop_event.set()
+                    except Exception:
+                        pass
+                    # >>> LLAMA SIEMPRE al fallback, aunque el worker se quede colgado
+                    _start_fallback("timeout")
                     break
 
         threading.Thread(target=_watchdog, daemon=True).start()
 
-        # Worker: abrir y CONSUMIR stream en el MISMO hilo; si no hay tokens → fallback
+        # Worker del stream
         def _worker():
             try:
                 _p("Abriendo stream del modelo…")
                 state["last_ts"] = time.time()
-
-                # 1) abrir stream aquí (mismo hilo que consume)
                 try:
-                    stream = self.llm.chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=True,
-                    )
+                    stream = self.llm.chat(messages=messages, max_tokens=max_tokens, temperature=temperature,
+                                           stream=True)
                     _p("Stream abierto ✅. Esperando primer token…")
                 except Exception as e:
                     _p(f"No se pudo abrir el stream: {e}")
-                    _fallback("apertura fallida")
+                    _start_fallback("apertura fallida")
                     return
 
-                # 2) consumir stream
                 for chunk in stream:
                     if getattr(self, "stop_event", None) and self.stop_event.is_set():
-                        # Si canceló el watchdog antes del primer token → haz fallback ahora
                         if state["tokens"] == 0:
-                            _fallback("timeout/cancel sin tokens")
+                            _start_fallback("cancel sin tokens")
                             return
-                        _p("Cancelado por usuario (tras recibir tokens).")
+                        _p("Cancelado por usuario (tras recibir tokens).");
                         break
 
                     try:
@@ -5239,28 +5382,15 @@ class ChatWithLLM(ChatFrame):
 
                     state["tokens"] += 1
                     state["last_ts"] = time.time()
-                    out_buf.append(tok)
-                    self.after(0, _push_text, tok, False)
+                    q.put(tok)
 
-                # 3) si hemos salido del bucle sin tokens → fallback
-                if state["tokens"] == 0 and (state["timed_out"] or self.stop_event.is_set()):
-                    _fallback("stream sin tokens")
+                if state["tokens"] == 0 and not state["timed_out"]:
+                    _start_fallback("stream sin tokens")
                     return
-
-                # 4) sufijo y cierre normal
-                if suffix:
-                    out_buf.append("\n\n" + suffix)
-                    self.after(0, _push_text, "\n\n" + suffix, False)
-                self.after(0, _push_text, "", True)
+                q.put(None)  # fin normal
 
             except Exception as e:
                 _fallback(f"error: {e}")
-            finally:
-                try:
-                    self._log_qa_if_possible("".join(out_buf))
-                except Exception:
-                    pass
-                self.after(0, _finish_ui)
 
         threading.Thread(target=_worker, daemon=True).start()
 
