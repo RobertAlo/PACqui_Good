@@ -58,7 +58,9 @@ def _import_organizador():
     # 1) Import directo por nombre (preferimos el VISOR)
     for name in (alt, primary):
         try:
-            return importlib.import_module(name)
+            mod = importlib.import_module(name)
+            if hasattr(mod, "OrganizadorFrame"):
+                return mod
         except Exception:
             pass
 
@@ -87,7 +89,8 @@ def _import_organizador():
             sys.modules[name] = mod
             assert spec.loader is not None
             spec.loader.exec_module(mod)  # type: ignore
-            return mod
+            if hasattr(mod, "OrganizadorFrame"):
+                return mod
 
     # 4) Error claro si no se encontró ninguno
     raise ImportError(
@@ -147,67 +150,20 @@ def _ensure_rag_patch():
 
 
 def _ensure_organizador_loaded():
-    """
-    Carga PACqui_RAG_bomba_SAFE (o *_VISOR) sin escanear todo el disco:
-    - Import directo si ya está en sys.path
-    - Busca SOLO en ubicaciones conocidas (env var + script dir + cwd + hasta 3 padres)
-      en formato archivo (.py) o paquete (__init__.py).
-    - Si no se encuentra, añade esas raíces a sys.path y reintenta.
-    """
-    import importlib, importlib.util, sys, os
+    """Garantiza que el módulo del Organizador esté importado y con alias estable."""
+    import sys
 
-    modname = "PACqui_RAG_bomba_SAFE"
-
-    # 1) Intento directo
-    try:
-        import importlib
-        importlib.import_module(modname)
+    existing = sys.modules.get("PACqui_RAG_bomba_SAFE")
+    if existing and hasattr(existing, "OrganizadorFrame"):
         return
-    except Exception:
-        pass
 
-    # 2) Raíces conocidas
-    roots = []
-    env = os.getenv("PACQUI_RAG_DIR", "")
-    if env: roots.append(env)
-    here = os.path.dirname(os.path.abspath(__file__))
-    roots.append(here)
-    roots.append(os.getcwd())
-    p = here
-    for _ in range(3):
-        p = os.path.dirname(p)
-        if p and p not in roots:
-            roots.append(p)
-
-    # 3) Probar archivos directos (SAFE y SAFE_VISOR)
-    candidates = []
-    for root in roots:
-        for rel in (
-            "PACqui_RAG_bomba_SAFE.py",
-            os.path.join("PACqui_RAG_bomba_SAFE", "__init__.py"),
-            "PACqui_RAG_bomba_SAFE_VISOR.py",
-            os.path.join("PACqui_RAG_bomba_SAFE_VISOR", "__init__.py"),
-        ):
-            cand = os.path.join(root, rel)
-            if os.path.exists(cand):
-                candidates.append(cand)
-
-    for cand in candidates:
-        try:
-            spec = importlib.util.spec_from_file_location(modname, cand)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[modname] = mod
-            assert spec.loader is not None
-            spec.loader.exec_module(mod)  # type: ignore
-            return
-        except Exception:
-            continue
-
-    # 4) Último intento: añadir raíces a sys.path y reimportar
-    for r in roots:
-        if r not in sys.path:
-            sys.path.append(r)
-    importlib.import_module(modname)
+    mod = _import_organizador()
+    # Asegura que podamos resolverlo por el nombre clásico incluso si proviene del *_VISOR
+    sys.modules.setdefault("PACqui_RAG_bomba_SAFE", mod)
+    if not hasattr(mod, "OrganizadorFrame"):
+        raise AttributeError(
+            "El módulo del visor se cargó, pero no expone OrganizadorFrame"
+        )
 
 
 
@@ -3484,8 +3440,7 @@ class AdminPanel(ttk.Notebook):
         # Fallback
         return time.time()
 
-    @staticmethod
-    def _coerce_event(ev):
+    def _coerce_event(self, ev):
         """Normaliza un evento a dict con claves ts(float), level, src, msg."""
         if not isinstance(ev, dict):
             return {
@@ -3494,7 +3449,7 @@ class AdminPanel(ttk.Notebook):
                 "src": "app",
                 "msg": str(ev),
             }
-        ts = _parse_ts_to_epoch(ev.get("ts"))
+        ts = self._parse_ts_to_epoch(ev.get("ts"))
         level = (ev.get("level") or ev.get("lvl") or "INFO").upper()
         if level not in ("DEBUG", "INFO", "WARN", "WARNING", "ERROR", "SUCCESS"):
             level = "INFO"
@@ -4533,6 +4488,15 @@ class ChatWithLLM(ChatFrame):
                 parts += ["[Contexto (índice)]", idx_ctx]
             if rag_ctx:
                 parts += ["[Contexto del repositorio]", rag_ctx]
+            if not idx_ctx and not rag_ctx:
+                parts += [
+                    "[SIN CONTEXTO]",
+                    (
+                        "El índice/RAG no devolvió rutas ni fragmentos útiles para esta consulta. "
+                        "Responde indicando que no hay suficiente información del repositorio, "
+                        "explica brevemente qué faltó y sugiere cómo afinar la búsqueda."
+                    ),
+                ]
             return "\n\n".join(parts).strip()
 
         #concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
@@ -4574,7 +4538,18 @@ class ChatWithLLM(ChatFrame):
 
         max_final = min(80, max(48, min(resp_budget, ctx - used - 64)))
         msgs = [{"role": "system", "content": sys_full}, {"role": "user", "content": user_text}]
-        return msgs, hits, max_final
+
+        context_info = {
+            "has_idx": bool((idx_ctx or "").strip()),
+            "has_rag": bool((rag_ctx or "").strip()),
+            "idx_ctx": idx_ctx or "",
+            "rag_ctx": rag_ctx or "",
+            "obs_block": obs_block or "",
+            "rutas_block": rutas_block or "",
+            "concept_block": concept_block or "",
+        }
+
+        return msgs, hits, max_final, context_info
 
     def _log_qa_if_possible(self, full_answer: str):
         """Guarda la Q/A en históricos (MetaStore) usando la DB del front."""
@@ -4616,7 +4591,7 @@ class ChatWithLLM(ChatFrame):
 
     def _send_llm(self):
         from tkinter import messagebox
-        import os, re, time, threading
+        import re, time, threading
 
         q = self._get_user_text()
 
@@ -4684,65 +4659,32 @@ class ChatWithLLM(ChatFrame):
         def worker():
             try:
                 # Prompt “budgetado” (siempre construye índice + RAG corto y ajusta tamaño)
-                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=96)
+                messages, hits, tok_out, ctx_info = self._compose_system_budgeted(q, max_tokens=96)
 
                 # rutas debajo de la respuesta (para coexistir con el modelo)
-                obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=180)
+                _obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(
+                    hits, max_items=3, max_obs_chars=180
+                )
                 suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
+
+                ctx_info = ctx_info or {}
+                has_idx = bool(ctx_info.get("has_idx"))
+                has_rag = bool(ctx_info.get("has_rag"))
+                rag_ctx = ctx_info.get("rag_ctx", "")
+                no_context = not (has_idx or has_rag)
 
                 # lanzar streaming real
                 self._turn_start_ts = time.time()
-                self.after(0, lambda: self._stream_llm_with_fallback(messages, max_tokens=tok_out, temperature=0.1,
-                                                                     suffix=suffix))
-
-                # si no hay contexto, salida amable con rutas
-                if not (has_idx or has_rag):
-                    rutas = []
-                    for s in (hits or [])[:3]:
-                        name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
-                        rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
-                    msg = "Aquí tienes las fuentes que encajan. ¿Te abro alguna?" + (
-                        "\n\nRutas sugeridas:\n\n" + "\n".join(rutas) if rutas else "")
-                    self.after(0, lambda: self._append_chat("PACqui", msg))
-                    return
-                self.after(0, lambda: self.progress(
-                    "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."))
-
-                # Mensajes con presupuesto reducido (respuesta ágil en CPU)
-                base_sys = (
-                    "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-                    "Usa únicamente la información del CONTEXTO adjunto y CITA usando [n]. "
-                    "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español. "
-                    "PROHIBIDO inventar datos que no aparezcan en los fragmentos."
-                )
-                header_user = ("INSTRUCCIONES: responde en 2–4 frases apoyándote en los FRAGMENTOS/ÍNDICE. "
-                               "Incluye citas [n] cuando uses datos concretos.")
-
-                contexto = ""
-                if has_idx: contexto += "[ÍNDICE]\n" + idx_ctx.strip() + "\n\n"
-                if has_rag: contexto += "[FRAGMENTOS]\n" + rag_ctx.strip() + "\n\n"
-
-                messages = [
-                    {"role": "system", "content": base_sys},
-                    {"role": "user", "content": f"{header_user}\n\n{contexto}PREGUNTA: {q}"}
-                ]
-
-                # presupuesto: máximo ~96 tokens de salida
-                tok_out = 64
-
-                # rutas debajo de la respuesta
-                obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=200)
-                suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
-
-                # lanzar streaming real
-                # lanzar streaming real (pasamos la query para fallback determinista)
-                # lanzar streaming real
-                self._turn_start_ts = time.time()  # ← AÑADE ESTA LÍNEA (ya importas time al inicio del método)
                 self.after(0, lambda: self._stream_llm_with_fallback(
-                    messages, max_tokens=tok_out, temperature=0.1, suffix=suffix))
+                    messages, max_tokens=tok_out, temperature=0.1, suffix=suffix
+                ))
 
+                if no_context:
+                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
+                else:
+                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
 
-
+                self.after(0, lambda msg=progress_msg: self.progress(msg))
 
             except Exception as e:
                 _msg = f"[error] {type(e).__name__}: {e}"
