@@ -4533,6 +4533,15 @@ class ChatWithLLM(ChatFrame):
                 parts += ["[Contexto (índice)]", idx_ctx]
             if rag_ctx:
                 parts += ["[Contexto del repositorio]", rag_ctx]
+            if not idx_ctx and not rag_ctx:
+                parts += [
+                    "[SIN CONTEXTO]",
+                    (
+                        "El índice/RAG no devolvió rutas ni fragmentos útiles para esta consulta. "
+                        "Responde indicando que no hay suficiente información del repositorio, "
+                        "explica brevemente qué faltó y sugiere cómo afinar la búsqueda."
+                    ),
+                ]
             return "\n\n".join(parts).strip()
 
         #concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
@@ -4627,7 +4636,7 @@ class ChatWithLLM(ChatFrame):
 
     def _send_llm(self):
         from tkinter import messagebox
-        import os, re, time, threading
+        import re, time, threading
 
         q = self._get_user_text()
 
@@ -4707,6 +4716,8 @@ class ChatWithLLM(ChatFrame):
                 has_idx = bool(ctx_info.get("has_idx"))
                 has_rag = bool(ctx_info.get("has_rag"))
                 rag_ctx = ctx_info.get("rag_ctx", "")
+                no_context = not (has_idx or has_rag)
+
 
                 # si no hay contexto, salida amable con rutas (no lanzamos el modelo)
                 if not (has_idx or has_rag):
@@ -4724,6 +4735,13 @@ class ChatWithLLM(ChatFrame):
                 self.after(0, lambda: self._stream_llm_with_fallback(
                     messages, max_tokens=tok_out, temperature=0.1, suffix=suffix
                 ))
+
+                if no_context:
+                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
+                else:
+                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
+
+                self.after(0, lambda msg=progress_msg: self.progress(msg))
 
                 self.after(0, lambda: self.progress(
                     "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
