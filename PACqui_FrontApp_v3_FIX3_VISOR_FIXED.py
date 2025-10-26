@@ -4718,6 +4718,18 @@ class ChatWithLLM(ChatFrame):
                 rag_ctx = ctx_info.get("rag_ctx", "")
                 no_context = not (has_idx or has_rag)
 
+
+                # si no hay contexto, salida amable con rutas (no lanzamos el modelo)
+                if not (has_idx or has_rag):
+                    rutas = []
+                    for s in (hits or [])[:3]:
+                        name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
+                        rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
+                    msg = "Aquí tienes las fuentes que encajan. ¿Te abro alguna?" + (
+                        "\n\nRutas sugeridas:\n\n" + "\n".join(rutas) if rutas else "")
+                    self.after(0, lambda: self._append_chat("PACqui", msg))
+                    self.after(0, lambda: self.progress("Contexto insuficiente: muestro solo rutas del índice."))
+                    return
                 # lanzar streaming real
                 self._turn_start_ts = time.time()
                 self.after(0, lambda: self._stream_llm_with_fallback(
@@ -4730,6 +4742,10 @@ class ChatWithLLM(ChatFrame):
                     progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
 
                 self.after(0, lambda msg=progress_msg: self.progress(msg))
+
+                self.after(0, lambda: self.progress(
+                    "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
+                ))
 
             except Exception as e:
                 _msg = f"[error] {type(e).__name__}: {e}"
