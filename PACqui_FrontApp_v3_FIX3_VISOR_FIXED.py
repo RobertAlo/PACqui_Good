@@ -58,7 +58,9 @@ def _import_organizador():
     # 1) Import directo por nombre (preferimos el VISOR)
     for name in (alt, primary):
         try:
-            return importlib.import_module(name)
+            mod = importlib.import_module(name)
+            if hasattr(mod, "OrganizadorFrame"):
+                return mod
         except Exception:
             pass
 
@@ -87,7 +89,8 @@ def _import_organizador():
             sys.modules[name] = mod
             assert spec.loader is not None
             spec.loader.exec_module(mod)  # type: ignore
-            return mod
+            if hasattr(mod, "OrganizadorFrame"):
+                return mod
 
     # 4) Error claro si no se encontró ninguno
     raise ImportError(
@@ -147,67 +150,20 @@ def _ensure_rag_patch():
 
 
 def _ensure_organizador_loaded():
-    """
-    Carga PACqui_RAG_bomba_SAFE (o *_VISOR) sin escanear todo el disco:
-    - Import directo si ya está en sys.path
-    - Busca SOLO en ubicaciones conocidas (env var + script dir + cwd + hasta 3 padres)
-      en formato archivo (.py) o paquete (__init__.py).
-    - Si no se encuentra, añade esas raíces a sys.path y reintenta.
-    """
-    import importlib, importlib.util, sys, os
+    """Garantiza que el módulo del Organizador esté importado y con alias estable."""
+    import sys
 
-    modname = "PACqui_RAG_bomba_SAFE"
-
-    # 1) Intento directo
-    try:
-        import importlib
-        importlib.import_module(modname)
+    existing = sys.modules.get("PACqui_RAG_bomba_SAFE")
+    if existing and hasattr(existing, "OrganizadorFrame"):
         return
-    except Exception:
-        pass
 
-    # 2) Raíces conocidas
-    roots = []
-    env = os.getenv("PACQUI_RAG_DIR", "")
-    if env: roots.append(env)
-    here = os.path.dirname(os.path.abspath(__file__))
-    roots.append(here)
-    roots.append(os.getcwd())
-    p = here
-    for _ in range(3):
-        p = os.path.dirname(p)
-        if p and p not in roots:
-            roots.append(p)
-
-    # 3) Probar archivos directos (SAFE y SAFE_VISOR)
-    candidates = []
-    for root in roots:
-        for rel in (
-            "PACqui_RAG_bomba_SAFE.py",
-            os.path.join("PACqui_RAG_bomba_SAFE", "__init__.py"),
-            "PACqui_RAG_bomba_SAFE_VISOR.py",
-            os.path.join("PACqui_RAG_bomba_SAFE_VISOR", "__init__.py"),
-        ):
-            cand = os.path.join(root, rel)
-            if os.path.exists(cand):
-                candidates.append(cand)
-
-    for cand in candidates:
-        try:
-            spec = importlib.util.spec_from_file_location(modname, cand)
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[modname] = mod
-            assert spec.loader is not None
-            spec.loader.exec_module(mod)  # type: ignore
-            return
-        except Exception:
-            continue
-
-    # 4) Último intento: añadir raíces a sys.path y reimportar
-    for r in roots:
-        if r not in sys.path:
-            sys.path.append(r)
-    importlib.import_module(modname)
+    mod = _import_organizador()
+    # Asegura que podamos resolverlo por el nombre clásico incluso si proviene del *_VISOR
+    sys.modules.setdefault("PACqui_RAG_bomba_SAFE", mod)
+    if not hasattr(mod, "OrganizadorFrame"):
+        raise AttributeError(
+            "El módulo del visor se cargó, pero no expone OrganizadorFrame"
+        )
 
 
 
@@ -3484,8 +3440,7 @@ class AdminPanel(ttk.Notebook):
         # Fallback
         return time.time()
 
-    @staticmethod
-    def _coerce_event(ev):
+    def _coerce_event(self, ev):
         """Normaliza un evento a dict con claves ts(float), level, src, msg."""
         if not isinstance(ev, dict):
             return {
@@ -3494,7 +3449,7 @@ class AdminPanel(ttk.Notebook):
                 "src": "app",
                 "msg": str(ev),
             }
-        ts = _parse_ts_to_epoch(ev.get("ts"))
+        ts = self._parse_ts_to_epoch(ev.get("ts"))
         level = (ev.get("level") or ev.get("lvl") or "INFO").upper()
         if level not in ("DEBUG", "INFO", "WARN", "WARNING", "ERROR", "SUCCESS"):
             level = "INFO"
@@ -4735,6 +4690,13 @@ class ChatWithLLM(ChatFrame):
                 self.after(0, lambda: self._stream_llm_with_fallback(
                     messages, max_tokens=tok_out, temperature=0.1, suffix=suffix
                 ))
+
+                if no_context:
+                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
+                else:
+                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
+
+                self.after(0, lambda msg=progress_msg: self.progress(msg))
 
                 if no_context:
                     progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
