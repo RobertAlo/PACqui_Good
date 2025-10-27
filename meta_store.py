@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, sqlite3, threading
 from typing import Iterable, List, Optional
 from pathlib import Path
-
+#PACqui
 DEFAULT_DB = "index_cache.sqlite"
 
 def _norm(p: str) -> str:

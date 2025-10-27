@@ -12,7 +12,7 @@ from ui_fuentes import SourcesPanel
 from tkinter import messagebox
 from path_utils import open_in_explorer
 
-
+#PACqui
 
 from PACqui_FrontApp_v1b import (
     APP_NAME, DEFAULT_DB, DataAccess, ChatFrame,

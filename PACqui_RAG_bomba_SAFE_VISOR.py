@@ -1,5 +1,6 @@
 # __build__: IndexGenerator_PRO_v2_FIXED3 (2025-09-17)
 # -*- coding: utf-8 -*-
+#PACqui
 r"""
 IndexGenerator (PACqui)– v1.1.6 (Casi perfecto)
 - FIX: Método faltante `_load_config` causaba AttributeError en `__init__` → ahora está presente y probado.

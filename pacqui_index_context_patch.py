@@ -1,4 +1,4 @@
-#PACqui
+#PACqui_
 # pacqui_index_context_patch.py
 # Monkey-patch para LLMChatDialog._worker_chat_stream:
 # - Añade [Contexto (índice)] (derivado de doc_keywords/doc_notes) al system real
