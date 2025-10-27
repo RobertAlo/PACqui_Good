@@ -4066,6 +4066,12 @@ class ChatWithLLM(ChatFrame):
         self._last_choice = None  # {"hit": {...}, "reasons": "texto", "query": "…"}
         self._last_query = None
         self._ext_filter = set()  # {".pdf"} | {".doc",".docx"} | set()
+        #Timeouts de primer token (configurables)
+        self.FIRST_TOKEN_TIMEOUT_MIN_WARM_S = 145.0   # modelo “caliente”
+        self.FIRST_TOKEN_TIMEOUT_MIN_COLD_S = 215.0   # modelo “frío”
+        self.FIRST_TOKEN_TIMEOUT_MAX_S = 300.0       # 5 minutos
+        self.FIRST_TOKEN_TIMEOUT_PER_IN_TOKEN_S = 0.12  # factor por token de entrada
+
 
         def _update_ext_filter(qlow: str):
             import re
@@ -5295,11 +5301,20 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 est_in = 0
 
-            # 2) Timeout dinámico (más generoso):   base + 0.12s por token   [min 35/60 .. max 240]
+            # 2) Timeout dinámico: base + k*s por token   [min 45/75 .. max 300]  (config. en self.*)
+
             #    - si está “caliente” (self.llm._warmed): mínimo 35s
             #    - si está “frío”: mínimo 60s
-            base_min = 35.0 if getattr(self.llm, "_warmed", False) else 60.0
-            TIMEOUT = max(base_min, min(240.0, 15.0 + 0.12 * float(est_in)))
+            base_min = (self.FIRST_TOKEN_TIMEOUT_MIN_WARM_S
+                        if getattr(self.llm, "_warmed", False)
+                        else self.FIRST_TOKEN_TIMEOUT_MIN_COLD_S)
+
+            TIMEOUT = max(
+                base_min,
+                min(self.FIRST_TOKEN_TIMEOUT_MAX_S,
+                    15.0 + self.FIRST_TOKEN_TIMEOUT_PER_IN_TOKEN_S * float(est_in))
+            )
+
             _p(f"Watchdog: tokens_in≈{est_in}, timeout≈{int(TIMEOUT)}s.")
 
             # 3) Vigilancia simple: si no llega 1er token, cancelar stream y lanzar fallback
