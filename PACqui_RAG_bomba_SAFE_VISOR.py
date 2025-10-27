@@ -3627,7 +3627,7 @@ class HelpDialog(tk.Toplevel):
                 ).fetchall()
             if not rows:
                 return ""
-            qv = self._hash_embedder(query or '', dim=256)
+            qv = _hash_embedder(query or '', dim=256)
             # cosine sim
             import math as _m
             def _cos(a,b):
@@ -3788,23 +3788,7 @@ class LLMChatDialog(tk.Toplevel):
         from tkinter import messagebox
         messagebox.showinfo("Observaciones", "(sin observaciones)", parent=self)
 
-    def _append_stream_text(self, txt, end_turn=False):
-        # Normaliza secuencias "\n" literales y otros saltos antes de insertar
-        try:
-            norm = self.app._normalize_text(txt) if hasattr(self.app, "_normalize_text") else str(txt)
-        except Exception:
-            norm = str(txt)
-        self.txt_chat.configure(state="normal")
-        if not self._in_stream:
-            self.txt_chat.insert("end", "PACqui:\n", ("who",))
-            self._in_stream = True
-        self.txt_chat.insert("end", txt)
-        if end_turn:
-            self.txt_chat.insert("end", "\n")
-            self._in_stream = False
-        self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
-        self.txt_chat.see("end")
-        self.txt_chat.configure(state="disabled")
+
 
     def _ensure_fuentes_panel(self):
         if self._fuentes_panel and tk.Toplevel.winfo_exists(self._fuentes_panel):
@@ -4273,25 +4257,7 @@ class LLMChatDialog(tk.Toplevel):
         self.destroy()
 
 
-    def _append_stream_text(self, txt, end_turn=False):
-        # Normalize escaped newlines before inserting
-        try:
-            norm = self.app._normalize_text(txt) if hasattr(self.app, "_normalize_text") else str(txt)
-        except Exception:
-            norm = str(txt)
-        self.txt_chat.configure(state="normal")
-        if not hasattr(self, "_in_stream"):
-            self._in_stream = False
-        if not self._in_stream:
-            self.txt_chat.insert("end", "PACqui:\n", ("who",))
-            self._in_stream = True
-        self.txt_chat.insert("end", txt)
-        if end_turn:
-            self.txt_chat.insert("end", "\n")
-            self._in_stream = False
-        self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
-        self.txt_chat.see("end")
-        self.txt_chat.configure(state="disabled")
+
 
     def _build_instruct_prompt(self, system_text: str, user_text: str) -> str:
         system_text = (system_text or "").strip()
@@ -4641,7 +4607,7 @@ try:
             count=0
             for ch in self._text_chunks(txt, max_chars=1200, overlap=200):
                 c.execute("INSERT INTO chunks(file_path, mtime, text) VALUES(?,?,?)", (fullpath, float(mtime_ts or 0.0), ch))
-                cid = c.lastrowid; vec = self._hash_embedder(ch, dim=256)
+                cid = c.lastrowid; vec = _hash_embedder(ch, dim=256)
                 c.execute("INSERT OR REPLACE INTO embeddings(chunk_id, vec) VALUES(?,?)", (cid, self._vec_to_blob(vec))); count+=1
             conn.commit()
             try: self.queue.put(('msg', (f'RAG: indexado {count} chunks — {os.path.basename(fullpath)}','DEBUG')))

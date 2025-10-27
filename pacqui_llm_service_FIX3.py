@@ -3,6 +3,49 @@ from __future__ import annotations
 import os, math, sqlite3, struct, re
 from pathlib import Path
 
+
+def _cpu_autotune(ctx_tokens: int):
+    import os, multiprocessing
+    cores = multiprocessing.cpu_count() or 4
+    # Hilos: usa todos menos 1 si hay >=6; si no, todos
+    n_threads = int(os.getenv("PACQUI_THREADS", str(cores - 1 if cores >= 6 else cores)))
+    # Batch: tope razonable para CPU; sobreescribible por env
+    n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "256")))
+    # CPU-only
+    n_gpu_layers = 0
+    # I/O rápido
+    use_mmap = True
+    # mlock opcional (1 para activarlo si tu OS lo permite)
+    use_mlock = bool(int(os.getenv("PACQUI_MLOCK", "0")))
+    return dict(n_threads=n_threads, n_batch=n_batch,
+                n_gpu_layers=n_gpu_layers, use_mmap=use_mmap, use_mlock=use_mlock)
+
+
+def _get_keywords(cur, fullpath: str):
+    cur.execute("SELECT keyword FROM doc_keywords WHERE lower(fullpath)=lower(?) ORDER BY keyword COLLATE NOCASE", (fullpath,))
+    return [r[0] for r in cur.fetchall()]
+
+
+def _get_note(cur, fullpath: str) -> str:
+    try:
+        cur.execute("SELECT note FROM doc_notes WHERE lower(fullpath)=lower(?)", (fullpath,))
+        row = cur.fetchone()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
+def _hash_embedder(text, dim=256):
+    import hashlib
+    v=[0.0]*dim
+    if text:
+        for tok in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{2,}", str(text).lower()):
+            h=int(hashlib.md5(tok.encode("utf-8")).hexdigest(),16)
+            i=h%dim; s=1.0 if (h>>1)&1 else -1.0; v[i]+=s
+    n=(sum(x*x for x in v)**0.5) or 1.0
+    return [x/n for x in v]
+
+
 class LLMService:
     """Servicio LLM sin UI para PACqui. Carga GGUF (llama-cpp) y expone chat().
        Incluye utilidades para contar tokens (aprox) y compactar contexto."""
@@ -31,21 +74,6 @@ class LLMService:
         self._embedder_cached = None
 
     # --------- carga ---------
-    def _cpu_autotune(self, ctx_tokens: int):
-        import os, multiprocessing
-        cores = multiprocessing.cpu_count() or 4
-        # Hilos: usa todos menos 1 si hay >=6; si no, todos
-        n_threads = int(os.getenv("PACQUI_THREADS", str(cores - 1 if cores >= 6 else cores)))
-        # Batch: tope razonable para CPU; sobreescribible por env
-        n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "256")))
-        # CPU-only
-        n_gpu_layers = 0
-        # I/O rápido
-        use_mmap = True
-        # mlock opcional (1 para activarlo si tu OS lo permite)
-        use_mlock = bool(int(os.getenv("PACQUI_MLOCK", "0")))
-        return dict(n_threads=n_threads, n_batch=n_batch,
-                    n_gpu_layers=n_gpu_layers, use_mmap=use_mmap, use_mlock=use_mlock)
 
     def load(self, model_path: str, ctx: int = 2048):
         from llama_cpp import Llama
@@ -70,7 +98,7 @@ class LLMService:
         self.model_path = model_path
         self.ctx = int(ctx or 2048)
 
-        perf = self._cpu_autotune(self.ctx)
+        perf = _cpu_autotune(self.ctx)
         self.model = Llama(
             model_path=self.model_path,
             n_ctx=self.ctx,
@@ -124,7 +152,7 @@ class LLMService:
         if os.getenv("PACQUI_FORCE_HASH", "1") == "1":
             # siempre hash-embedder
             def _encode_hash(text: str, _dim=256):
-                return self._hash_embedder(text, dim=_dim)
+                return _hash_embedder(text, dim=_dim)
 
             self._embedder_cached = {"encode": _encode_hash, "dim": 256, "backend": "hash", "sig": "hash:256"}
             return self._embedder_cached
@@ -157,13 +185,13 @@ class LLMService:
                 return self._embedder_cached
             except Exception:
                 # Si el modelo no está instalado → caeremos a hash y anotaremos aviso en el contexto
-                self._embedder_cached = {"encode": lambda t: self._hash_embedder(t, dim=256),
+                self._embedder_cached = {"encode": lambda t: _hash_embedder(t, dim=256),
                                          "dim": 256, "backend": "hash", "sig": "hash:256",
                                          "warn": f"[aviso] El índice usa {sig} pero no se pudo cargar el modelo local. Instala sentence-transformers o define PACQUI_EMBED_DIR."}
                 return self._embedder_cached
 
         # Fallback por defecto (hash)
-        self._embedder_cached = {"encode": lambda t: self._hash_embedder(t, dim=256),
+        self._embedder_cached = {"encode": lambda t: _hash_embedder(t, dim=256),
                                  "dim": 256, "backend": "hash", "sig": "hash:256"}
         return self._embedder_cached
 
@@ -333,8 +361,8 @@ class LLMService:
                 # “must terms”: p.ej. si pregunta contiene “feader”, exige que aparezca
                 # --- Filtrado por obligación (must_any) y exclusiones (must_not) ---
                 # Construye 1 sola vez el "blob" normalizado con kws + nota + nombre fichero
-                blob = " ".join(self._get_keywords(cur, fp) +
-                                [self._get_note(cur, fp), os.path.basename(fp)])
+                blob = " ".join(_get_keywords(cur, fp) +
+                                [_get_note(cur, fp), os.path.basename(fp)])
                 blob_norm = _norm(blob)
 
                 # Cada grupo de must_any debe tener AL MENOS 1 término presente
@@ -409,8 +437,8 @@ class LLMService:
             out = []
             for _rank, _kw, _notes, _fn, fp in ranked:
                 name = os.path.basename(fp)
-                kws = "; ".join(self._get_keywords(cur, fp))
-                note = self._get_note(cur, fp)
+                kws = "; ".join(_get_keywords(cur, fp))
+                note = _get_note(cur, fp)
                 if len(note) > max_note_chars: note = note[:max_note_chars] + "…"
                 out.append({"path": fp, "name": name, "score": _kw + _notes + _fn, "keywords": kws, "note": note})
             return out
@@ -435,18 +463,6 @@ class LLMService:
             except Exception:
                 pass
         # <<< FEEDBACK BOOST
-
-    def _get_keywords(self, cur, fullpath: str):
-        cur.execute("SELECT keyword FROM doc_keywords WHERE lower(fullpath)=lower(?) ORDER BY keyword COLLATE NOCASE", (fullpath,))
-        return [r[0] for r in cur.fetchall()]
-
-    def _get_note(self, cur, fullpath: str) -> str:
-        try:
-            cur.execute("SELECT note FROM doc_notes WHERE lower(fullpath)=lower(?)", (fullpath,))
-            row = cur.fetchone()
-            return row[0] if row else ""
-        except Exception:
-            return ""
 
     def build_index_context(self, query: str, top_k: int = 5, max_note_chars: int = 240):
         hits = self._index_hits(query, top_k=top_k, max_note_chars=max_note_chars)
@@ -567,16 +583,6 @@ class LLMService:
 
         return "\n\n".join(frags)
 
-    def _hash_embedder(self, text, dim=256):
-        import hashlib
-        v=[0.0]*dim
-        if text:
-            for tok in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{2,}", str(text).lower()):
-                h=int(hashlib.md5(tok.encode("utf-8")).hexdigest(),16)
-                i=h%dim; s=1.0 if (h>>1)&1 else -1.0; v[i]+=s
-        n=(sum(x*x for x in v)**0.5) or 1.0
-        return [x/n for x in v]
-
     def concept_context(self, query_text: str, max_chars: int = 600, top_k: int = 5) -> str:
         try:
             from meta_store import MetaStore
@@ -676,17 +682,19 @@ class LLMService:
             self._warmed = True
             self._warming = False
 
-    def chat(self, messages, temperature=0.3, max_tokens=256, stream=True):
+    # === PEGAR DENTRO DE class LLMService, sustituyendo a los métodos existentes ===
+
+    def chat(self, messages, temperature: float = 0.3, max_tokens: int = 256, stream: bool = True):
+        """Llama a llama.cpp (create_chat_completion). Sin sufijos raros.
+        Maneja cache_prompt si está disponible y recorta contexto si hace falta."""
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
 
-        # --- FORZAR POLÍTICA DE IDIOMA (ES) ---
+        # Política de idioma (ES)
         ES_POLICY = ("Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-                        "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español.")
-        has_es = any(
-            (m.get("role") == "system" and "español" in (m.get("content", "").lower()))
-            for m in (messages or [])
-        )
+                     "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español.")
+        has_es = any((m.get("role") == "system" and "español" in (m.get("content", "").lower()))
+                     for m in (messages or []))
         if not has_es:
             messages = [{"role": "system", "content": ES_POLICY}] + list(messages or [])
 
@@ -698,42 +706,39 @@ class LLMService:
                         temperature=float(temperature),
                         max_tokens=int(max_tokens),
                         stream=bool(stream),
-                        cache_prompt=True
+                        cache_prompt=True,
                     )
                 except TypeError:
-                    # build de llama-cpp sin cache_prompt
+                    # build sin cache_prompt
                     return self.model.create_chat_completion(
                         messages=messages,
                         temperature=float(temperature),
                         max_tokens=int(max_tokens),
-                        stream=bool(stream)
+                        stream=bool(stream),
                     )
         except (RuntimeError, ValueError) as e:
-            # Desbordes de contexto → recortar y reintentar
+            # recorte y reintento si nos pasamos de contexto
             msg = str(e)
             if "context window" in msg or "exceed context" in msg:
                 out_tok = max(128, min(256, int(self.ctx * 0.12)))
                 budget_in = max(256, self.ctx - out_tok - 64)
                 safe_msgs = self._shrink_messages(messages, budget_in_tokens=budget_in)
                 with self._model_lock:
-                    try:
-                        return self.model.create_chat_completion(
-                            messages=safe_msgs,
-                            temperature=float(temperature),
-                            max_tokens=int(out_tok),
-                            stream=bool(stream)
-                        )
-                    except Exception:
-                        return {
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "[aviso] El contexto era demasiado largo y fue recortado automáticamente. "
-                                               "Vuelve a preguntar con una frase más concreta."
-                                }
-                            }]
-                        }
+                    return self.model.create_chat_completion(
+                        messages=safe_msgs,
+                        temperature=float(temperature),
+                        max_tokens=int(out_tok),
+                        stream=bool(stream),
+                    )
             raise
+
+    def stream_chat(self, messages, temperature: float = 0.3, max_tokens: int = 256):
+        """Wrapper que devuelve un iterable de eventos de stream."""
+        resp = self.chat(messages=messages, temperature=temperature,
+                         max_tokens=max_tokens, stream=True)
+        # llama.cpp ya devuelve un generador de chunks cuando stream=True.
+        return resp
+    # === FIN BLOQUE ===
 
 
 

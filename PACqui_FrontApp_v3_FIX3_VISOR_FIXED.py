@@ -58,9 +58,7 @@ def _import_organizador():
     # 1) Import directo por nombre (preferimos el VISOR)
     for name in (alt, primary):
         try:
-            mod = importlib.import_module(name)
-            if hasattr(mod, "OrganizadorFrame"):
-                return mod
+            return importlib.import_module(name)
         except Exception:
             pass
 
@@ -89,8 +87,7 @@ def _import_organizador():
             sys.modules[name] = mod
             assert spec.loader is not None
             spec.loader.exec_module(mod)  # type: ignore
-            if hasattr(mod, "OrganizadorFrame"):
-                return mod
+            return mod
 
     # 4) Error claro si no se encontró ninguno
     raise ImportError(
@@ -116,7 +113,8 @@ def _import_rag_patch():
     here = os.path.dirname(os.path.abspath(__file__))
     roots = [here, os.path.dirname(here)]
     for root in roots:
-        path = os.path.join(root, "../../OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/Proyecto actual/pacqui_index_context_patch.py")
+        path = os.path.join(root,
+                            "../../OneDrive - HIBERUS SISTEMAS INFORMATICOS S.L/Escritorio/Proyecto actual/pacqui_index_context_patch.py")
         if os.path.exists(path):
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
@@ -150,20 +148,67 @@ def _ensure_rag_patch():
 
 
 def _ensure_organizador_loaded():
-    """Garantiza que el módulo del Organizador esté importado y con alias estable."""
-    import sys
+    """
+    Carga PACqui_RAG_bomba_SAFE (o *_VISOR) sin escanear todo el disco:
+    - Import directo si ya está en sys.path
+    - Busca SOLO en ubicaciones conocidas (env var + script dir + cwd + hasta 3 padres)
+      en formato archivo (.py) o paquete (__init__.py).
+    - Si no se encuentra, añade esas raíces a sys.path y reintenta.
+    """
+    import importlib, importlib.util, sys, os
 
-    existing = sys.modules.get("PACqui_RAG_bomba_SAFE")
-    if existing and hasattr(existing, "OrganizadorFrame"):
+    modname = "PACqui_RAG_bomba_SAFE"
+
+    # 1) Intento directo
+    try:
+        import importlib
+        importlib.import_module(modname)
         return
+    except Exception:
+        pass
 
-    mod = _import_organizador()
-    # Asegura que podamos resolverlo por el nombre clásico incluso si proviene del *_VISOR
-    sys.modules.setdefault("PACqui_RAG_bomba_SAFE", mod)
-    if not hasattr(mod, "OrganizadorFrame"):
-        raise AttributeError(
-            "El módulo del visor se cargó, pero no expone OrganizadorFrame"
-        )
+    # 2) Raíces conocidas
+    roots = []
+    env = os.getenv("PACQUI_RAG_DIR", "")
+    if env: roots.append(env)
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots.append(here)
+    roots.append(os.getcwd())
+    p = here
+    for _ in range(3):
+        p = os.path.dirname(p)
+        if p and p not in roots:
+            roots.append(p)
+
+    # 3) Probar archivos directos (SAFE y SAFE_VISOR)
+    candidates = []
+    for root in roots:
+        for rel in (
+            "PACqui_RAG_bomba_SAFE.py",
+            os.path.join("PACqui_RAG_bomba_SAFE", "__init__.py"),
+            "PACqui_RAG_bomba_SAFE_VISOR.py",
+            os.path.join("PACqui_RAG_bomba_SAFE_VISOR", "__init__.py"),
+        ):
+            cand = os.path.join(root, rel)
+            if os.path.exists(cand):
+                candidates.append(cand)
+
+    for cand in candidates:
+        try:
+            spec = importlib.util.spec_from_file_location(modname, cand)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[modname] = mod
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)  # type: ignore
+            return
+        except Exception:
+            continue
+
+    # 4) Último intento: añadir raíces a sys.path y reimportar
+    for r in roots:
+        if r not in sys.path:
+            sys.path.append(r)
+    importlib.import_module(modname)
 
 
 
@@ -3440,7 +3485,8 @@ class AdminPanel(ttk.Notebook):
         # Fallback
         return time.time()
 
-    def _coerce_event(self, ev):
+    @staticmethod
+    def _coerce_event(ev):
         """Normaliza un evento a dict con claves ts(float), level, src, msg."""
         if not isinstance(ev, dict):
             return {
@@ -3449,7 +3495,7 @@ class AdminPanel(ttk.Notebook):
                 "src": "app",
                 "msg": str(ev),
             }
-        ts = self._parse_ts_to_epoch(ev.get("ts"))
+        ts = _parse_ts_to_epoch(ev.get("ts"))
         level = (ev.get("level") or ev.get("lvl") or "INFO").upper()
         if level not in ("DEBUG", "INFO", "WARN", "WARNING", "ERROR", "SUCCESS"):
             level = "INFO"
@@ -3723,9 +3769,18 @@ class AdminPanel(ttk.Notebook):
         try:
             self.app.llm.load(mp, ctx=ctx)
             self.app.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
-            cfg = _load_cfg()
-            cfg["model_path"] = mp
-            cfg["model_ctx"] = ctx
+            cfg = _load_cfg(); cfg["model_path"]=mp; cfg["model_ctx"]=ctx; _save_cfg(cfg)
+            messagebox.showinfo(APP_NAME, "Modelo cargado en backend.")
+            self.app._log("model_loaded",
+                          model=os.path.basename(mp),
+                          ctx=ctx,
+                          threads=self.app.llm.threads,
+                          batch=self.app.llm.n_batch)
+            self.app.llm.load(mp, ctx=ctx)
+            self.app.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
+            cfg = _load_cfg();
+            cfg["model_path"] = mp;
+            cfg["model_ctx"] = ctx;
             _save_cfg(cfg)
             messagebox.showinfo(APP_NAME, "Modelo cargado en backend.")
             self.app._log("model_loaded",
@@ -4267,31 +4322,24 @@ class ChatWithLLM(ChatFrame):
             messagebox.showerror("Abrir carpeta", f"No se pudo abrir la carpeta de:\n{path}\n\n{e}", parent=self)
 
     # --- NUEVO: helpers para el spinner ---
+    # --- NUEVO: helpers para el spinner ---
     def _spinner_start(self):
         try:
             self.stop_event.clear()
         except Exception:
             pass
         try:
-            self.pb.grid(); self.pb.start(12)
+            # Usar SOLO pack para evitar conflictos grid/pack
+            self.pb.pack_forget()
+            self.pb.pack(side="left", padx=4)
+            self.pb.start(12)
         except Exception:
+            pass
+        for w in ("ent_input", "txt_input", "btn_send"):
             try:
-                self.pb.pack(side="left", padx=4); self.pb.start(12)
+                getattr(self, w).configure(state="disabled")
             except Exception:
                 pass
-        try:
-            self.ent_input.configure(state="disabled")
-        except Exception:
-            pass
-        try:
-            self.txt_input.configure(state="disabled")
-        except Exception:
-            pass
-
-        try:
-            self.btn_send.configure(state="disabled")
-        except Exception:
-            pass
         try:
             self.btn_stop.configure(state="normal")
         except Exception:
@@ -4299,28 +4347,22 @@ class ChatWithLLM(ChatFrame):
 
     def _spinner_stop(self):
         try:
-            self.pb.stop(); self.pb.grid_remove()
+            self.pb.stop()
+            self.pb.pack_forget()
         except Exception:
-            try:
-                self.pb.stop(); self.pb.pack_forget()
-            except Exception:
-                pass
+            pass
         try:
             self.btn_stop.configure(state="disabled")
         except Exception:
             pass
+        for w in ("ent_input", "txt_input", "btn_send"):
+            try:
+                getattr(self, w).configure(state="normal")
+            except Exception:
+                pass
+        # foco en el área de entrada multilinea si existe
         try:
-            self.ent_input.configure(state="normal"); self.ent_input.focus_set()
-        except Exception:
-            pass
-        try:
-            self.txt_input.configure(state="normal");
-            self.txt_input.focus_set()
-        except Exception:
-            pass
-
-        try:
-            self.btn_send.configure(state="normal")
+            (getattr(self, "txt_input", None) or self.ent_input).focus_set()
         except Exception:
             pass
 
@@ -4479,15 +4521,6 @@ class ChatWithLLM(ChatFrame):
                 parts += ["[Contexto (índice)]", idx_ctx]
             if rag_ctx:
                 parts += ["[Contexto del repositorio]", rag_ctx]
-            if not idx_ctx and not rag_ctx:
-                parts += [
-                    "[SIN CONTEXTO]",
-                    (
-                        "El índice/RAG no devolvió rutas ni fragmentos útiles para esta consulta. "
-                        "Responde indicando que no hay suficiente información del repositorio, "
-                        "explica brevemente qué faltó y sugiere cómo afinar la búsqueda."
-                    ),
-                ]
             return "\n\n".join(parts).strip()
 
         #concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
@@ -4529,18 +4562,7 @@ class ChatWithLLM(ChatFrame):
 
         max_final = min(80, max(48, min(resp_budget, ctx - used - 64)))
         msgs = [{"role": "system", "content": sys_full}, {"role": "user", "content": user_text}]
-
-        context_info = {
-            "has_idx": bool((idx_ctx or "").strip()),
-            "has_rag": bool((rag_ctx or "").strip()),
-            "idx_ctx": idx_ctx or "",
-            "rag_ctx": rag_ctx or "",
-            "obs_block": obs_block or "",
-            "rutas_block": rutas_block or "",
-            "concept_block": concept_block or "",
-        }
-
-        return msgs, hits, max_final, context_info
+        return msgs, hits, max_final
 
     def _log_qa_if_possible(self, full_answer: str):
         """Guarda la Q/A en históricos (MetaStore) usando la DB del front."""
@@ -4582,7 +4604,7 @@ class ChatWithLLM(ChatFrame):
 
     def _send_llm(self):
         from tkinter import messagebox
-        import re, time, threading
+        import os, re, time, threading
 
         q = self._get_user_text()
 
@@ -4645,78 +4667,37 @@ class ChatWithLLM(ChatFrame):
 
         self.progress_reset("Preparando respuesta…")
         self.progress("Buscando en el índice…")
+        # Bloquea la UI desde ya (aunque aún no haya stream)
+        self._spinner_start()
 
         # worker: construye contexto corto y lanza streaming
+        # worker: construye contexto corto y lanza streaming (versión unificada SIN has_idx/has_rag)
         def worker():
-            try:
-                # Prompt “budgetado” (siempre construye índice + RAG corto y ajusta tamaño)
-                messages, hits, tok_out, ctx_info = self._compose_system_budgeted(q, max_tokens=96)
 
-                # rutas debajo de la respuesta (para coexistir con el modelo)
-                _obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(
-                    hits, max_items=3, max_obs_chars=180
-                )
+
+            try:
+                # 1) Construye mensajes + presupuesto con el helper centralizado
+                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=96)
+
+                # 2) Rutas debajo de la respuesta para coexistir con el modelo
+                try:
+                    obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=180)
+                except Exception:
+                    obs_block, rutas_block = "", ""
                 suffix = ("Rutas sugeridas:\n\n" + rutas_block) if rutas_block else ""
 
-                ctx_info = ctx_info or {}
-                has_idx = bool(ctx_info.get("has_idx"))
-                has_rag = bool(ctx_info.get("has_rag"))
-                rag_ctx = ctx_info.get("rag_ctx", "")
-                no_context = not (has_idx or has_rag)
-
-
-                # si no hay contexto, salida amable con rutas (no lanzamos el modelo)
-                if not (has_idx or has_rag):
-                    rutas = []
-                    for s in (hits or [])[:3]:
-                        name = s.get("name") or (s.get("path") and os.path.basename(s["path"])) or "(sin nombre)"
-                        rutas.append(f"- {name}\n  Ruta: {s.get('path', '')}")
-                    msg = "Aquí tienes las fuentes que encajan. ¿Te abro alguna?" + (
-                        "\n\nRutas sugeridas:\n\n" + "\n".join(rutas) if rutas else "")
-                    self.after(0, lambda: self._append_chat("PACqui", msg))
-                    self.after(0, lambda: self.progress("Contexto insuficiente: muestro solo rutas del índice."))
-                    return
-                # lanzar streaming real
-                self._turn_start_ts = time.time()
+                # 3) Lanzar streaming real (pintado progresivo + fallback integrados)
+                self._turn_start_ts = time.time()  # métrica para históricos
                 self.after(0, lambda: self._stream_llm_with_fallback(
                     messages, max_tokens=tok_out, temperature=0.1, suffix=suffix
-                ))
-
-                if no_context:
-                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
-                else:
-                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
-
-                self.after(0, lambda msg=progress_msg: self.progress(msg))
-
-                if no_context:
-                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
-                else:
-                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
-
-                self.after(0, lambda msg=progress_msg: self.progress(msg))
-
-                if no_context:
-                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
-                else:
-                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
-
-                self.after(0, lambda msg=progress_msg: self.progress(msg))
-
-                self.after(0, lambda: self.progress(
-                    "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
                 ))
 
             except Exception as e:
                 _msg = f"[error] {type(e).__name__}: {e}"
                 self.after(0, lambda m=_msg: self._append_chat("PACqui", m))
+                self.after(0, self._spinner_stop)
 
-        # spinner mientras preparamos el contexto
-        try:
-            self.set_status("Preparando contexto…")
-
-        except Exception:
-            pass
+        import threading
         threading.Thread(target=worker, daemon=True).start()
 
     def _fill_sources_tree(self, hits):
@@ -5110,7 +5091,7 @@ class ChatWithLLM(ChatFrame):
         if getattr(self, "stop_event", None):
             self.stop_event.clear()
         q = queue.Queue()
-        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False, "suffix_done": False}
+        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False}
         out_buf = []
 
         def _p(msg: str):
@@ -5148,19 +5129,6 @@ class ChatWithLLM(ChatFrame):
                 if not state["done"]:
                     self.after(15, _paint_loop)
                 else:
-                    if suffix and suffix.strip() and not state.get("suffix_done"):
-                        extra = ("\n\n" if out_buf else "") + suffix
-                        try:
-                            self._append_stream_text(extra)
-                        except Exception:
-                            try:
-                                self.txt_chat.configure(state="normal")
-                                self.txt_chat.insert("end", extra)
-                                self.txt_chat.configure(state="disabled")
-                            except Exception:
-                                pass
-                        out_buf.append(extra)
-                        state["suffix_done"] = True
                     # cierre UI
                     try:
                         self._append_stream_text("", end_turn=True)
@@ -5187,7 +5155,7 @@ class ChatWithLLM(ChatFrame):
             _p(f"Fallback sin streaming ({reason})…")
             import threading, time
 
-            # Estima tokens para decidir un deadline razonable [45 .. 180] s
+            # Estimación para deadline
             try:
                 est_in = sum(self.llm.count_tokens((m.get("content") or "")) for m in (messages or []))
             except Exception:
@@ -5197,20 +5165,56 @@ class ChatWithLLM(ChatFrame):
 
             result = {"txt": None, "err": None, "done": False}
 
+            def _to_instruct(_msgs: list[dict]) -> str:
+                # Instruct simple y robusto (modelo instruct o genérico)
+                sys_part = "\n".join([m.get("content", "") for m in _msgs if m.get("role") == "system"]).strip()
+                user_parts = [m.get("content", "") for m in _msgs if m.get("role") != "system"]
+                user_text = user_parts[-1] if user_parts else ""
+                pre = f"<<SYS>>{sys_part}<<SYS>>\n" if sys_part else ""
+                return f"{pre}Usuario: {user_text}\nAsistente:"
+
             def _call():
                 try:
-                    # Si el motivo fue típico de stream roto, AÚN ASÍ intentamos 1 llamada no-stream con deadline
-                    resp = self.llm.chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=False,
-                    )
+                    # 1) chat no-stream
+                    resp = self.llm.chat(messages=messages, max_tokens=max_tokens,
+                                         temperature=temperature, stream=False)
                     ch0 = (resp.get("choices") or [{}])[0]
                     txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or ""
-                    result["txt"] = txt if txt else ""
-                except Exception as e:
-                    result["err"] = str(e)
+                    if not txt:
+                        raise RuntimeError("chat non-stream vacío")
+
+                    result["txt"] = txt
+                except Exception:
+                    # 2) completion stream (prompt instruct)
+                    try:
+                        prompt = _to_instruct(messages)
+                        model = getattr(self.llm, "model", None)
+                        if model is None:
+                            raise RuntimeError("model no disponible")
+
+                        out_chunks = []
+                        for chunk in model.create_completion(prompt=prompt, temperature=temperature,
+                                                             max_tokens=max_tokens, stream=True):
+                            if getattr(self, "stop_event", None) and self.stop_event.is_set():
+                                break
+                            delta = ""
+                            try:
+                                delta = (chunk.get("choices") or [{}])[0].get("text", "")
+                            except Exception:
+                                pass
+                            if delta:
+                                t = self.app._normalize_text(delta) if hasattr(self.app, "_normalize_text") else delta
+                                out_chunks.append(t)
+                                self.after(0, lambda tt=t: self._append_stream_text(tt))
+                        txt2 = "".join(out_chunks).strip()
+                        if not txt2:
+                            # 3) completion no-stream (último recurso)
+                            resp2 = model.create_completion(prompt=prompt, temperature=temperature,
+                                                            max_tokens=max_tokens)
+                            txt2 = ((resp2.get("choices") or [{}])[0].get("text", "") or "").strip()
+                        result["txt"] = txt2
+                    except Exception as e2:
+                        result["err"] = str(e2)
                 finally:
                     result["done"] = True
 
@@ -5222,7 +5226,7 @@ class ChatWithLLM(ChatFrame):
                 time.sleep(0.25)
 
             if not result["done"]:
-                # Cancelamos y devolvemos mensaje amable + rutas
+                # Cancelación y texto amable
                 try:
                     if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
                         self.llm.cancel()
@@ -5230,22 +5234,23 @@ class ChatWithLLM(ChatFrame):
                     pass
                 txt = "Ahora mismo no he podido generar respuesta del modelo."
             else:
-                txt = result["txt"] if result["txt"] is not None else f"[error] {result['err']}"
+                txt = (result["txt"] or "").strip()
+                if not txt and result.get("err"):
+                    txt = f"[error] {result['err']}"
 
             if suffix:
                 txt = (txt or "") + ("\n\n" + suffix)
-                state["suffix_done"] = True
 
-            # PINTADO GARANTIZADO por la ruta estable del chat
+            # Volcado por la ruta estable (no streaming) garantizado
             try:
                 self.after(0, lambda: self._append_chat("PACqui", txt or ""))
             except Exception:
-                try:  # último recurso
+                try:
                     self._append_chat("PACqui", txt or "")
                 except Exception:
                     pass
 
-            # CIERRE DEL TURNO (por si el worker quedó bloqueado):
+            # Cierre del turno (aunque el worker quede colgado)
             try:
                 state["done"] = True
             except Exception:
@@ -5260,16 +5265,13 @@ class ChatWithLLM(ChatFrame):
                     self.progress(f"Listo ({int((time.time() - t0s) * 1000)} ms).")
             except Exception:
                 pass
-
-            # Guarda histórico
             try:
                 out_buf.append(txt or "")
                 self._log_qa_if_possible("".join(out_buf))
             except Exception:
                 pass
-
             try:
-                q.put(None)  # sentinel de cierre para el _paint_loop
+                q.put(None)  # cerrar paint loop
             except Exception:
                 pass
 

@@ -258,7 +258,7 @@ class ChatFrame(ttk.Frame):
         input_row.pack(fill="x", pady=(8,0))
         self.ent_input = ttk.Entry(input_row)
         self.ent_input.pack(side="left", fill="x", expand=True)
-        self.ent_input.bind("<Return>", lambda e: self._on_send())
+        self.ent_input.bind("<Return>", lambda e: self._on_return())
         ttk.Button(input_row, text="Enviar", style="Big.TButton", command=self._on_send).pack(side="left", padx=(8,0))
 
         # Right pane: sources + note + actions
@@ -343,14 +343,9 @@ class ChatFrame(ttk.Frame):
             self._on_send()
 
     def _on_send(self):
-        text = self.ent_input.get().strip()
-        if not text:
-            return
-        self._append_chat("Tú", text)
-        self._clear_user_text()
-
-        # Suggest sources
-        self._populate_sources(text)
+        """Click en el botón 'Enviar'."""
+        print("[UI] Botón Enviar pulsado")
+        self._send_llm()
 
     def _append_chat(self, who: str, text: str):
         import re
@@ -412,52 +407,7 @@ class ChatFrame(ttk.Frame):
         txt.see("end")
         txt.configure(state="disabled")
 
-    def _append_stream_text(self, txt: str, end_turn: bool = False):
-        # 1) Validaciones e instrumentación básicas
-        try:
-            assert hasattr(self, "txt_chat"), "txt_chat no existe en este frame"
-            assert self.txt_chat is not None, "txt_chat es None"
-        except Exception:
-            return
 
-        # Normaliza (si tu AppRoot tiene normalizador)
-        try:
-            norm = self.app._normalize_text(txt) if hasattr(self.app, "_normalize_text") else str(txt)
-        except Exception:
-            norm = str(txt)
-
-        # Abrir el Text
-        try:
-            self.txt_chat.configure(state="normal")
-        except Exception:
-            pass
-
-        # Encabezado “PACqui:” solo la primera vez del turno
-        try:
-            if not hasattr(self, "_in_stream"):
-                self._in_stream = False
-            if not self._in_stream:
-                self._in_stream = True
-                self.txt_chat.insert("end", "PACqui:\n", ("who",))
-                self.txt_chat.tag_configure("who", font=("Segoe UI", 9, "bold"))
-        except Exception:
-            pass
-
-        # Cuerpo
-        try:
-            self.txt_chat.insert("end", norm)
-            if end_turn:
-                self.txt_chat.insert("end", "\n")
-                self._in_stream = False
-            self.txt_chat.see("end")
-        except Exception:
-            pass
-
-        # Cerrar el Text
-        try:
-            self.txt_chat.configure(state="disabled")
-        except Exception:
-            pass
 
     def _populate_sources(self, text: str):
         self.tv.delete(*self.tv.get_children())
