@@ -3723,18 +3723,9 @@ class AdminPanel(ttk.Notebook):
         try:
             self.app.llm.load(mp, ctx=ctx)
             self.app.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
-            cfg = _load_cfg(); cfg["model_path"]=mp; cfg["model_ctx"]=ctx; _save_cfg(cfg)
-            messagebox.showinfo(APP_NAME, "Modelo cargado en backend.")
-            self.app._log("model_loaded",
-                          model=os.path.basename(mp),
-                          ctx=ctx,
-                          threads=self.app.llm.threads,
-                          batch=self.app.llm.n_batch)
-            self.app.llm.load(mp, ctx=ctx)
-            self.app.lbl_model.config(text=f"Modelo: {Path(mp).name} (ctx={ctx})")
-            cfg = _load_cfg();
-            cfg["model_path"] = mp;
-            cfg["model_ctx"] = ctx;
+            cfg = _load_cfg()
+            cfg["model_path"] = mp
+            cfg["model_ctx"] = ctx
             _save_cfg(cfg)
             messagebox.showinfo(APP_NAME, "Modelo cargado en backend.")
             self.app._log("model_loaded",
@@ -4705,6 +4696,13 @@ class ChatWithLLM(ChatFrame):
 
                 self.after(0, lambda msg=progress_msg: self.progress(msg))
 
+                if no_context:
+                    progress_msg = "Sin contexto recuperado: el modelo responderá avisando de la falta de datos."
+                else:
+                    progress_msg = "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
+
+                self.after(0, lambda msg=progress_msg: self.progress(msg))
+
                 self.after(0, lambda: self.progress(
                     "Contexto listo" + (" (+ fragmentos RAG)" if rag_ctx.strip() else "") + "."
                 ))
@@ -5112,7 +5110,7 @@ class ChatWithLLM(ChatFrame):
         if getattr(self, "stop_event", None):
             self.stop_event.clear()
         q = queue.Queue()
-        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False}
+        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False, "suffix_done": False}
         out_buf = []
 
         def _p(msg: str):
@@ -5150,6 +5148,19 @@ class ChatWithLLM(ChatFrame):
                 if not state["done"]:
                     self.after(15, _paint_loop)
                 else:
+                    if suffix and suffix.strip() and not state.get("suffix_done"):
+                        extra = ("\n\n" if out_buf else "") + suffix
+                        try:
+                            self._append_stream_text(extra)
+                        except Exception:
+                            try:
+                                self.txt_chat.configure(state="normal")
+                                self.txt_chat.insert("end", extra)
+                                self.txt_chat.configure(state="disabled")
+                            except Exception:
+                                pass
+                        out_buf.append(extra)
+                        state["suffix_done"] = True
                     # cierre UI
                     try:
                         self._append_stream_text("", end_turn=True)
@@ -5223,6 +5234,7 @@ class ChatWithLLM(ChatFrame):
 
             if suffix:
                 txt = (txt or "") + ("\n\n" + suffix)
+                state["suffix_done"] = True
 
             # PINTADO GARANTIZADO por la ruta estable del chat
             try:

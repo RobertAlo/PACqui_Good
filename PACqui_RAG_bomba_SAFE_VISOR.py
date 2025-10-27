@@ -39,10 +39,22 @@ from tkinter import font as tkfont
 from tkinter import ttk, messagebox, filedialog
 from tkinter.scrolledtext import ScrolledText
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill
-from openpyxl.utils import get_column_letter
-from openpyxl.cell import WriteOnlyCell
+# openpyxl es opcional: algunos despliegues sólo exportan CSV/xlsxwriter.
+# Si no está instalado, degradamos la funcionalidad a un aviso amable en tiempo de ejecución.
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.cell import WriteOnlyCell
+    _OPENPYXL_AVAILABLE = True
+    _OPENPYXL_ERROR = None
+except Exception as exc:  # pragma: no cover - entorno sin openpyxl
+    Workbook = None  # type: ignore[assignment]
+    Font = Alignment = PatternFill = None  # type: ignore[assignment]
+    get_column_letter = None  # type: ignore[assignment]
+    WriteOnlyCell = None  # type: ignore[assignment]
+    _OPENPYXL_AVAILABLE = False
+    _OPENPYXL_ERROR = exc
 import collections
 import math
 import zipfile
@@ -65,6 +77,21 @@ except Exception:
 from path_utils import norm_ext, file_url_windows as _fileurl_windows, rel_from_base
 
 Row = Tuple[str, str, int, float, str, str, str]  # (nombre, ext, size, mtime, carpeta, ruta_abs, localizacion)
+
+
+def _ensure_openpyxl(parent=None) -> bool:
+    """Devuelve True si openpyxl está disponible; si no, muestra aviso único."""
+    if _OPENPYXL_AVAILABLE:
+        return True
+    try:
+        txt_err = ("La exportación a Excel requiere el paquete 'openpyxl'.\n"
+                   "Instálalo (pip install openpyxl) o usa el exportador CSV/xlsxwriter.")
+        if _OPENPYXL_ERROR:
+            txt_err += f"\n\nDetalle: {_OPENPYXL_ERROR}"
+        messagebox.showerror("Exportar", txt_err, parent=parent)
+    except Exception:
+        print("[PACqui] Falta openpyxl para exportar a Excel:", _OPENPYXL_ERROR)
+    return False
 
 def _iter_files(base: Path) -> Iterable[Path]:
     for root, _dirs, files in os.walk(base):
@@ -1606,6 +1633,9 @@ class OrganizadorFrame(ttk.Frame):
             messagebox.showinfo(APP_NAME, "No hay datos que exportar. Escanea o busca primero.")
             return
 
+        if not _ensure_openpyxl(self):
+            return
+
         default_name = f"Listado_DocuSICOP_{'TODO_' if export_all else ''}{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         save_path = filedialog.asksaveasfilename(
             title="Guardar Excel", defaultextension=".xlsx", initialfile=default_name, filetypes=[("Excel", "*.xlsx")]
@@ -2889,6 +2919,8 @@ class OrganizadorFrame(ttk.Frame):
         if not self.file_index:
             messagebox.showinfo(APP_NAME, "No hay índice cargado. Pulsa ESCANEAR primero.")
             return
+        if not _ensure_openpyxl(self):
+            return
         default_name = f"Listado_DocuSICOP_TODO_RAPIDO_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         save_path = filedialog.asksaveasfilename(
             title="Guardar Excel (rápido)", defaultextension=".xlsx",
@@ -2899,6 +2931,9 @@ class OrganizadorFrame(ttk.Frame):
         threading.Thread(target=self._worker_exportar_excel_stream, args=(save_path,), daemon=True).start()
 
     def _worker_exportar_excel_stream(self, save_path: str):
+        if not _OPENPYXL_AVAILABLE:
+            self.queue.put(("msg", ("openpyxl no está disponible; instala el paquete para exportar a Excel.", "ERR")))
+            return
         try:
             total = len(self.file_index)
             self.queue.put(("task_open", ("Generando Excel (rápido)", total)))
@@ -3008,6 +3043,8 @@ class OrganizadorFrame(ttk.Frame):
         tv = self.tree
         if not tv.get_children():
             messagebox.showinfo(APP_NAME, "No hay filas visibles para exportar.")
+            return
+        if not _ensure_openpyxl(self):
             return
         from datetime import datetime
 
