@@ -2250,8 +2250,8 @@ class AdminPanel(ttk.Notebook):
             raise RuntimeError("LLM no cargado (revisa _autoload_model y self.app.llm).")
 
         messages = [
-            {"role": "system", "content": prompt_sistema or "Responde SIEMPRE en español neutro."},
-            {"role": "user", "content": ((contexto or "") + "\n\n" + (entrada or "")).strip()}
+            {"role": "system", "content": base_sys},
+            {"role": "user", "content": ucontent},
         ]
 
         # Tu LLMService expone .chat(...). Lo estás usando así en el banco de pruebas. :contentReference[oaicite:2]{index=2}
@@ -4067,11 +4067,10 @@ class ChatWithLLM(ChatFrame):
         self._last_query = None
         self._ext_filter = set()  # {".pdf"} | {".doc",".docx"} | set()
         #Timeouts de primer token (configurables)
-        self.FIRST_TOKEN_TIMEOUT_MIN_WARM_S = 145.0   # modelo “caliente”
-        self.FIRST_TOKEN_TIMEOUT_MIN_COLD_S = 215.0   # modelo “frío”
-        self.FIRST_TOKEN_TIMEOUT_MAX_S = 300.0       # 5 minutos
+        self.FIRST_TOKEN_TIMEOUT_MIN_WARM_S = 45.0  # modelo “caliente” (primer token)
+        self.FIRST_TOKEN_TIMEOUT_MIN_COLD_S = 90.0  # modelo “frío” (primer token)
+        self.FIRST_TOKEN_TIMEOUT_MAX_S = 480.0  # techo duro
         self.FIRST_TOKEN_TIMEOUT_PER_IN_TOKEN_S = 0.12  # factor por token de entrada
-
 
         def _update_ext_filter(qlow: str):
             import re
@@ -4468,18 +4467,21 @@ class ChatWithLLM(ChatFrame):
             return "Aquí tienes las fuentes que encajan. ¿Te abro alguna?"
 
     def _compose_system_budgeted(self, user_text: str, max_tokens: int = 256):
+        # Política estricta: no inventar si no hay contexto
         base_sys = (
-            "Eres PACqui. Español neutro. 1) Da 2–3 frases útiles. "
-            "2) Si hay [Contexto (índice)], lista rutas en viñetas EXACTAS. "
-            "3) Si hay [Contexto del repositorio], explica citando [n]. "
-            "No inventes ni menciones rutas no dadas. Si el contexto no basta, dilo y sugiere cómo afinar."
+            "Eres PACqui. Responde SIEMPRE en español neutro. "
+            "Usa ÚNICAMENTE la información del CONTEXTO adjunto. "
+            "Si hay [FRAGMENTOS], fundamenta y CITA usando [n]. "
+            "Si NO hay [FRAGMENTOS] pero hay [ÍNDICE], limita la salida a sugerir rutas (viñetas) sin añadir contenido. "
+            "Si no hay contexto suficiente, responde exactamente: "
+            "\"No tengo suficiente contexto del repositorio para responder con certeza. "
+            "Abre una de las rutas sugeridas o concreta la búsqueda.\""
         )
 
         # Contexto inicial (auto-escala con el ctx del modelo)
         ctx = int(getattr(self.llm, "ctx", 2048) or 2048)
-        # Preset súper contenido para CPU: muy pocas rutas y RAG mínimo
-        idx_top, idx_note_chars = 2, 140
-        rag_k, rag_frag_chars = 1, 220
+        idx_top, idx_note_chars = 3, 180  # un poco más generoso
+        rag_k, rag_frag_chars = 3, 260  # más fragmentos y algo más largos
 
         def shrink(text: str, max_chars: int) -> str:
             t = (text or "").strip()
@@ -4493,81 +4495,66 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 return max(1, int(len(s) / 4))
 
-        # Construcción de contextos
+        # 1) Construcción de contextos
         idx_ctx, hits = self.llm.build_index_context(user_text, top_k=idx_top, max_note_chars=idx_note_chars)
         rag_q = user_text
         if getattr(self, "_ext_filter", None):
             rag_q = user_text + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
-        # >>> ESTA LÍNEA ES LA QUE FALTABA <<<
         rag_ctx = self.llm._rag_retrieve(rag_q, k=rag_k, max_chars=rag_frag_chars)
-        # --- NUEVO: bloques que usa build_system_text() ---
+
+        # 2) Bloques secundarios
         try:
-            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(
-                hits, max_items=3, max_obs_chars=200
-            )
+            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=200)
         except Exception:
             obs_block, rutas_block = "", ""
 
         try:
-            concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5) or ""
+            concept_block = self.llm.concept_context(user_text, max_chars=420, top_k=5) or ""
         except Exception:
             concept_block = ""
 
-        # --------------------------------------------------
-
+        # 3) Ensamblado con etiquetas que entiende el recortador del LLMService
         def build_system_text():
             parts = [base_sys]
-            if concept_block:
-                parts += ["[CONCEPTOS]", concept_block]
-            if obs_block:
-                parts += ["[OBSERVACIONES]", obs_block]
-            if rutas_block:
-                parts += ["[RUTAS]", rutas_block]
-            if idx_ctx:
-                parts += ["[Contexto (índice)]", idx_ctx]
-            if rag_ctx:
-                parts += ["[Contexto del repositorio]", rag_ctx]
+            if concept_block: parts += ["[CONCEPTOS]", concept_block]
+            if obs_block:     parts += ["[OBSERVACIONES]", obs_block]
+            if rutas_block:   parts += ["[RUTAS]", rutas_block]
+            if idx_ctx:       parts += ["[ÍNDICE]", idx_ctx]
+            if rag_ctx:       parts += ["[FRAGMENTOS]", rag_ctx]
             return "\n\n".join(parts).strip()
-
-        #concept_block = self.llm.concept_context(user_text, max_chars=480, top_k=5)
-        #if concept_block:
-            #parts += ["[CONCEPTOS CLAVE]", concept_block]
-
-        # ❌ (bloque parts/join eliminado aquí)
 
         sys_full = build_system_text()
 
-        # --- Overhead del render de mensajes ---
+        # 4) Presupuesto: baja el overhead y sube la salida efectiva
         def used_effective():
-            # 1.35x margen + 20 tokens plantilla
-            return int(1.35 * (toklen(sys_full) + toklen(user_text))) + 20
+            # margen prudente (chat-format) + pequeño fijo
+            return int(1.15 * (toklen(sys_full) + toklen(user_text))) + 10
 
         used = used_effective()
         resp_budget = int(max_tokens)
 
-        # Recorte en bucle hasta que prompt + respuesta <= ctx - 64
+        # 5) Ajuste iterativo hasta encajar en ctx
         for _ in range(10):
             if used + resp_budget <= ctx - 64:
                 break
-            # (1) Acorta RAG
             if rag_ctx and len(rag_ctx) > 180:
-                rag_frag_chars = max(200, int(rag_frag_chars * 0.7))
+                rag_frag_chars = max(180, int(rag_frag_chars * 0.80));
                 rag_ctx = shrink(rag_ctx, rag_frag_chars)
-            # (2) Menos rutas / notas más cortas
             elif hits and idx_top > 1:
                 idx_top = max(1, idx_top - 1)
-                idx_note_chars = max(100, int(idx_note_chars * 0.8))
+                idx_note_chars = max(120, int(idx_note_chars * 0.85))
                 idx_ctx, hits = self.llm.build_index_context(user_text, top_k=idx_top, max_note_chars=idx_note_chars)
-            # (3) Baja tokens de respuesta
-            elif resp_budget > 64:
-                resp_budget = max(64, int(resp_budget * 0.75))
+            elif resp_budget > 96:
+                resp_budget = max(96, int(resp_budget * 0.85))
             else:
                 break
             sys_full = build_system_text()
             used = used_effective()
 
-        max_final = min(80, max(48, min(resp_budget, ctx - used - 64)))
-        msgs = [{"role": "system", "content": sys_full}, {"role": "user", "content": user_text}]
+        # ⬅️ Aquí estaba el corte: quita el min(80, …) y dalo dinámico
+        max_final = max(160, min(resp_budget, ctx - used - 64, 384))
+        msgs = [{"role": "system", "content": sys_full},
+                {"role": "user", "content": user_text}]
         return msgs, hits, max_final
 
     def _log_qa_if_possible(self, full_answer: str):
@@ -4663,8 +4650,19 @@ class ChatWithLLM(ChatFrame):
         except Exception:
             pass
 
+        # Sincroniza el flag con el checkbox por si hubiera quedado desfasado
+        try:
+            self.notes_only = bool(self.var_notes_only.get())
+        except Exception:
+            pass
+
         # modo “Solo índice” o sin modelo → respuesta determinista
         if (not self.llm.is_loaded()) or self.notes_only:
+            try:
+                why = "modelo no cargado" if (not self.llm.is_loaded()) else "modo 'Solo índice' activo"
+                self.progress(f"Bypass LLM → {why}. Respondo con observaciones/rutas.")
+            except Exception:
+                pass
             try:
                 self._reply_with_observations(q)
             except Exception:
@@ -4683,7 +4681,7 @@ class ChatWithLLM(ChatFrame):
 
             try:
                 # 1) Construye mensajes + presupuesto con el helper centralizado
-                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=96)
+                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=768)
 
                 # 2) Rutas debajo de la respuesta para coexistir con el modelo
                 try:
@@ -4922,12 +4920,11 @@ class ChatWithLLM(ChatFrame):
 
         # 2) System: tono persona + prohibición de inventar
         base_sys = (
-            "Eres PACqui. Ayudas al usuario con un tono cercano y profesional. "
-            "TU ÚNICA FUENTE permitida son las OBSERVACIONES que verás a continuación. "
-            "Si algo NO está en esas observaciones, NO lo inventes. "
-            "FORMATO DE RESPUESTA: (1) 2–3 frases que respondan a la pregunta usando esas observaciones; "
-            "(2) un bloque 'Rutas sugeridas:' con viñetas (nombre y ruta). "
-            "Si las observaciones no bastan, dilo explícitamente."
+            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
+            "Usa EXCLUSIVAMENTE los [FRAGMENTOS] y, si faltan, el [ÍNDICE]. "
+            "Cita SIEMPRE con [n] según el orden de los fragmentos. "
+            "PROHIBIDO inventar datos que no aparezcan en los fragmentos ni en el índice. "
+            "Si no hay evidencia suficiente, di explícitamente que no puedes responder con el repositorio actual."
         )
 
         # 3) Ensamblamos contextos
@@ -5090,15 +5087,75 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
-    def _stream_llm_with_fallback(self, messages, max_tokens=256, temperature=0.2, suffix: str = ""):
+    def _stream_llm_with_fallback(self, messages, max_tokens=768, temperature=0.2, suffix: str = ""):
         import threading, time, queue
         # UI: arranque
         self._spinner_start()
         if getattr(self, "stop_event", None):
             self.stop_event.clear()
         q = queue.Queue()
-        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False}
+        state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False, "watchdog_strikes": 0}
         out_buf = []
+
+        # === PATCH RAG MESSAGE START ===
+        user_q = self.entry.get().strip() if hasattr(self, "entry") else (user_text if 'user_text' in locals() else "")
+
+        # 1) Construye contexto de índice + RAG
+        idx_ctx, idx_hits = self.llm.build_index_context(user_q, top_k=6, max_note_chars=280)
+        rag_ctx = self.llm._rag_retrieve(user_q, k=8, max_chars=1200)
+
+        # 2) Monta el contenido del 'user' con secciones claras
+        ucontent = (
+                "[INSTRUCCIONES]\n"
+                "Responde usando SOLO lo que aparece abajo en [FRAGMENTOS] y, si no alcanza, el [ÍNDICE]. "
+                "Cita con [n]. Si no hay fragmentos relevantes, dilo.\n\n"
+                "[FRAGMENTOS]\n" + (rag_ctx or "(vacío)") + "\n\n"
+                                                            "[ÍNDICE]\n" + (idx_ctx or "(sin índice)") + "\n\n"
+                                                                                                         "[PREGUNTA]\n" + user_q
+        )
+        # === PATCH: forzar el prompt con RAG/ÍNDICE ===
+        import os
+
+        # System fuerte para prohibir alucinar
+        base_sys = (
+            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
+            "Usa EXCLUSIVAMENTE lo que aparece en [FRAGMENTOS] y, si hace falta, en [ÍNDICE]. "
+            "CITA con [n]. Si no hay fragmentos relevantes, responde: "
+            "'No dispongo de fragmentos suficientes del repositorio para responder con garantías'. "
+            "Prohibido inventar datos que no estén en los fragmentos."
+        )
+
+        # Sustituimos los 'messages' reales que enviaremos al modelo
+        messages = [
+            {"role": "system", "content": base_sys},
+            {"role": "user", "content": ucontent},
+        ]
+
+        # Respeto variable de entorno para el máximo de salida si existe
+        try:
+            mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
+            if mt_env > 0:
+                max_tokens = mt_env
+        except Exception:
+            pass
+
+        # Traza de presupuesto real (prompt + salida)
+        try:
+            ctx = int(getattr(self.llm, "ctx", 4096) or 4096)
+            tin = sum(self.llm.count_tokens((m.get("content") or "")) for m in messages)
+            print(f"[TOKENS] ctx={ctx}  in≈{tin}  out_max={int(max_tokens)}")
+        except Exception:
+            pass
+        # === FIN PATCH ===
+
+        # 3) Traza útil
+        try:
+            tin = self.llm.count_tokens(ucontent)
+            print(f"[RAG] frags={(rag_ctx.count('[', 0) if rag_ctx else 0)}  idx_len={len(idx_ctx)}  in_tokens≈{tin}")
+        except Exception:
+            pass
+
+        # === PATCH RAG MESSAGE END ===
 
         def _p(msg: str):
             try:
@@ -5137,7 +5194,10 @@ class ChatWithLLM(ChatFrame):
                 else:
                     # cierre UI
                     try:
+                        if suffix:
+                            self._append_stream_text("\n" + suffix)
                         self._append_stream_text("", end_turn=True)
+
                     except Exception:
                         pass
                     try:
@@ -5157,19 +5217,26 @@ class ChatWithLLM(ChatFrame):
         self.after(0, _paint_loop)
 
         # Fallback sin streaming (bloquea SOLO el worker)
-        def _fallback(reason: str):
-            _p(f"Fallback sin streaming ({reason})…")
+        # Fallback preferente: streaming con completion (modo instruct) para sacar 1er token MUY pronto
+        def _fallback(
+                reason: str,
+                _messages=messages,
+                _max_tokens=max_tokens,
+                _temperature=temperature
+        ):
+
+            _p(f"Fallback preferente (completion stream) — {reason}…")
             import threading, time
 
-            # Estimación para deadline
+            # Estimación para deadline y logging
             try:
                 est_in = sum(self.llm.count_tokens((m.get("content") or "")) for m in (messages or []))
             except Exception:
                 est_in = 0
-            DEADLINE = max(45.0, min(180.0, 12.0 + 0.08 * float(est_in)))
-            _p(f"Fallback: tokens_in≈{est_in}, deadline≈{int(DEADLINE)}s.")
+            DEADLINE = max(60.0, min(240.0, 15.0 + 0.10 * float(est_in)))
+            _p(f"Fallback: tokens_in≈{int(est_in)}, deadline≈{int(DEADLINE)}s.")
 
-            result = {"txt": None, "err": None, "done": False}
+            result = {"txt": "", "err": None, "done": False}
 
             def _to_instruct(_msgs: list[dict]) -> str:
                 # Instruct simple y robusto (modelo instruct o genérico)
@@ -5181,46 +5248,47 @@ class ChatWithLLM(ChatFrame):
 
             def _call():
                 try:
-                    # 1) chat no-stream
-                    resp = self.llm.chat(messages=messages, max_tokens=max_tokens,
-                                         temperature=temperature, stream=False)
-                    ch0 = (resp.get("choices") or [{}])[0]
-                    txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or ""
-                    if not txt:
-                        raise RuntimeError("chat non-stream vacío")
+                    # 1) completion STREAMING (prioritario por latencia de 1er token)
+                    prompt = _to_instruct(_messages)
+                    model = getattr(self.llm, "model", None)
+                    if model is None:
+                        raise RuntimeError("model no disponible")
 
-                    result["txt"] = txt
-                except Exception:
-                    # 2) completion stream (prompt instruct)
-                    try:
-                        prompt = _to_instruct(messages)
-                        model = getattr(self.llm, "model", None)
-                        if model is None:
-                            raise RuntimeError("model no disponible")
+                    out_chunks = []
+                    for chunk in model.create_completion(prompt=prompt, temperature=_temperature,
+                                                         max_tokens=_max_tokens, stream=True):
 
-                        out_chunks = []
-                        for chunk in model.create_completion(prompt=prompt, temperature=temperature,
-                                                             max_tokens=max_tokens, stream=True):
-                            if getattr(self, "stop_event", None) and self.stop_event.is_set():
-                                break
-                            delta = ""
+                        if getattr(self, "stop_event", None) and self.stop_event.is_set():
+                            break
+                        delta = ""
+                        try:
+                            delta = (chunk.get("choices") or [{}])[0].get("text", "")
+                        except Exception:
+                            pass
+                        if delta:
+                            t = self.app._normalize_text(delta) if hasattr(self.app, "_normalize_text") else delta
+                            out_chunks.append(t)
+                            # Pintado progresivo
                             try:
-                                delta = (chunk.get("choices") or [{}])[0].get("text", "")
+                                self.after(0, lambda tt=t: self._append_stream_text(tt))
                             except Exception:
                                 pass
-                            if delta:
-                                t = self.app._normalize_text(delta) if hasattr(self.app, "_normalize_text") else delta
-                                out_chunks.append(t)
-                                self.after(0, lambda tt=t: self._append_stream_text(tt))
-                        txt2 = "".join(out_chunks).strip()
-                        if not txt2:
-                            # 3) completion no-stream (último recurso)
-                            resp2 = model.create_completion(prompt=prompt, temperature=temperature,
-                                                            max_tokens=max_tokens)
-                            txt2 = ((resp2.get("choices") or [{}])[0].get("text", "") or "").strip()
-                        result["txt"] = txt2
-                    except Exception as e2:
-                        result["err"] = str(e2)
+                            # Aunque no haya terminado, guarda progreso parcial por si corta el DEADLINE
+                            result["txt"] = "".join(out_chunks)
+
+                    # 2) Si por cualquier motivo no hay texto, probamos chat no-stream como último recurso
+                    if not result["txt"]:
+                        try:
+                            resp = self.llm.chat(messages=_messages, max_tokens=_max_tokens,
+                                                 temperature=_temperature, stream=False)
+
+                            ch0 = (resp.get("choices") or [{}])[0]
+                            txt = (ch0.get("message") or {}).get("content", "") or ch0.get("text", "") or ""
+                            result["txt"] = txt
+                        except Exception as e2:
+                            result["err"] = str(e2)
+                except Exception as e:
+                    result["err"] = str(e)
                 finally:
                     result["done"] = True
 
@@ -5232,50 +5300,27 @@ class ChatWithLLM(ChatFrame):
                 time.sleep(0.25)
 
             if not result["done"]:
-                # Cancelación y texto amable
+                # Cancelación y texto amable (dejando lo ya pintado)
                 try:
                     if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
                         self.llm.cancel()
                 except Exception:
                     pass
+                result["err"] = (result["err"] or "timeout")
+                result["done"] = True
+
+            # Cierre amable
+            txt = (result["txt"] or "").strip()
+            if not txt:
                 txt = "Ahora mismo no he podido generar respuesta del modelo."
             else:
-                txt = (result["txt"] or "").strip()
-                if not txt and result.get("err"):
-                    txt = f"[error] {result['err']}"
-
-            if suffix:
-                txt = (txt or "") + ("\n\n" + suffix)
-
-            # Volcado por la ruta estable (no streaming) garantizado
-            try:
-                self.after(0, lambda: self._append_chat("PACqui", txt or ""))
-            except Exception:
+                # cierre de pintado (no duplicar: el paint-loop añade el sufijo)
                 try:
-                    self._append_chat("PACqui", txt or "")
+                    # añade el fragmento final al buffer para el log
+                    out_buf.append("")
+                    self._log_qa_if_possible("".join(out_buf) + txt)
                 except Exception:
                     pass
-
-            # Cierre del turno (aunque el worker quede colgado)
-            try:
-                state["done"] = True
-            except Exception:
-                pass
-            try:
-                self._spinner_stop()
-            except Exception:
-                pass
-            try:
-                t0s = getattr(self, "_turn_start_ts", None)
-                if t0s:
-                    self.progress(f"Listo ({int((time.time() - t0s) * 1000)} ms).")
-            except Exception:
-                pass
-            try:
-                out_buf.append(txt or "")
-                self._log_qa_if_possible("".join(out_buf))
-            except Exception:
-                pass
             try:
                 q.put(None)  # cerrar paint loop
             except Exception:
@@ -5317,35 +5362,126 @@ class ChatWithLLM(ChatFrame):
 
             _p(f"Watchdog: tokens_in≈{est_in}, timeout≈{int(TIMEOUT)}s.")
 
-            # 3) Vigilancia simple: si no llega 1er token, cancelar stream y lanzar fallback
+            # 3) Vigilancia con dos fases: ampliación y, si persiste, cancelación
             while not self.stop_event.is_set():
                 time.sleep(1.0)
-                if state["tokens"] == 0 and (time.time() - state["last_ts"] > TIMEOUT):
-                    state["timed_out"] = True
-                    _p(f"Timeout {int(TIMEOUT)}s sin tokens → cancelando stream.")
-                    try:
-                        if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
-                            self.llm.cancel()
-                    except Exception:
-                        pass
-                    try:
-                        self.stop_event.set()
-                    except Exception:
-                        pass
-                    # >>> LLAMA SIEMPRE al fallback, aunque el worker se quede colgado
-                    _start_fallback("timeout")
-                    break
+
+                # si ya llegó algún token, el watchdog no hace nada
+                if state["tokens"] > 0:
+                    continue
+
+                elapsed = time.time() - state["last_ts"]
+                if elapsed <= TIMEOUT:
+                    continue
+
+                # Strike 1: con contexto alto o modelo "frío", ampliamos margen una vez
+                if state["watchdog_strikes"] == 0 and (est_in >= 350 or not getattr(self.llm, "_warmed", False)):
+                    state["watchdog_strikes"] = 1
+                    # ampliación: 60 s extra + 60% del TIMEOUT actual, acotado por 2×MAX
+                    extra = max(45.0, TIMEOUT * 0.60 + 60.0)
+                    TIMEOUT = min(self.FIRST_TOKEN_TIMEOUT_MAX_S * 2.0, TIMEOUT + extra)
+                    state["last_ts"] = time.time()
+                    _p(f"[Watchdog] Sin tokens tras {int(elapsed)}s → ampliando margen a ≈{int(TIMEOUT)}s "
+                       f"(contexto≈{int(est_in)}, warmed={getattr(self.llm, '_warmed', False)}).")
+                    continue
+
+                # Strike 2: ahora sí, cancelamos y lanzamos fallback
+                state["timed_out"] = True
+                _p(f"Timeout {int(elapsed)}s sin tokens → cancelando stream (fallback).")
+                try:
+                    if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
+                        self.llm.cancel()
+                except Exception:
+                    pass
+                try:
+                    self.stop_event.set()
+                except Exception:
+                    pass
+                _start_fallback("timeout")
+                break
 
         threading.Thread(target=_watchdog, daemon=True).start()
 
         # Worker del stream
-        def _worker():
+        def _worker(
+                _messages=messages,
+                _max_tokens=max_tokens,
+                _temperature=temperature
+        ):
+
             try:
                 _p("Abriendo stream del modelo…")
                 state["last_ts"] = time.time()
+                _p(f"[CHAT] out_max={int(max_tokens)}  ctx={getattr(self.llm, 'ctx', None)}")
                 try:
-                    stream = self.llm.chat(messages=messages, max_tokens=max_tokens, temperature=temperature,
+                    print(f"[CHAT] out_max={int(max_tokens)}  ctx={getattr(self.llm, 'ctx', None)}")
+                except Exception:
+                    pass
+
+                # === PATCH: forzar FRAGMENTOS/ÍNDICE en el prompt real ===
+                import os
+
+                # a) Pregunta actual (si no hay entry, toma el último 'user' de messages)
+                try:
+                    user_q = self.entry.get().strip()
+                except Exception:
+                    try:
+                        user_q = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+                    except Exception:
+                        user_q = ""
+
+                # b) Construye contexto de índice + RAG
+                idx_ctx, _idx_hits = self.llm.build_index_context(user_q, top_k=6, max_note_chars=280)
+                rag_ctx = self.llm._rag_retrieve(user_q, k=8, max_chars=1200)
+
+                # c) Ensambla el contenido del usuario con secciones claras
+                ucontent = (
+                        "[INSTRUCCIONES]\n"
+                        "Responde usando SOLO lo que aparece abajo en [FRAGMENTOS] y, si no alcanza, el [ÍNDICE]. "
+                        "Cita con [n]. Si no hay fragmentos relevantes, dilo.\n\n"
+                        "[FRAGMENTOS]\n" + (rag_ctx or "(vacío)") + "\n\n"
+                                                                    "[ÍNDICE]\n" + (idx_ctx or "(sin índice)") + "\n\n"
+                                                                                                                 "[PREGUNTA]\n" + user_q
+                )
+
+                # d) System fuerte (obliga a usar repo)
+                base_sys = (
+                    "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
+                    "Usa EXCLUSIVAMENTE lo que aparece en [FRAGMENTOS] y, si hace falta, en [ÍNDICE]. "
+                    "CITA con [n]. Si no hay fragmentos, responde: "
+                    "'No dispongo de fragmentos suficientes del repositorio para responder con garantías'. "
+                    "Prohibido inventar datos que no estén en los fragmentos."
+                )
+
+                # e) SUSTITUIMOS los 'messages' que enviaremos al modelo
+                messages = [
+                    {"role": "system", "content": base_sys},
+                    {"role": "user", "content": ucontent},
+                ]
+
+                # f) Respeta variable de entorno para el máximo de salida si existe
+                try:
+                    mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
+                    if mt_env > 0:
+                        max_tokens = mt_env
+                except Exception:
+                    pass
+
+                # g) Traza útil de presupuesto
+                try:
+                    ctx = int(getattr(self.llm, "ctx", 4096) or 4096)
+                    tin = self.llm.count_tokens(ucontent)
+                    print(
+                        f"[RAG] frags={rag_ctx.count('[') if rag_ctx else 0}  idx_len={len(idx_ctx)}  in_tokens≈{tin}")
+                    print(f"[CHAT] out_max={int(max_tokens)}  ctx={ctx}")
+                except Exception:
+                    pass
+                # === FIN PATCH ===
+
+                try:
+                    stream = self.llm.chat(messages=_messages, max_tokens=_max_tokens, temperature=_temperature,
                                            stream=True)
+
                     _p("Stream abierto ✅. Esperando primer token…")
                 except Exception as e:
                     _p(f"No se pudo abrir el stream: {e}")
@@ -5384,6 +5520,7 @@ class ChatWithLLM(ChatFrame):
                 q.put(None)  # fin normal
 
             except Exception as e:
+                _p(f"[stream] {type(e).__name__}: {e}")
                 _fallback(f"error: {e}")
 
         threading.Thread(target=_worker, daemon=True).start()

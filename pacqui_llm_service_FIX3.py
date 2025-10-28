@@ -9,16 +9,20 @@ def _cpu_autotune(ctx_tokens: int):
     cores = multiprocessing.cpu_count() or 4
     # Hilos: usa todos menos 1 si hay >=6; si no, todos
     n_threads = int(os.getenv("PACQUI_THREADS", str(cores - 1 if cores >= 6 else cores)))
-    # Batch: tope razonable para CPU; sobreescribible por env
-    n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "256")))
+    # Batch de CPU (alto → puede disparar bugs en Q8_0 si te pasas)
+    n_batch = min(ctx_tokens, int(os.getenv("PACQUI_N_BATCH", "192")))
+    # Micro-batch bajo evita 'invalid logits id' en algunas builds Windows
+    n_ubatch = int(os.getenv("PACQUI_N_UBATCH", "32"))
     # CPU-only
     n_gpu_layers = 0
     # I/O rápido
     use_mmap = True
-    # mlock opcional (1 para activarlo si tu OS lo permite)
+    # mlock opcional
     use_mlock = bool(int(os.getenv("PACQUI_MLOCK", "0")))
-    return dict(n_threads=n_threads, n_batch=n_batch,
+    return dict(n_threads=n_threads, n_batch=n_batch, n_ubatch=n_ubatch,
                 n_gpu_layers=n_gpu_layers, use_mmap=use_mmap, use_mlock=use_mlock)
+
+
 
 
 def _get_keywords(cur, fullpath: str):
@@ -58,7 +62,7 @@ class LLMService:
         self.ctx = 2048
 
         # Reserva 1–2 cores para la UI
-        import os
+
         self.threads = max(2, (os.cpu_count() or 4) - 2)
 
         # Más conservador para primer run (evita picos)
@@ -75,10 +79,10 @@ class LLMService:
 
     # --------- carga ---------
 
-    def load(self, model_path: str, ctx: int = 2048):
+    def load(self, model_path: str, ctx: int = 8192):
         from llama_cpp import Llama
+        import os
         name = Path(model_path).name.lower()
-        # Detecta formato de chat para reducir overhead del prompt
         chat_fmt = "llama-2"
         if "mistral" in name:
             chat_fmt = "mistral-instruct"
@@ -87,16 +91,16 @@ class LLMService:
         elif "phi" in name:
             chat_fmt = "phi3"
 
-        # --- Idempotencia: si ya está cargado lo mismo, retorna rápido ---
-        if self.model and self.model_path == model_path and int(self.ctx) == int(ctx or 2048):
+        # Idempotencia
+        if self.model and self.model_path == model_path and int(self.ctx) == int(
+                ctx or os.getenv("PACQUI_CTX", "8192")):
             return
 
-        # Reset flags de warmup
-        self._warmed = False
+        self._warmed = False;
         self._warming = False
-
         self.model_path = model_path
-        self.ctx = int(ctx or 2048)
+        # ↑↑ ctx por variable de entorno, default 8192 (antes 2048)
+        self.ctx = int(ctx or int(os.getenv("PACQUI_CTX", "8192")))
 
         perf = _cpu_autotune(self.ctx)
         self.model = Llama(
@@ -104,7 +108,8 @@ class LLMService:
             n_ctx=self.ctx,
             n_threads=perf["n_threads"],
             n_batch=perf["n_batch"],
-            n_gpu_layers=perf["n_gpu_layers"],  # CPU-only
+            n_ubatch=perf["n_ubatch"],
+            n_gpu_layers=perf["n_gpu_layers"],
             f16_kv=True,
             use_mmap=perf["use_mmap"],
             vocab_only=False,
@@ -480,11 +485,20 @@ class LLMService:
             cur = con.cursor()
 
             # tokens significativos de la query
-            toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{4,}", (query or ""))]
+            toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", (query or ""))]
             STOP = {"para", "con", "por", "unos", "unas", "este", "esta", "esto", "sobre", "desde", "hasta",
                     "entre", "que", "como", "cual", "cuales", "de", "la", "el", "los", "las", "y", "o", "u",
                     "del", "al"}
-            toks = [t for t in toks if t not in STOP][:4]  # máximo 4
+            toks = [t for t in toks if t not in STOP][:6]  # un poco más laxo y hasta 6 términos
+
+            # ⚑ whitelists útiles del dominio
+            qlow = (query or "").lower()
+            if "mic" in qlow and "mic" not in toks:
+                toks.append("mic")
+            if "fega" in qlow and "feaga" not in toks:
+                toks.append("feaga")
+            if "feader" in qlow and "feader" not in toks:
+                toks.append("feader")
 
             if toks:
                 clauses, params = [], []
@@ -513,7 +527,7 @@ class LLMService:
         finally:
             con.close()
 
-    def _rag_retrieve(self, query: str, k: int = 4, max_chars: int = 700) -> str:
+    def _rag_retrieve(self, query: str, k: int = 8, max_chars: int = 1200) -> str:
         """
         Recupera k fragmentos re-ordenando por similitud + preferencia de extensión (PDF/DOCX),
         SIN depender de self.rag (usa chunks/embeddings del SQLite).
@@ -521,7 +535,7 @@ class LLMService:
         import re, os, struct
         from pathlib import Path
 
-        rows = self._rag_rows(query, max_candidates=600)
+        rows = self._rag_rows(query, max_candidates=900)
 
         if not rows:
             return ""
@@ -666,37 +680,65 @@ class LLMService:
                 pass
 
             # 3) micro-chat para compilar grafo/KV — SIEMPRE bajo lock
+            # 3) micro-warmup SIN chat-format para compilar grafo/KV — SIEMPRE bajo lock
             try:
                 if self.model is not None:
                     with self._model_lock:
-                        # usa TU propio wrapper .chat() (no intentes encadenar self.model.self.app...)
-                        self.chat(
-                            messages=[{"role": "system", "content": "ok"},
-                                      {"role": "user", "content": "ok"}],
-                            max_tokens=1, temperature=0.0, stream=False
-                        )
-
+                        try:
+                            _ = self.model.create_completion(
+                                prompt="ok", max_tokens=1, temperature=0.0
+                            )
+                        except Exception:
+                            # Si tu build no expone 'create_completion', ignora el warmup
+                            pass
             except Exception:
                 pass
+
         finally:
             self._warmed = True
             self._warming = False
 
     # === PEGAR DENTRO DE class LLMService, sustituyendo a los métodos existentes ===
 
-    def chat(self, messages, temperature: float = 0.3, max_tokens: int = 256, stream: bool = True):
-        """Llama a llama.cpp (create_chat_completion). Sin sufijos raros.
-        Maneja cache_prompt si está disponible y recorta contexto si hace falta."""
+    def chat(self, messages, temperature: float = 0.3, max_tokens: int = 768, stream: bool = True):
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
 
-        # Política de idioma (ES)
+        # Política ES
         ES_POLICY = ("Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
                      "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español.")
+        # Presupuesto de salida: por env si está definido
+        try:
+            import os
+            if max_tokens is None or int(max_tokens) <= 0:
+                max_tokens = int(os.getenv("PACQUI_MAX_TOKENS", "768"))
+        except Exception:
+            pass
+
+        # Traza de tokens de entrada aproximados
+        try:
+            user_blob = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+            in_tok = self.count_tokens(user_blob)
+            print(f"[TOKENS] ctx={self.ctx}  in≈{in_tok}  out_max={int(max_tokens)}")
+        except Exception:
+            pass
+
         has_es = any((m.get("role") == "system" and "español" in (m.get("content", "").lower()))
                      for m in (messages or []))
         if not has_es:
             messages = [{"role": "system", "content": ES_POLICY}] + list(messages or [])
+
+        # Presupuesto de salida: env > default=768
+        import os
+        out_tok = int(os.getenv("PACQUI_MAX_TOKENS", "768")) if max_tokens is None else int(max_tokens)
+
+        # Traza aproximada de tokens de entrada
+        try:
+            user_blob = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+            in_tok = self.count_tokens(user_blob)
+            print(f"[TOKENS] ctx={self.ctx}  in≈{in_tok}  out_max={out_tok}")
+        except Exception:
+            pass
 
         try:
             with self._model_lock:
@@ -704,30 +746,29 @@ class LLMService:
                     return self.model.create_chat_completion(
                         messages=messages,
                         temperature=float(temperature),
-                        max_tokens=int(max_tokens),
+                        max_tokens=int(out_tok),
                         stream=bool(stream),
                         cache_prompt=True,
                     )
                 except TypeError:
-                    # build sin cache_prompt
                     return self.model.create_chat_completion(
                         messages=messages,
                         temperature=float(temperature),
-                        max_tokens=int(max_tokens),
+                        max_tokens=int(out_tok),
                         stream=bool(stream),
                     )
         except (RuntimeError, ValueError) as e:
-            # recorte y reintento si nos pasamos de contexto
             msg = str(e)
             if "context window" in msg or "exceed context" in msg:
-                out_tok = max(128, min(256, int(self.ctx * 0.12)))
-                budget_in = max(256, self.ctx - out_tok - 64)
+                # Recalcula presupuesto ante overflow
+                out_tok2 = max(256, min(1024, int(self.ctx * 0.18)))
+                budget_in = max(512, self.ctx - out_tok2 - 64)
                 safe_msgs = self._shrink_messages(messages, budget_in_tokens=budget_in)
                 with self._model_lock:
                     return self.model.create_chat_completion(
                         messages=safe_msgs,
                         temperature=float(temperature),
-                        max_tokens=int(out_tok),
+                        max_tokens=int(out_tok2),
                         stream=bool(stream),
                     )
             raise
