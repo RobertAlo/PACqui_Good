@@ -574,7 +574,15 @@ class LLMService:
             fname = os.path.basename(path or "").lower()
             fname_bonus = sum(1 for t in toks if t in fname)
             ext_adj = EXT_BONUS.get(ext, 0) + EXT_MALUS.get(ext, 0)
-            scored.append((base * 10 + ext_adj * 5 + fname_bonus * 2, text or "", path or ""))
+
+            # --- BOOST dominio PAC/MIC/SICOP/PEPAC ---
+            mic_terms = (
+            " mic ", " ficheros de pago ", " fichero de pago ", " sicop ", " pepac ", " feaga ", " feader ")
+            txt_low = (text or "").lower()
+            dom_boost = 1.5 if (
+                        any(t in txt_low for t in mic_terms) or any(t.strip() in fname for t in mic_terms)) else 0.0
+
+            scored.append((base * 10 + ext_adj * 5 + fname_bonus * 2 + dom_boost, text or "", path or ""))
 
         if not scored:
             return ""
@@ -775,10 +783,8 @@ class LLMService:
 
     def stream_chat(self, messages, temperature: float = 0.3, max_tokens: int = 256):
         """Wrapper que devuelve un iterable de eventos de stream."""
-        resp = self.chat(messages=messages, temperature=temperature,
-                         max_tokens=max_tokens, stream=True)
-        # llama.cpp ya devuelve un generador de chunks cuando stream=True.
-        return resp
+        return self.chat(messages=messages, temperature=temperature, max_tokens=int(max_tokens), stream=True)
+
     # === FIN BLOQUE ===
 
 

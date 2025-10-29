@@ -4469,13 +4469,12 @@ class ChatWithLLM(ChatFrame):
     def _compose_system_budgeted(self, user_text: str, max_tokens: int = 256):
         # Política estricta: no inventar si no hay contexto
         base_sys = (
-            "Eres PACqui. Responde SIEMPRE en español neutro. "
-            "Usa ÚNICAMENTE la información del CONTEXTO adjunto. "
-            "Si hay [FRAGMENTOS], fundamenta y CITA usando [n]. "
-            "Si NO hay [FRAGMENTOS] pero hay [ÍNDICE], limita la salida a sugerir rutas (viñetas) sin añadir contenido. "
-            "Si no hay contexto suficiente, responde exactamente: "
-            "\"No tengo suficiente contexto del repositorio para responder con certeza. "
-            "Abre una de las rutas sugeridas o concreta la búsqueda.\""
+            "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
+            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
+            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
+            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
+            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
+            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
         )
 
         # Contexto inicial (auto-escala con el ctx del modelo)
@@ -4920,11 +4919,12 @@ class ChatWithLLM(ChatFrame):
 
         # 2) System: tono persona + prohibición de inventar
         base_sys = (
-            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE los [FRAGMENTOS] y, si faltan, el [ÍNDICE]. "
-            "Cita SIEMPRE con [n] según el orden de los fragmentos. "
-            "PROHIBIDO inventar datos que no aparezcan en los fragmentos ni en el índice. "
-            "Si no hay evidencia suficiente, di explícitamente que no puedes responder con el repositorio actual."
+            "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
+            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
+            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
+            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
+            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
+            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
         )
 
         # 3) Ensamblamos contextos
@@ -5041,6 +5041,18 @@ class ChatWithLLM(ChatFrame):
                 pass
             norm = str(txt)
 
+        # (debajo de self.txt_chat.insert(...))
+        try:
+            # rango del último bloque insertado
+            start_idx = self.txt_chat.index("end-1c linestart")
+            end_idx = self.txt_chat.index("end-1c")
+            self._linkify_paths(start_idx, end_idx)
+        except Exception as e:
+            try:
+                self.progress(f"_append_stream_text linkify: {e}")
+            except Exception:
+                pass
+
         # Abrir el Text para edición
         try:
             self.txt_chat.configure(state="normal")
@@ -5087,6 +5099,61 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
+    def _open_path_at_cursor(self, widget, x, y):
+        try:
+            idx = widget.index(f"@{x},{y}")
+            tags = widget.tag_names(idx)
+            if "pathlink" not in tags:
+                return
+            # Recupera la ruta del tag
+            ranges = widget.tag_prevrange("pathlink", idx + "+1c")
+            if not ranges:
+                ranges = widget.tag_nextrange("pathlink", "1.0")
+            if not ranges:
+                return
+            start, end = ranges
+            path = widget.get(start, end)
+            import os, subprocess, sys
+            # Abre con el visor del SO
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore
+            elif sys.platform.startswith("darwin"):
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            try:
+                self.progress(f"_open_path_at_cursor: {e}")
+            except Exception:
+                pass
+
+    def _linkify_paths(self, start_idx, end_idx):
+        try:
+            t = self.txt_chat
+            t.tag_configure("pathlink", underline=1, foreground="#0645AD")
+            # Dos patrones típicos que mostramos en el chat
+            for label in ("Ruta:", "Fuente:"):
+                pos = start_idx
+                while True:
+                    pos = t.search(label, pos, stopindex=end_idx)
+                    if not pos:
+                        break
+                    line_end = t.search("\n", pos, stopindex=end_idx) or end_idx
+                    # extrae el texto tras "Ruta:" / "Fuente:" hasta el fin de línea
+                    after = f"{pos}+{len(label)}c"
+                    path = t.get(after, line_end).strip()
+                    if path:
+                        # calcula los índices exactos del path y taggéalo
+                        t.tag_add("pathlink", after, f"{after}+{len(path)}c")
+                    pos = line_end
+            # Bind de click
+            t.tag_bind("pathlink", "<Button-1>", lambda e: self._open_path_at_cursor(e.widget, e.x, e.y))
+        except Exception as e:
+            try:
+                self.progress(f"_linkify_paths: {e}")
+            except Exception:
+                pass
+
     def _stream_llm_with_fallback(self, messages, max_tokens=768, temperature=0.2, suffix: str = ""):
         import threading, time, queue
         # UI: arranque
@@ -5097,32 +5164,89 @@ class ChatWithLLM(ChatFrame):
         state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False, "watchdog_strikes": 0}
         out_buf = []
 
-        # === PATCH RAG MESSAGE START ===
+        """
+        RAG
+        MESSAGE
+        START == ="""
+        # Pregunta del usuario
         user_q = self.entry.get().strip() if hasattr(self, "entry") else (user_text if 'user_text' in locals() else "")
 
-        # 1) Construye contexto de índice + RAG
+        # 1) Contextos: Índice + RAG (top-k y tamaño de fragmentos)
         idx_ctx, idx_hits = self.llm.build_index_context(user_q, top_k=6, max_note_chars=280)
-        rag_ctx = self.llm._rag_retrieve(user_q, k=8, max_chars=1200)
+        # --- Respeta el filtro de extensiones de la UI para el RAG ---
+        q_for_rag = user_q
+        try:
+            extf = set(getattr(self, "_ext_filter", set()) or set())
+        except Exception:
+            extf = set()
+        # El servicio RAG activa el filtro si ve estos tokens en la query
+        if ".pdf" in extf or "pdf" in extf:
+            q_for_rag += " pdf"
+        if ".docx" in extf or "docx" in extf:
+            q_for_rag += " docx"
+        if ".doc" in extf or "doc" in extf:
+            q_for_rag += " doc"
 
-        # 2) Monta el contenido del 'user' con secciones claras
-        ucontent = (
-                "[INSTRUCCIONES]\n"
-                "Responde usando SOLO lo que aparece abajo en [FRAGMENTOS] y, si no alcanza, el [ÍNDICE]. "
-                "Cita con [n]. Si no hay fragmentos relevantes, dilo.\n\n"
-                "[FRAGMENTOS]\n" + (rag_ctx or "(vacío)") + "\n\n"
-                                                            "[ÍNDICE]\n" + (idx_ctx or "(sin índice)") + "\n\n"
-                                                                                                         "[PREGUNTA]\n" + user_q
+        rag_ctx = self.llm._rag_retrieve(q_for_rag, k=8, max_chars=1200)
+
+        # 2) Cortafuegos anti-alucinación: si no hay fragmentos, no llamamos al LLM
+        if not rag_ctx or not rag_ctx.strip():
+            aviso = (
+                "No encuentro fragmentos relevantes en el repositorio para responder con garantías. "
+                "Prueba a afinar la búsqueda (p. ej., 'MIC', 'fichero de pago', 'SICOP', 'condicionalidad', "
+                "o usa 'solo pdf' / 'solo docx')."
+            )
+            try:
+                self._append_stream_text("PACqui: " + aviso, end_turn=True)
+            except Exception:
+                pass
+            try:
+                self._spinner_stop()
+            except Exception:
+                pass
+            return
+
+        # 3) System estricto (con RAG)
+        base_sys = (
+            "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
+            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
+            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
+            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
+            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
+            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
         )
+
+        # 4) Mensaje de usuario (plantilla cerrada)
+        ucontent = (
+            f"Pregunta del usuario:\n{user_q}\n\n"
+            "=== FRAGMENTOS (cítalos como [1], [2], ...) ===\n"
+            f"{rag_ctx}\n\n"
+            "=== ÍNDICE (observaciones/rutas del índice) ===\n"
+            f"{idx_ctx}\n\n"
+            "Instrucciones de uso:\n"
+            "- Responde a la PREGUNTA usando exclusivamente los FRAGMENTOS; el ÍNDICE es solo apoyo contextual.\n"
+            "- No pidas más datos ni hagas listas genéricas. Responde directamente.\n"
+            "- Cita con [n] cada punto que derives de un fragmento.\n"
+            "- Si no hay datos suficientes en los fragmentos para algún apartado, dilo."
+        )
+
+        # 5) Sobrescribe los 'messages' reales que enviaremos al modelo
+        messages = [
+            {"role": "system", "content": base_sys},
+            {"role": "user", "content": ucontent},
+        ]
         # === PATCH: forzar el prompt con RAG/ÍNDICE ===
+
         import os
 
         # System fuerte para prohibir alucinar
         base_sys = (
-            "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE lo que aparece en [FRAGMENTOS] y, si hace falta, en [ÍNDICE]. "
-            "CITA con [n]. Si no hay fragmentos relevantes, responde: "
-            "'No dispongo de fragmentos suficientes del repositorio para responder con garantías'. "
-            "Prohibido inventar datos que no estén en los fragmentos."
+            "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
+            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
+            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
+            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
+            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
+            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
         )
 
         # Sustituimos los 'messages' reales que enviaremos al modelo
@@ -5134,8 +5258,7 @@ class ChatWithLLM(ChatFrame):
         # Respeto variable de entorno para el máximo de salida si existe
         try:
             mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
-            if mt_env > 0:
-                max_tokens = mt_env
+
         except Exception:
             pass
 
@@ -5409,77 +5532,30 @@ class ChatWithLLM(ChatFrame):
                 _temperature=temperature
         ):
 
+            # --- FIX max_tokens shadowing (no tocar _max_tokens) ---
+            eff_max = _max_tokens
+            try:
+                mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
+                if mt_env > 0:
+                    eff_max = mt_env
+            except Exception:
+                pass
+
             try:
                 _p("Abriendo stream del modelo…")
                 state["last_ts"] = time.time()
-                _p(f"[CHAT] out_max={int(max_tokens)}  ctx={getattr(self.llm, 'ctx', None)}")
+                _p(f"[CHAT] out_max={int(eff_max)}  ctx={getattr(self.llm, 'ctx', None)}")
                 try:
-                    print(f"[CHAT] out_max={int(max_tokens)}  ctx={getattr(self.llm, 'ctx', None)}")
+                    print(f"[CHAT] out_max={int(eff_max)}  ctx={getattr(self.llm, 'ctx', None)}")
                 except Exception:
                     pass
 
-                # === PATCH: forzar FRAGMENTOS/ÍNDICE en el prompt real ===
-                import os
 
-                # a) Pregunta actual (si no hay entry, toma el último 'user' de messages)
-                try:
-                    user_q = self.entry.get().strip()
-                except Exception:
-                    try:
-                        user_q = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
-                    except Exception:
-                        user_q = ""
-
-                # b) Construye contexto de índice + RAG
-                idx_ctx, _idx_hits = self.llm.build_index_context(user_q, top_k=6, max_note_chars=280)
-                rag_ctx = self.llm._rag_retrieve(user_q, k=8, max_chars=1200)
-
-                # c) Ensambla el contenido del usuario con secciones claras
-                ucontent = (
-                        "[INSTRUCCIONES]\n"
-                        "Responde usando SOLO lo que aparece abajo en [FRAGMENTOS] y, si no alcanza, el [ÍNDICE]. "
-                        "Cita con [n]. Si no hay fragmentos relevantes, dilo.\n\n"
-                        "[FRAGMENTOS]\n" + (rag_ctx or "(vacío)") + "\n\n"
-                                                                    "[ÍNDICE]\n" + (idx_ctx or "(sin índice)") + "\n\n"
-                                                                                                                 "[PREGUNTA]\n" + user_q
-                )
-
-                # d) System fuerte (obliga a usar repo)
-                base_sys = (
-                    "Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
-                    "Usa EXCLUSIVAMENTE lo que aparece en [FRAGMENTOS] y, si hace falta, en [ÍNDICE]. "
-                    "CITA con [n]. Si no hay fragmentos, responde: "
-                    "'No dispongo de fragmentos suficientes del repositorio para responder con garantías'. "
-                    "Prohibido inventar datos que no estén en los fragmentos."
-                )
-
-                # e) SUSTITUIMOS los 'messages' que enviaremos al modelo
-                messages = [
-                    {"role": "system", "content": base_sys},
-                    {"role": "user", "content": ucontent},
-                ]
-
-                # f) Respeta variable de entorno para el máximo de salida si existe
-                try:
-                    mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
-                    if mt_env > 0:
-                        max_tokens = mt_env
-                except Exception:
-                    pass
-
-                # g) Traza útil de presupuesto
-                try:
-                    ctx = int(getattr(self.llm, "ctx", 4096) or 4096)
-                    tin = self.llm.count_tokens(ucontent)
-                    print(
-                        f"[RAG] frags={rag_ctx.count('[') if rag_ctx else 0}  idx_len={len(idx_ctx)}  in_tokens≈{tin}")
-                    print(f"[CHAT] out_max={int(max_tokens)}  ctx={ctx}")
-                except Exception:
-                    pass
-                # === FIN PATCH ===
 
                 try:
-                    stream = self.llm.chat(messages=_messages, max_tokens=_max_tokens, temperature=_temperature,
+                    # Ajusta el máximo efectivo de salida: env > parámetro > 768
+                    eff_max = int(mt_env) if (isinstance(mt_env, int) and mt_env > 0) else int(max_tokens)
+                    stream = self.llm.chat(messages=messages, max_tokens=eff_max, temperature=float(temperature),
                                            stream=True)
 
                     _p("Stream abierto ✅. Esperando primer token…")
