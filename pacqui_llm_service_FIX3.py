@@ -398,23 +398,7 @@ class LLMService:
 
                 ranked.append((rank, sc["kw"], sc["notes"], sc["fname"], fp))
 
-                # >>> FEEDBACK BOOST
-                try:
-                    cur2 = con.cursor()
-                    cur2.execute("""
-                        SELECT COALESCE(SUM(CASE
-                            WHEN f.rating >= 8 THEN 3
-                            WHEN f.rating >= 6 THEN 1
-                            WHEN f.rating BETWEEN 0 AND 3 THEN -1
-                            ELSE 0 END), 0)
-                        FROM qa_sources s
-                        JOIN qa_feedback f ON f.qa_id = s.qa_id
-                        WHERE lower(s.path) = lower(?)
-                    """, (fp,))
-                    rank += float(cur2.fetchone()[0] or 0)
-                except Exception:
-                    pass
-                # <<< FEEDBACK BOOST
+
 
 
                 # --- BOOST por "concept_sources" (más fuerte que pinned) ---
@@ -712,10 +696,10 @@ class LLMService:
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
 
-        # Política ES
         ES_POLICY = ("Eres el asistente de PACqui. Responde SIEMPRE en español neutro. "
                      "Si el usuario escribe en otro idioma, traduce mentalmente y contesta en español.")
-        # Presupuesto de salida: por env si está definido
+
+        # Max tokens por ENV si viene definido
         try:
             import os
             if max_tokens is None or int(max_tokens) <= 0:
@@ -723,7 +707,13 @@ class LLMService:
         except Exception:
             pass
 
-        # Traza de tokens de entrada aproximados
+        # Inyecta política ES si no está
+        has_es = any((m.get("role") == "system" and "español" in (m.get("content", "").lower()))
+                     for m in (messages or []))
+        if not has_es:
+            messages = [{"role": "system", "content": ES_POLICY}] + list(messages or [])
+
+        # Traza de tokens de entrada
         try:
             user_blob = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
             in_tok = self.count_tokens(user_blob)
@@ -731,54 +721,41 @@ class LLMService:
         except Exception:
             pass
 
-        has_es = any((m.get("role") == "system" and "español" in (m.get("content", "").lower()))
-                     for m in (messages or []))
-        if not has_es:
-            messages = [{"role": "system", "content": ES_POLICY}] + list(messages or [])
-
-        # Presupuesto de salida: env > default=768
-        import os
-        out_tok = int(os.getenv("PACQUI_MAX_TOKENS", "768")) if max_tokens is None else int(max_tokens)
-
-        # Traza aproximada de tokens de entrada
-        try:
-            user_blob = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
-            in_tok = self.count_tokens(user_blob)
-            print(f"[TOKENS] ctx={self.ctx}  in≈{in_tok}  out_max={out_tok}")
-        except Exception:
-            pass
-
+        out_tok = int(max_tokens)
         try:
             with self._model_lock:
+                import inspect
+
+                # Opciones comunes (sin 'cache_prompt')
+                opts = dict(
+                    messages=messages,
+                    temperature=float(temperature),
+                    max_tokens=int(out_tok),
+                    stream=bool(stream),
+                    # Cortafuegos contra listas/enum repetitivas y clones de apertura
+                    repeat_penalty=1.15,
+                    stop=[
+                        "Pregunta del usuario:", "=== FRAGMENTOS", "=== ÍNDICE",
+                        "\nPregunta:", "\n1)", "\n1."
+                    ],
+                )
+
+                # Solo añadimos 'cache_prompt' si la build lo soporta
                 try:
-                    return self.model.create_chat_completion(
-                        messages=messages,
-                        temperature=float(temperature),
-                        max_tokens=int(out_tok),
-                        stream=bool(stream),
-                        cache_prompt=True,
-                    )
+                    sig = inspect.signature(self.model.create_chat_completion)
+                    if "cache_prompt" in sig.parameters:
+                        opts["cache_prompt"] = False  # desactivado adrede
+                except Exception:
+                    pass
+
+                try:
+                    return self.model.create_chat_completion(**opts)
                 except TypeError:
-                    return self.model.create_chat_completion(
-                        messages=messages,
-                        temperature=float(temperature),
-                        max_tokens=int(out_tok),
-                        stream=bool(stream),
-                    )
+                    # Retry ultra-compatible: sin 'cache_prompt' por si el wrapper no lo admite
+                    opts.pop("cache_prompt", None)
+                    return self.model.create_chat_completion(**opts)
+
         except (RuntimeError, ValueError) as e:
-            msg = str(e)
-            if "context window" in msg or "exceed context" in msg:
-                # Recalcula presupuesto ante overflow
-                out_tok2 = max(256, min(1024, int(self.ctx * 0.18)))
-                budget_in = max(512, self.ctx - out_tok2 - 64)
-                safe_msgs = self._shrink_messages(messages, budget_in_tokens=budget_in)
-                with self._model_lock:
-                    return self.model.create_chat_completion(
-                        messages=safe_msgs,
-                        temperature=float(temperature),
-                        max_tokens=int(out_tok2),
-                        stream=bool(stream),
-                    )
             raise
 
     def stream_chat(self, messages, temperature: float = 0.3, max_tokens: int = 256):

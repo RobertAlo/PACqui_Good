@@ -4470,11 +4470,14 @@ class ChatWithLLM(ChatFrame):
         # Política estricta: no inventar si no hay contexto
         base_sys = (
             "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
-            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
-            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
-            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
-            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
+            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual y CITA con [n] (n = índice del fragmento). "
+            "PROHIBIDO: saludar, pedir palabra clave o proponer filtros (p. ej., 'solo pdf/docx'), repetir la pregunta "
+            "o añadir preámbulos/CTAs. Responde directo a la pregunta. "
+            "Estructura en bloques SOLO si hay evidencia para cada bloque; si NO hay evidencia para un bloque, omítelo. "
+            "Si los fragmentos son insuficientes para parte de la respuesta, indícalo sin inventar. "
+            "NO COPIES ni enumeres preguntas del contexto; NO empieces con 'Pregunta:' ni listes '¿Cuáles son…?'. "
+            "No repitas etiquetas como [FRAGMENTOS] o [ÍNDICE] en la salida. "
+            "Al final, incluye 'Fuentes:' con la lista [n] y su ruta tal como aparecen en los FRAGMENTOS."
         )
 
         # Contexto inicial (auto-escala con el ctx del modelo)
@@ -4551,7 +4554,11 @@ class ChatWithLLM(ChatFrame):
             used = used_effective()
 
         # ⬅️ Aquí estaba el corte: quita el min(80, …) y dalo dinámico
-        max_final = max(160, min(resp_budget, ctx - used - 64, 384))
+        import os as _os_tokcap
+        cap_env = int(_os_tokcap.getenv("PACQUI_MAX_TOKENS", "640"))
+        cap_safe = max(192, min(cap_env, 1024))
+        max_final = max(192, min(resp_budget, ctx - used - 64, cap_safe))
+
         msgs = [{"role": "system", "content": sys_full},
                 {"role": "user", "content": user_text}]
         return msgs, hits, max_final
@@ -4618,17 +4625,33 @@ class ChatWithLLM(ChatFrame):
         qlow = q.lower().strip()
         qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
 
-        # saludos / small-talk sin índice
-        if re.match(r"^(hola|buenas(?:\s+(tardes|noches))?|buenos\s+dias|hey|hello|gracias|ok|vale)\b", qlow_clean):
-            self._append_chat("PACqui",
-                              "¡Hola! 👋 Puedo buscar en tu repositorio y priorizar **PDF/DOCX**. "
-                              "Dime una palabra clave (p. ej., *pagos FEADER*) o escribe *solo pdf* / *solo docx* para filtrar."
-                              )
+        # small-talk SOLO en primer turno (full-match), para no secuestrar preguntas reales
+        if not hasattr(self, "_user_turns"):
+            self._user_turns = 0
+        is_first_turn = (self._user_turns == 0)
+
+        import re as _re_small
+        qlow = q.lower().strip()
+        qlow_clean = _re_small.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
+
+        smalltalk = _re_small.fullmatch(
+            r"(hola|buenas(?:\s+(tardes|noches))?|buenos\s+d(?:í|i)as|gracias|ok|vale)[.!¡…]*",
+            qlow_clean
+        )
+        if is_first_turn and smalltalk:
+            self._append_chat("PACqui", "Hola 👋. Escribe tu pregunta y te sugeriré rutas relevantes.")
+            self._user_turns += 1
             return
-        if re.search(r"\b(cómo\s+estás|como\s+estas|qué\s+tal|que\s+tal|cómo\s+te\s+va|como\s+te\s+va)\b", qlow_clean):
-            self._append_chat("PACqui",
-                              "¡Todo bien! 🙂 ¿En qué te ayudo del repositorio (puedo priorizar **PDF/DOCX**)?")
+
+        if is_first_turn and _re_small.fullmatch(
+                r"(c(?:ó|o)mo\s+est(?:á|a)s|qu(?:é|e)\s+tal|hey|hello)[.!¡…]*", qlow_clean
+        ):
+            self._append_chat("PACqui", "¡Todo bien! 🙂 ¿En qué te ayudo del repositorio?")
+            self._user_turns += 1
             return
+
+        # marca que a partir de aquí ya hubo interacción del usuario
+        self._user_turns += 1
 
         # actualizar filtro por extensión si el usuario dice "solo pdf/docx"
         try:
@@ -5163,39 +5186,49 @@ class ChatWithLLM(ChatFrame):
         q = queue.Queue()
         state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False, "watchdog_strikes": 0}
         out_buf = []
+        # --- Guardia de apertura “mala” (listas/pregunta) ---
+        import re as _re_bad
+        state["retried_bad_open"] = False  # solo reintentamos 1 vez
 
-        """
-        RAG
-        MESSAGE
-        START == ="""
-        # Pregunta del usuario
-        user_q = self.entry.get().strip() if hasattr(self, "entry") else (user_text if 'user_text' in locals() else "")
+        def _bad_opening(prefix: str) -> bool:
+            s = (prefix or "").strip().lower()
+            if not s:
+                return False
+            # patrones que estamos viendo en tus capturas
+            if s.startswith("pregunta:"):
+                return True
+            if _re_bad.match(r"^1[\.\)]\s", s):
+                return True
+            if "¿cuáles son las ayudas" in s[:160]:
+                return True
+            return False
 
-        # 1) Contextos: Índice + RAG (top-k y tamaño de fragmentos)
+        # === RAG/ÍNDICE: composición estricta del prompt (forzado) ===
+        import os
+
+        # 0) Pregunta del usuario leída de la entry
+        user_q = self.entry.get().strip() if hasattr(self, "entry") else ""
+
+        # 1) Contextos del índice y del RAG (respeta filtros de extensión de la UI)
         idx_ctx, idx_hits = self.llm.build_index_context(user_q, top_k=6, max_note_chars=280)
-        # --- Respeta el filtro de extensiones de la UI para el RAG ---
         q_for_rag = user_q
         try:
             extf = set(getattr(self, "_ext_filter", set()) or set())
         except Exception:
             extf = set()
-        # El servicio RAG activa el filtro si ve estos tokens en la query
         if ".pdf" in extf or "pdf" in extf:
             q_for_rag += " pdf"
         if ".docx" in extf or "docx" in extf:
             q_for_rag += " docx"
         if ".doc" in extf or "doc" in extf:
             q_for_rag += " doc"
-
         rag_ctx = self.llm._rag_retrieve(q_for_rag, k=8, max_chars=1200)
 
-        # 2) Cortafuegos anti-alucinación: si no hay fragmentos, no llamamos al LLM
+        # 2) Cortafuegos: si no hay fragmentos, no llamamos al LLM
         if not rag_ctx or not rag_ctx.strip():
-            aviso = (
-                "No encuentro fragmentos relevantes en el repositorio para responder con garantías. "
-                "Prueba a afinar la búsqueda (p. ej., 'MIC', 'fichero de pago', 'SICOP', 'condicionalidad', "
-                "o usa 'solo pdf' / 'solo docx')."
-            )
+            aviso = ("No encuentro fragmentos relevantes en el repositorio para responder con garantías. "
+                     "Prueba a afinar la búsqueda (p. ej., 'MIC', 'fichero de pago', 'SICOP', 'condicionalidad', "
+                     "o usa 'solo pdf' / 'solo docx').")
             try:
                 self._append_stream_text("PACqui: " + aviso, end_turn=True)
             except Exception:
@@ -5206,17 +5239,19 @@ class ChatWithLLM(ChatFrame):
                 pass
             return
 
-        # 3) System estricto (con RAG)
+        # 3) System duro: prohíbe saludar, pedir palabra clave o copiar preguntas del contexto
         base_sys = (
             "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
-            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
-            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
-            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
-            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
+            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual y CITA con [n] (n = índice del fragmento). "
+            "PROHIBIDO: saludar, pedir palabra clave o proponer filtros (p. ej., 'solo pdf/docx'); "
+            "PROHIBIDO copiar o enumerar preguntas del contexto; no empieces con 'Pregunta:' ni con listados de '¿Cuáles son…?'. "
+            "Responde directo a la pregunta. Estructura en bloques SOLO si hay evidencia para cada bloque; "
+            "si NO hay evidencia para un bloque, omítelo. Si los fragmentos son insuficientes para parte de la respuesta, indícalo sin inventar. "
+            "No repitas etiquetas como [FRAGMENTOS] o [ÍNDICE] en la salida. "
+            "Al final, incluye 'Fuentes:' con la lista [n] y su ruta tal como aparecen en los FRAGMENTOS."
         )
 
-        # 4) Mensaje de usuario (plantilla cerrada)
+        # 4) User estricto con etiquetas
         ucontent = (
             f"Pregunta del usuario:\n{user_q}\n\n"
             "=== FRAGMENTOS (cítalos como [1], [2], ...) ===\n"
@@ -5230,55 +5265,31 @@ class ChatWithLLM(ChatFrame):
             "- Si no hay datos suficientes en los fragmentos para algún apartado, dilo."
         )
 
-        # 5) Sobrescribe los 'messages' reales que enviaremos al modelo
-        messages = [
-            {"role": "system", "content": base_sys},
-            {"role": "user", "content": ucontent},
-        ]
-        # === PATCH: forzar el prompt con RAG/ÍNDICE ===
-
-        import os
-
-        # System fuerte para prohibir alucinar
-        base_sys = (
-            "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual. "
-            "CITA cada afirmación relevante con [n] (n es el índice del fragmento) y NO inventes. "
-            "Estructura la respuesta en: 1) Definición, 2) Para qué sirve en PAC/SICOP, "
-            "3) Estructura o campos/formatos clave si aparecen, 4) Validaciones/requisitos si aparecen, "
-            "5) Fuentes (lista de [n] con ruta). Si los fragmentos no contienen la información, dilo explícitamente."
-        )
-
-        # Sustituimos los 'messages' reales que enviaremos al modelo
+        # 5) Sobrescribe el 'messages' real que se enviará al modelo
         messages = [
             {"role": "system", "content": base_sys},
             {"role": "user", "content": ucontent},
         ]
 
-        # Respeto variable de entorno para el máximo de salida si existe
+        # 6) Presupuesto de salida por env (opcional)
         try:
             mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
-
+            if mt_env > 0:
+                max_tokens = mt_env
         except Exception:
             pass
 
-        # Traza de presupuesto real (prompt + salida)
+        # 7) Trazas útiles
         try:
             ctx = int(getattr(self.llm, "ctx", 4096) or 4096)
             tin = sum(self.llm.count_tokens((m.get("content") or "")) for m in messages)
             print(f"[TOKENS] ctx={ctx}  in≈{tin}  out_max={int(max_tokens)}")
-        except Exception:
-            pass
-        # === FIN PATCH ===
-
-        # 3) Traza útil
-        try:
-            tin = self.llm.count_tokens(ucontent)
-            print(f"[RAG] frags={(rag_ctx.count('[', 0) if rag_ctx else 0)}  idx_len={len(idx_ctx)}  in_tokens≈{tin}")
+            tin_u = self.llm.count_tokens(ucontent)
+            print(f"[RAG] frags={(rag_ctx.count('[', 0) if rag_ctx else 0)}  idx_len={len(idx_ctx)}  in_tokens≈{tin_u}")
         except Exception:
             pass
 
-        # === PATCH RAG MESSAGE END ===
+        # === FIN composición estricta ===
 
         def _p(msg: str):
             try:
@@ -5580,6 +5591,59 @@ class ChatWithLLM(ChatFrame):
                         tok = ""
                     if not tok:
                         continue
+
+                    # --- Cortafuegos de apertura "Pregunta/1)" (reintento una sola vez) ---
+                    try:
+                        if not state.get("retried_bad_open", False):
+                            # prefijo con lo recibido hasta ahora + el token actual (máx. 160 chars)
+                            _prefix = "".join(out_buf + [tok])[:160]
+                            _pfx = _prefix.strip().lower()
+                            bad = False
+                            if _pfx.startswith("pregunta:"):
+                                bad = True
+                            elif _pfx.startswith("1)") or _pfx.startswith("1."):
+                                bad = True
+                            elif "¿cuáles son las ayudas" in _pfx:
+                                bad = True
+
+                            if bad:
+                                # Cancela stream actual
+                                try:
+                                    if hasattr(self.llm, "cancel") and callable(self.llm.cancel):
+                                        self.llm.cancel()
+                                except Exception:
+                                    pass
+                                try:
+                                    if getattr(self, "stop_event", None):
+                                        self.stop_event.set()
+                                except Exception:
+                                    pass
+
+                                state["retried_bad_open"] = True
+                                _p("Apertura no deseada ('Pregunta/1)'). Reintentando con T baja…")
+
+                                # Reintento inmediato con la misma 'messages' y T=0.12 (más obediente)
+                                try:
+                                    for retry_chunk in self.llm.stream_chat(
+                                            messages=messages,
+                                            max_tokens=int(max_tokens),
+                                            temperature=0.12,
+                                    ):
+                                        if not retry_chunk:
+                                            continue
+                                        rc0 = (retry_chunk or {}).get("choices", [{}])[0]
+                                        rdelta = rc0.get("delta") or {}
+                                        rtok = rdelta.get("content") or rc0.get("text") or ""
+                                        if rtok:
+                                            q.put(rtok)
+                                            state["tokens"] += 1
+                                    q.put(None)  # fin
+                                except Exception as re:
+                                    _p(f"Reintento fallido: {re}")
+                                return  # salimos del bucle original para no seguir con el stream cancelado
+                    except Exception:
+                        pass
+                    # --- FIN cortafuegos ---
 
                     if state["tokens"] == 0:
                         dt_first = int((time.time() - state["last_ts"]) * 1000)

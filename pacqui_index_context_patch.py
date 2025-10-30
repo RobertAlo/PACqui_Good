@@ -25,7 +25,7 @@ LLMChatDialog = base.LLMChatDialog
 
 # --- REEMPLAZO: compone un [ÍNDICE] compacto y ajusta al presupuesto de tokens ---
 
-def _build_index_context(dialog, user_text: str, top_k: int = 5, max_note_chars: int = 240) -> str:
+def _build_index_context(dialog, user_text: str, top_k: int = 3, max_note_chars: int = 160) -> str:
     """Usa el índice (keywords/observaciones) y devuelve un bloque breve."""
     try:
         hits = dialog._collect_index_hits(user_text, top_k=top_k) or []
@@ -107,12 +107,19 @@ def _patched_worker_chat_stream(self):
                 "\"No tengo suficiente contexto en el repositorio. Prueba otra búsqueda o abre una de las rutas sugeridas.\""
             )
 
-            # Ensamble bruto
+            # Ensamble bruto (FRAGMENTOS primero, luego ÍNDICE)
             contexto = ""
-            if idx_ctx:
-                contexto += "[ÍNDICE]\n" + idx_ctx + "\n\n"
             if rag_ctx:
                 contexto += "[FRAGMENTOS]\n" + rag_ctx + "\n\n"
+            if idx_ctx:
+                contexto += "[ÍNDICE]\n" + idx_ctx + "\n\n"
+
+            # Presupuesto (entrada = ctx_total - salida - margen)
+            ctx_max = getattr(self, "ctx", None) or getattr(self.model, "n_ctx", 2048) or 2048
+            tok_out = max(128, min(256, int(ctx_max * 0.12)))
+            tok_in  = max(256, ctx_max - tok_out - 64)
+            contexto = _trim_to_budget(contexto, tok_in)
+
 
             # Presupuesto (entrada = ctx_total - salida - margen)
             ctx_max = getattr(self, "ctx", None) or getattr(self.model, "n_ctx", 2048) or 2048
@@ -139,17 +146,12 @@ def _patched_worker_chat_stream(self):
             return
 
         # Llamada en streaming (tolerando builds sin cache_prompt)
+        # Llamada en streaming (sin cache_prompt para evitar incompatibilidades)
         stream = None
         try:
             stream = self.app.llm.chat(
-                messages=msgs, temperature=temp, max_tokens=max_t, stream=True, cache_prompt=True
-            )
-        except TypeError:
-            # builds sin cache_prompt → misma llamada pero sin ese kw
-            stream = self.app.llm.chat(
                 messages=msgs, temperature=temp, max_tokens=max_t, stream=True
             )
-
         except Exception:
             stream = None
 
@@ -168,7 +170,8 @@ def _patched_worker_chat_stream(self):
 
 
         final = "".join(out).strip()
-        if not final and stream is None:
+        # Si no hubo tokens en streaming (aunque stream no sea None), forzamos fallback sin stream
+        if not final:
             try:
                 resp = self.app.llm.chat(
                     messages=msgs, temperature=temp, max_tokens=max_t, stream=False
@@ -176,6 +179,7 @@ def _patched_worker_chat_stream(self):
                 final = ((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
             except Exception:
                 final = ""
+
 
         # >>> QA LOG (colocado tras construir `final`)
         try:
