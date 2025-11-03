@@ -2249,10 +2249,13 @@ class AdminPanel(ttk.Notebook):
         if mdl is None:
             raise RuntimeError("LLM no cargado (revisa _autoload_model y self.app.llm).")
 
-        messages = [
-            {"role": "system", "content": base_sys},
-            {"role": "user", "content": ucontent},
-        ]
+        # 5) Respeta los mensajes ya compuestos por el caller; si vienen vacíos, compón aquí.
+        if not messages:
+            messages = [
+                {"role": "system", "content": base_sys},
+                {"role": "user", "content": ucontent},
+            ]
+        # Si sí venían mensajes, NO los tocamos (evita duplicar RAG y agrandar el prompt)
 
         # Tu LLMService expone .chat(...). Lo estás usando así en el banco de pruebas. :contentReference[oaicite:2]{index=2}
         if hasattr(mdl, "chat"):
@@ -4066,6 +4069,11 @@ class ChatWithLLM(ChatFrame):
         self._last_choice = None  # {"hit": {...}, "reasons": "texto", "query": "…"}
         self._last_query = None
         self._ext_filter = set()  # {".pdf"} | {".doc",".docx"} | set()
+        # // Guardias de streaming para evitar reentradas que pueden tumbar llama.cpp
+        self._gen_active = False  # hay una generación en curso
+        self._gen_thread = None  # hilo de generación actual
+        self._want_continue = False  # bandera para autocontinuación diferida
+
         #Timeouts de primer token (configurables)
         self.FIRST_TOKEN_TIMEOUT_MIN_WARM_S = 45.0  # modelo “caliente” (primer token)
         self.FIRST_TOKEN_TIMEOUT_MIN_COLD_S = 90.0  # modelo “frío” (primer token)
@@ -4482,8 +4490,8 @@ class ChatWithLLM(ChatFrame):
 
         # Contexto inicial (auto-escala con el ctx del modelo)
         ctx = int(getattr(self.llm, "ctx", 2048) or 2048)
-        idx_top, idx_note_chars = 3, 180  # un poco más generoso
-        rag_k, rag_frag_chars = 3, 260  # más fragmentos y algo más largos
+        idx_top, idx_note_chars = 2, 160  # menos índice -> menos prompt
+        rag_k, rag_frag_chars = 3, 240  # frags RAG algo más cortos
 
         def shrink(text: str, max_chars: int) -> str:
             t = (text or "").strip()
@@ -4504,14 +4512,24 @@ class ChatWithLLM(ChatFrame):
             rag_q = user_text + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
         rag_ctx = self.llm._rag_retrieve(rag_q, k=rag_k, max_chars=rag_frag_chars)
 
+        # contexto muy breve de conversación (no es fuente, sólo guía)
+        prev_q = (getattr(self, "_last_user_q", "") or "").strip()
+        prev_a = (getattr(self, "_last_bot_a", "") or "").strip()
+        if prev_q and prev_a and prev_q != user_text:
+            chat_hint = f"Contexto de conversación (NO es fuente, sólo guía):\n- Pregunta anterior: {prev_q[:240]}\n- Resumen respuesta previa: {prev_a[:240]}\n\n"
+        else:
+            chat_hint = ""
+
         # 2) Bloques secundarios
         try:
-            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=3, max_obs_chars=200)
+            obs_block, rutas_block, _ = self._build_obs_and_routes_blocks(hits, max_items=2, max_obs_chars=160)
+
         except Exception:
             obs_block, rutas_block = "", ""
 
         try:
-            concept_block = self.llm.concept_context(user_text, max_chars=420, top_k=5) or ""
+            concept_block = self.llm.concept_context(user_text, max_chars=300, top_k=3) or ""
+
         except Exception:
             concept_block = ""
 
@@ -4555,8 +4573,9 @@ class ChatWithLLM(ChatFrame):
 
         # ⬅️ Aquí estaba el corte: quita el min(80, …) y dalo dinámico
         import os as _os_tokcap
-        cap_env = int(_os_tokcap.getenv("PACQUI_MAX_TOKENS", "640"))
+        cap_env = int(_os_tokcap.getenv("PACQUI_MAX_TOKENS", "512"))
         cap_safe = max(192, min(cap_env, 1024))
+
         max_final = max(192, min(resp_budget, ctx - used - 64, cap_safe))
 
         msgs = [{"role": "system", "content": sys_full},
@@ -4606,6 +4625,8 @@ class ChatWithLLM(ChatFrame):
         import os, re, time, threading
 
         q = self._get_user_text()
+        # guardar última pregunta del usuario para contexto
+        self._last_user_q = q
 
         if not q:
             try:
@@ -4703,7 +4724,7 @@ class ChatWithLLM(ChatFrame):
 
             try:
                 # 1) Construye mensajes + presupuesto con el helper centralizado
-                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=768)
+                messages, hits, tok_out = self._compose_system_budgeted(q, max_tokens=512)
 
                 # 2) Rutas debajo de la respuesta para coexistir con el modelo
                 try:
@@ -4933,12 +4954,13 @@ class ChatWithLLM(ChatFrame):
         """
         # 1) Recogemos hits y construimos bloques OBS + RUTAS
         all_hits = self._collect_hits(
-            user_text, top_k=5, note_chars=240,
+            user_text, top_k=3, note_chars=180,
             prefer_only=(sorted(self._ext_filter) if getattr(self, "_ext_filter", None) else None)
         )
 
         # El treeview se actualiza fuera, pero devolvemos también los hits
-        obs_block, rutas_block, used_hits = self._build_obs_and_routes_blocks(all_hits, max_items=3, max_obs_chars=220)
+        obs_block, rutas_block, used_hits = self._build_obs_and_routes_blocks(all_hits, max_items=2, max_obs_chars=140)
+
 
         # 2) System: tono persona + prohibición de inventar
         base_sys = (
@@ -5183,9 +5205,28 @@ class ChatWithLLM(ChatFrame):
         self._spinner_start()
         if getattr(self, "stop_event", None):
             self.stop_event.clear()
+        # // Antirreentrada: no permitas abrir otro stream si ya hay uno activo
+        if getattr(self, "_gen_active", False):
+            try:
+                self._append_stream_text("\n[esperando a que termine la generación anterior...]\n")
+            except Exception:
+                pass
+            return
+        self._gen_active = True
+
         q = queue.Queue()
         state = {"tokens": 0, "last_ts": time.time(), "timed_out": False, "done": False, "watchdog_strikes": 0}
         out_buf = []
+        state["needs_continue"] = False
+        state["continued"] = False
+
+        # Pinta el encabezado "PACqui:" al instante para feedback visual,
+        # incluso si el primer token tarda en llegar (CPU, prompt largo).
+        try:
+            self._append_stream_text("")  # fuerza el encabezado sin texto
+        except Exception:
+            pass
+
         # --- Guardia de apertura “mala” (listas/pregunta) ---
         import re as _re_bad
         state["retried_bad_open"] = False  # solo reintentamos 1 vez
@@ -5210,7 +5251,8 @@ class ChatWithLLM(ChatFrame):
         user_q = self.entry.get().strip() if hasattr(self, "entry") else ""
 
         # 1) Contextos del índice y del RAG (respeta filtros de extensión de la UI)
-        idx_ctx, idx_hits = self.llm.build_index_context(user_q, top_k=6, max_note_chars=280)
+        idx_ctx, idx_hits = self.llm.build_index_context(user_q, top_k=3, max_note_chars=200)
+
         q_for_rag = user_q
         try:
             extf = set(getattr(self, "_ext_filter", set()) or set())
@@ -5222,7 +5264,8 @@ class ChatWithLLM(ChatFrame):
             q_for_rag += " docx"
         if ".doc" in extf or "doc" in extf:
             q_for_rag += " doc"
-        rag_ctx = self.llm._rag_retrieve(q_for_rag, k=8, max_chars=1200)
+        rag_ctx = self.llm._rag_retrieve(q_for_rag, k=3, max_chars=900)
+
 
         # 2) Cortafuegos: si no hay fragmentos, no llamamos al LLM
         if not rag_ctx or not rag_ctx.strip():
@@ -5266,10 +5309,13 @@ class ChatWithLLM(ChatFrame):
         )
 
         # 5) Sobrescribe el 'messages' real que se enviará al modelo
-        messages = [
-            {"role": "system", "content": base_sys},
-            {"role": "user", "content": ucontent},
-        ]
+        # 5) Respeta los mensajes ya compuestos por el caller; si vienen vacíos, compón aquí.
+        if not messages:
+            messages = [
+                {"role": "system", "content": base_sys},
+                {"role": "user", "content": ucontent},
+            ]
+        # Si sí venían mensajes, NO los tocamos (evita duplicar RAG y agrandar el prompt)
 
         # 6) Presupuesto de salida por env (opcional)
         try:
@@ -5326,6 +5372,31 @@ class ChatWithLLM(ChatFrame):
                 if not state["done"]:
                     self.after(15, _paint_loop)
                 else:
+                    # ¿hay que continuar porque hemos tocado el límite?
+                    if state.get("needs_continue") and not state.get("continued"):
+                        state["continued"] = True
+                        try:
+                            partial = "".join(out_buf).strip()
+                        except Exception:
+                            partial = ""
+                        # construye mensajes de continuación (no repitas, solo remata)
+                        cont_msgs = list(messages or [])
+                        if partial:
+                            cont_msgs = cont_msgs + [{"role": "assistant", "content": partial}]
+                        cont_msgs = cont_msgs + [{
+                            "role": "user",
+                            "content": "Continúa exactamente donde lo dejaste. Termina la frase y concluye con un breve cierre. No repitas texto."
+                        }]
+                        # relanza con un tope pequeño (p. ej. 256) y mismo sufijo
+                        self.after(0, lambda: self._stream_llm_with_fallback(
+                            cont_msgs, max_tokens=min(256, max_tokens), temperature=temperature, suffix=suffix
+                        ))
+                        return
+
+                    # esta generación ha terminado; permite nuevas
+                    self._gen_active = False
+                    self._gen_thread = None
+
                     # cierre UI
                     try:
                         if suffix:
@@ -5334,6 +5405,13 @@ class ChatWithLLM(ChatFrame):
 
                     except Exception:
                         pass
+
+                    # guarda la última respuesta para el contexto de conversación
+                    try:
+                        self._last_bot_a = "".join(out_buf).strip()
+                    except Exception:
+                        pass
+
                     try:
                         self._spinner_stop()
                     except Exception:
@@ -5427,7 +5505,8 @@ class ChatWithLLM(ChatFrame):
                     result["done"] = True
 
             t0 = time.time()
-            t = threading.Thread(target=_call, daemon=True)
+            t = threading.Thread(target=_worker, daemon=True, name="PACquiLLMWorker")
+            self._gen_thread = t
             t.start()
 
             while not result["done"] and (time.time() - t0) < DEADLINE:
@@ -5552,6 +5631,9 @@ class ChatWithLLM(ChatFrame):
             except Exception:
                 pass
 
+            # guarda el límite efectivo para que lo vea el lazo de pintado
+            state["eff_max"] = int(eff_max)
+
             try:
                 _p("Abriendo stream del modelo…")
                 state["last_ts"] = time.time()
@@ -5587,10 +5669,34 @@ class ChatWithLLM(ChatFrame):
                         ch0 = (chunk or {}).get("choices", [{}])[0]
                         delta = ch0.get("delta") or {}
                         tok = delta.get("content") or ch0.get("text") or ""
+                        if tok:
+                            if state["tokens"] == 0:
+                                _p(f"Primer token recibido ({int((time.time() - state['last_ts']) * 1000)} ms)")
+                            state["tokens"] += 1
+                            state["last_ts"] = time.time()
+                            # >>> CLAVE: encola el token para que el _paint_loop lo pinte
+                            q.put(self._normalize_text(tok) if hasattr(self, "_normalize_text") else tok)
+
                     except Exception:
                         tok = ""
                     if not tok:
                         continue
+            finally:
+                try:
+                    # si se han generado casi tantos tokens como el límite, pedir una continuación
+                    try:
+                        lim = int(state.get("eff_max", 0) or 0)
+                        state["needs_continue"] = (
+                                lim > 0
+                                and not state.get("timed_out", False)
+                                and state["tokens"] >= max(1, lim - 2)
+                        )
+                    except Exception:
+                        state["needs_continue"] = False
+
+                    q.put(None)  # <- indica fin de stream a la UI
+                except Exception:
+                    pass
 
                     # --- Cortafuegos de apertura "Pregunta/1)" (reintento una sola vez) ---
                     try:
@@ -5654,14 +5760,14 @@ class ChatWithLLM(ChatFrame):
                     state["last_ts"] = time.time()
                     q.put(tok)
 
-                if state["tokens"] == 0 and not state["timed_out"]:
-                    _start_fallback("stream sin tokens")
-                    return
-                q.put(None)  # fin normal
+                    if state["tokens"] == 0 and not state["timed_out"]:
+                        _start_fallback("stream sin tokens")
+                        return
+                    q.put(None)  # fin normal
 
-            except Exception as e:
-                _p(f"[stream] {type(e).__name__}: {e}")
-                _fallback(f"error: {e}")
+                except Exception as e:
+                    _p(f"[stream] {type(e).__name__}: {e}")
+                    _fallback(f"error: {e}")
 
         threading.Thread(target=_worker, daemon=True).start()
 

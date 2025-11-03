@@ -544,6 +544,7 @@ class LLMService:
         EXT_MALUS = {".png": -2, ".jpg": -2, ".jpeg": -2, ".gif": -2, ".py": -2, ".java": -1, ".sql": -1}
         toks = re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", qlow)
 
+
         scored = []
         for _cid, text, path, vec_blob in rows:
             try:
@@ -554,6 +555,11 @@ class LLMService:
             ext = Path(path or "").suffix.lower()
             if ext_filter and ext not in ext_filter:
                 continue
+            txt_low = (text or "").lower()
+            # si hay términos de la consulta y ninguno aparece en el texto -> descarta (ruido)
+            if toks and not any(t in txt_low for t in toks):
+                continue
+
             base = cos(qv, vec)
             fname = os.path.basename(path or "").lower()
             fname_bonus = sum(1 for t in toks if t in fname)
@@ -579,8 +585,9 @@ class LLMService:
             t = (text or "").strip()
             if not t:
                 continue
-            if len(t) > 600:
-                t = t[:600] + "…"
+            if len(t) > 420:
+                t = t[:420] + "…"
+
             frag = f"[{i}] {t}\n    Fuente: {path}"
             if used + len(frag) > max_chars * k:
                 break
@@ -758,9 +765,18 @@ class LLMService:
         except (RuntimeError, ValueError) as e:
             raise
 
-    def stream_chat(self, messages, temperature: float = 0.3, max_tokens: int = 256):
-        """Wrapper que devuelve un iterable de eventos de stream."""
-        return self.chat(messages=messages, temperature=temperature, max_tokens=int(max_tokens), stream=True)
+    # --- justo bajo LLMService.chat(...) ---
+    def stream_chat(self, *, messages, temperature=0.2, max_tokens=256, **kw):
+        """
+        Azúcar sintáctico: garantiza stream=True y delega en chat().
+        Permite que el front llame self.llm.stream_chat(...) sin romper.
+        """
+        kw.pop("stream", None)
+        return self.chat(messages=messages,
+                         temperature=temperature,
+                         max_tokens=max_tokens,
+                         stream=True,
+                         **kw)
 
     # === FIN BLOQUE ===
 
