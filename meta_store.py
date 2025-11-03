@@ -528,15 +528,41 @@ class MetaStore:
             con.commit()
 
     def list_concepts(self, q: str = None, limit: int = 500):
+        import re
         flt = ""
         args = []
         if q and q.strip():
-            flt = "WHERE lower(title) LIKE ? OR lower(body) LIKE ? OR id IN (SELECT concept_id FROM concept_alias WHERE lower(alias) LIKE ?)"
-            like = f"%{q.lower()}%";
-            args = [like, like, like]
+            toks = re.findall(r"[a-z0-9áéíóúüñ]{3,}", q.lower())
+            like_clauses = []
+            like_args = []
+            for t in toks:
+                like = f"%{t}%"
+                like_clauses += [
+                    "lower(title) LIKE ?",
+                    "lower(body) LIKE ?",
+                    "lower(COALESCE(tags,'')) LIKE ?",
+                ]
+                like_args += [like, like, like]
+
+            alias_clause = ""
+            alias_args = []
+            if toks:
+                alias_placeholders = ",".join(["?"] * len(toks))
+                alias_clause = f" OR id IN (SELECT concept_id FROM concept_alias WHERE lower(alias) IN ({alias_placeholders}))"
+                alias_args = [t for t in toks]
+
+            flt = "WHERE (" + " OR ".join(like_clauses) + alias_clause + ")"
+            args = like_args + alias_args
+
         with self._connect() as con:
-            rows = con.execute(f"""SELECT id, slug, title, substr(body,1,160), tags
-                                   FROM concepts {flt} ORDER BY updated_at DESC LIMIT ?""", (*args, limit)).fetchall()
+            rows = con.execute(
+                f"""SELECT id, slug, title, substr(body,1,160), COALESCE(tags,'')
+                    FROM concepts {flt}
+                    ORDER BY updated_at DESC
+                    LIMIT ?""",
+                (*args, int(limit)),
+            ).fetchall()
+
         return [dict(id=r[0], slug=r[1], title=r[2], body=r[3], tags=r[4]) for r in rows]
 
     # ---------- concept sources (rutas ponderadas por concepto) ----------
@@ -661,35 +687,52 @@ class MetaStore:
             return n
 
     def concept_context_for(self, text: str, max_chars: int = 600, top_k: int = 5) -> str:
-        """Devuelve un bloque corto con los conceptos que ‘matchean’ la consulta."""
+        """Devuelve un bloque breve con los conceptos que casan con la consulta."""
         import re
-        toks = set(re.findall(r"[a-z0-9áéíóúüñ]{3,}", (text or "").lower()))
-        if not toks: return ""
-        like_list = [f"%{t}%" for t in toks]
-        placeholders = ",".join(["?"] * len(like_list))
-        sql = f"""
-          SELECT c.title, c.body, c.tags
-          FROM concepts c
-          WHERE {" OR ".join(["lower(c.title) LIKE ?", "lower(c.body) LIKE ?"])}
-             OR c.id IN (SELECT concept_id FROM concept_alias WHERE lower(alias) IN ({placeholders}))
-          LIMIT {top_k}
-        """
+        toks = re.findall(r"[a-z0-9áéíóúüñ]{3,}", (text or "").lower())
+        if not toks:
+            return ""
+
+        like_clauses = []
         args = []
         for t in toks:
-            args += [f"%{t}%", f"%{t}%"]
-        args += list(toks)
+            like = f"%{t}%"
+            like_clauses += [
+                "lower(c.title) LIKE ?",
+                "lower(c.body) LIKE ?",
+                "lower(COALESCE(c.tags,'')) LIKE ?",
+            ]
+            args += [like, like, like]
+
+        alias_placeholders = ",".join(["?"] * len(toks)) if toks else ""
+        alias_clause = f" OR c.id IN (SELECT concept_id FROM concept_alias WHERE lower(alias) IN ({alias_placeholders}))" if toks else ""
+        args += [t for t in toks]  # para el IN de alias
+
+        sql = f"""
+          SELECT c.title, c.body, COALESCE(c.tags,'')
+          FROM concepts c
+          WHERE ({" OR ".join(like_clauses)}){alias_clause}
+          ORDER BY c.updated_at DESC
+          LIMIT ?
+        """
+        args.append(int(top_k))
+
         with self._connect() as con:
             rows = con.execute(sql, args).fetchall()
-        items = []
-        used = 0
+
+        # Construye bloque compacto (reparte max_chars entre top_k)
+        items, used = [], 0
+        per = max(120, int(max_chars / max(1, top_k)))
         for title, body, tags in rows:
-            frag = (body.strip() if len(body) <= 220 else body.strip()[:220].rstrip() + "…")
+            frag = " ".join((body or "").split())
+            if len(frag) > per:
+                frag = frag[:per].rstrip() + "…"
             chunk = f"— {title}: {frag}"
-            if tags: chunk += f"  [#{tags}]"
-            if used + len(chunk) > max_chars: break
-            used += len(chunk)
+            if tags:
+                chunk += f"  [#{tags}]"
             items.append(chunk)
-        return "\n".join(items)
+
+        return "\n".join(items) if items else ""
 
 
 if __name__ == "__main__":

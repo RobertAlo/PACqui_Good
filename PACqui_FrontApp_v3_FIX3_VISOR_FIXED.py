@@ -4476,17 +4476,19 @@ class ChatWithLLM(ChatFrame):
 
     def _compose_system_budgeted(self, user_text: str, max_tokens: int = 256):
         # Política estricta: no inventar si no hay contexto
+        # Política estricta: FRAGMENTOS > CONCEPTOS > (si nada) solo rutas
         base_sys = (
             "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual y CITA con [n] (n = índice del fragmento). "
-            "PROHIBIDO: saludar, pedir palabra clave o proponer filtros (p. ej., 'solo pdf/docx'), repetir la pregunta "
-            "o añadir preámbulos/CTAs. Responde directo a la pregunta. "
-            "Estructura en bloques SOLO si hay evidencia para cada bloque; si NO hay evidencia para un bloque, omítelo. "
-            "Si los fragmentos son insuficientes para parte de la respuesta, indícalo sin inventar. "
-            "NO COPIES ni enumeres preguntas del contexto; NO empieces con 'Pregunta:' ni listes '¿Cuáles son…?'. "
-            "No repitas etiquetas como [FRAGMENTOS] o [ÍNDICE] en la salida. "
-            "Al final, incluye 'Fuentes:' con la lista [n] y su ruta tal como aparecen en los FRAGMENTOS."
+            "Jerarquía de fuentes:\n"
+            "1) Si hay [FRAGMENTOS], usa EXCLUSIVAMENTE esos fragmentos como base factual y CITA con [n].\n"
+            "2) Si NO hay [FRAGMENTOS] pero hay [CONCEPTOS], responde anclado a esos conceptos del repositorio "
+            "(sin [n], pero dejando claro que proceden del bloque [CONCEPTOS]).\n"
+            "3) Si no hay ni [FRAGMENTOS] ni [CONCEPTOS] pero sí [ÍNDICE], limita la salida a sugerir rutas; no inventes contenido.\n"
+            "Prohibido: saludos, pedir más datos, CTAs, repetir la pregunta o empezar con 'Pregunta:'. "
+            "Estructura en bloques SOLO si hay evidencia suficiente en FRAGMENTOS/CONCEPTOS; si no, omite el bloque. "
+            "Al final, si usaste FRAGMENTOS, incluye 'Fuentes:' con la lista [n] y su ruta tal como aparecen en los FRAGMENTOS."
         )
+
 
         # Contexto inicial (auto-escala con el ctx del modelo)
         ctx = int(getattr(self.llm, "ctx", 2048) or 2048)
@@ -4529,9 +4531,20 @@ class ChatWithLLM(ChatFrame):
 
         try:
             concept_block = self.llm.concept_context(user_text, max_chars=300, top_k=3) or ""
+            # -- FUSIÓN CONCEPTOS→FRAGMENTOS (si no hay RAG)
+            if (not rag_ctx or not rag_ctx.strip()) and concept_block.strip():
+                _lines = [ln.strip("—- ").strip() for ln in concept_block.splitlines() if ln.strip()]
+                if _lines:
+                    _frags = []
+                    for i, ln in enumerate(_lines, start=1):
+                        _frags.append(f"[{i}] {ln}\n    Fuente: Concepto")
+                    rag_ctx = "\n".join(_frags)
+
 
         except Exception:
             concept_block = ""
+
+
 
         # 3) Ensamblado con etiquetas que entiende el recortador del LLMService
         def build_system_text():
@@ -5265,6 +5278,20 @@ class ChatWithLLM(ChatFrame):
         if ".doc" in extf or "doc" in extf:
             q_for_rag += " doc"
         rag_ctx = self.llm._rag_retrieve(q_for_rag, k=3, max_chars=900)
+        # -- FUSIÓN CONCEPTOS→FRAGMENTOS (si no hay RAG)
+        if not rag_ctx or not rag_ctx.strip():
+            try:
+                concept_block = self.llm.concept_context(user_q, max_chars=360, top_k=3) or ""
+            except Exception:
+                concept_block = ""
+            if concept_block.strip():
+                _lines = [ln.strip("—- ").strip() for ln in concept_block.splitlines() if ln.strip()]
+                if _lines:
+                    _frags = []
+                    for i, ln in enumerate(_lines, start=1):
+                        _frags.append(f"[{i}] {ln}\n    Fuente: Concepto")
+                    rag_ctx = "\n".join(_frags)
+
 
 
         # 2) Cortafuegos: si no hay fragmentos, no llamamos al LLM

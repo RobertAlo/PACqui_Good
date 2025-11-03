@@ -391,23 +391,19 @@ class LLMService:
                 # --- BOOST por fuentes pinneadas ---
                 try:
                     if fp in pinned:
-                        # factor afinable: 10 puntos por weight≈1.0
                         rank += int(round(10.0 * pinned[fp]))
                 except Exception:
                     pass
 
-                ranked.append((rank, sc["kw"], sc["notes"], sc["fname"], fp))
-
-
-
-
                 # --- BOOST por "concept_sources" (más fuerte que pinned) ---
                 try:
                     if fp in concept_boost:
-                        # ~12 puntos por weight≈1.0 (ligeramente por encima de "pinned_sources")
                         rank += int(round(12.0 * concept_boost[fp]))
                 except Exception:
                     pass
+
+                # Agrega al ranking con el score FINAL
+                ranked.append((rank, sc["kw"], sc["notes"], sc["fname"], fp))
 
             if not ranked:
                 return []
