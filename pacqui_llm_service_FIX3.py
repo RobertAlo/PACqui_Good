@@ -695,7 +695,8 @@ class LLMService:
 
     # === PEGAR DENTRO DE class LLMService, sustituyendo a los métodos existentes ===
 
-    def chat(self, messages, temperature: float = 0.3, max_tokens: int = 768, stream: bool = True):
+    def chat(self, messages, temperature: float = 0.3, max_tokens: int = 768, stream: bool = True, stop=None):
+
         if not self.model:
             raise RuntimeError("Modelo no cargado. Elige un .gguf antes de chatear.")
 
@@ -709,6 +710,10 @@ class LLMService:
                 max_tokens = int(os.getenv("PACQUI_MAX_TOKENS", "768"))
         except Exception:
             pass
+
+        # Stops por defecto: evitamos cortar por "Pregunta..." u ordinales
+        default_stops = ["=== FRAGMENTOS", "=== ÍNDICE"]
+        stops_list = default_stops if not stop else list(stop)
 
         # Inyecta política ES si no está
         has_es = any((m.get("role") == "system" and "español" in (m.get("content", "").lower()))
@@ -737,10 +742,9 @@ class LLMService:
                     stream=bool(stream),
                     # Cortafuegos contra listas/enum repetitivas y clones de apertura
                     repeat_penalty=1.15,
-                    stop=[
-                        "Pregunta del usuario:", "=== FRAGMENTOS", "=== ÍNDICE",
-                        "\nPregunta:", "\n1)", "\n1."
-                    ],
+                    stop=stops_list,
+
+
                 )
 
                 # Solo añadimos 'cache_prompt' si la build lo soporta
@@ -762,7 +766,8 @@ class LLMService:
             raise
 
     # --- justo bajo LLMService.chat(...) ---
-    def stream_chat(self, *, messages, temperature=0.2, max_tokens=256, **kw):
+    def stream_chat(self, *, messages, temperature=0.2, max_tokens=256, stop=None, **kw):
+
         """
         Azúcar sintáctico: garantiza stream=True y delega en chat().
         Permite que el front llame self.llm.stream_chat(...) sin romper.
@@ -772,7 +777,9 @@ class LLMService:
                          temperature=temperature,
                          max_tokens=max_tokens,
                          stream=True,
+                         stop=stop,
                          **kw)
+
 
     # === FIN BLOQUE ===
 

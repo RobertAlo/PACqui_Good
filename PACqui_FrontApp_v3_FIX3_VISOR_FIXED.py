@@ -4546,22 +4546,35 @@ class ChatWithLLM(ChatFrame):
 
 
 
-        # 3) Ensamblado con etiquetas que entiende el recortador del LLMService
-        def build_system_text():
-            parts = [base_sys]
-            if concept_block: parts += ["[CONCEPTOS]", concept_block]
-            if obs_block:     parts += ["[OBSERVACIONES]", obs_block]
-            if rutas_block:   parts += ["[RUTAS]", rutas_block]
-            if idx_ctx:       parts += ["[ÍNDICE]", idx_ctx]
-            if rag_ctx:       parts += ["[FRAGMENTOS]", rag_ctx]
+        # 3) Ensamblado: política en SYSTEM, evidencia en USER
+        def build_user_text():
+            parts = [f"Pregunta del usuario:\n{user_text}"]
+            # FRAGMENTOS (principal ancla factual)
+            if rag_ctx and rag_ctx.strip():
+                parts += ["=== FRAGMENTOS (cítalos como [1], [2], …) ===", rag_ctx]
+            # ÍNDICE (solo apoyo contextual)
+            if idx_ctx and idx_ctx.strip():
+                parts += ["=== ÍNDICE (observaciones/rutas del índice) ===", idx_ctx]
+            # CONCEPTOS (solo si no hay FRAGMENTOS; ya hicimos fusión concepto→fragmento arriba)
+            if (not rag_ctx or not rag_ctx.strip()) and concept_block and concept_block.strip():
+                parts += ["=== CONCEPTOS (semántica corta) ===", concept_block]
+
+            parts += [
+                "Instrucciones de uso:",
+                "- Responde a la PREGUNTA usando exclusivamente los FRAGMENTOS; el ÍNDICE es apoyo contextual.",
+                "- No pidas más datos ni hagas listas genéricas. Responde directamente.",
+                "- Cita con [n] cada punto que derives de un fragmento.",
+                "- Si no hay datos suficientes en los fragmentos para algún apartado, dilo."
+            ]
             return "\n\n".join(parts).strip()
 
-        sys_full = build_system_text()
+        ucontent = build_user_text()
+        sys_full = base_sys  # ← El SYSTEM queda SOLO con la política
 
-        # 4) Presupuesto: baja el overhead y sube la salida efectiva
+        # 4) Presupuesto: contamos SYSTEM + USER (no solo system)
         def used_effective():
             # margen prudente (chat-format) + pequeño fijo
-            return int(1.15 * (toklen(sys_full) + toklen(user_text))) + 10
+            return int(1.15 * (toklen(sys_full) + toklen(ucontent))) + 10
 
         used = used_effective()
         resp_budget = int(max_tokens)
@@ -4571,29 +4584,43 @@ class ChatWithLLM(ChatFrame):
             if used + resp_budget <= ctx - 64:
                 break
             if rag_ctx and len(rag_ctx) > 180:
-                rag_frag_chars = max(180, int(rag_frag_chars * 0.80));
+                rag_frag_chars = max(180, int(rag_frag_chars * 0.80))
                 rag_ctx = shrink(rag_ctx, rag_frag_chars)
             elif hits and idx_top > 1:
                 idx_top = max(1, idx_top - 1)
                 idx_note_chars = max(120, int(idx_note_chars * 0.85))
-                idx_ctx, hits = self.llm.build_index_context(user_text, top_k=idx_top, max_note_chars=idx_note_chars)
+                idx_ctx, hits = self.llm.build_index_context(
+                    user_text, top_k=idx_top, max_note_chars=idx_note_chars
+                )
             elif resp_budget > 96:
                 resp_budget = max(96, int(resp_budget * 0.85))
             else:
                 break
-            sys_full = build_system_text()
+            # reensamblar USER después de recortes
+            ucontent = build_user_text()
             used = used_effective()
 
-        # ⬅️ Aquí estaba el corte: quita el min(80, …) y dalo dinámico
+        # Límite final dinámico (respeta variable de entorno y contexto)
         import os as _os_tokcap
         cap_env = int(_os_tokcap.getenv("PACQUI_MAX_TOKENS", "512"))
         cap_safe = max(192, min(cap_env, 1024))
-
         max_final = max(192, min(resp_budget, ctx - used - 64, cap_safe))
 
+        # Mensajes finales: política en SYSTEM, evidencia y pregunta en USER
         msgs = [{"role": "system", "content": sys_full},
-                {"role": "user", "content": user_text}]
+                {"role": "user",   "content": ucontent}]
+
+        # Diagnóstico opcional: activa con PACQUI_DIAG_RAG=1
+        try:
+            import os as _os
+            if _os.getenv("PACQUI_DIAG_RAG", "0") == "1":
+                _frags = (rag_ctx or "").count("\n    Fuente:")
+                print(f"[CTX] frags={_frags}  idx_hits={len(hits)}  tok(system)={toklen(sys_full)}  tok(user)={toklen(ucontent)}")
+        except Exception:
+            pass
+
         return msgs, hits, max_final
+
 
     def _log_qa_if_possible(self, full_answer: str):
         """Guarda la Q/A en históricos (MetaStore) usando la DB del front."""
