@@ -2,7 +2,7 @@
 import os
 import tkinter as tk
 from tkinter import ttk, messagebox
-#PACqui_
+#PACqui_1.3.0
 class SourcesPanel(tk.Toplevel):
     """
     Panel lateral (desacoplado) para listar "Fuentes" sugeridas por el índice (keywords/observaciones)

@@ -8,7 +8,7 @@ import os, sys, json, time, hashlib, binascii, secrets, sqlite3, threading, webb
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-#PACqui
+#PACqui 1.3.0
 APP_NAME = "PACqui"
 CONFIG_DIR = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "PACqui"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)

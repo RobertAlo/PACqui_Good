@@ -3,7 +3,7 @@ from __future__ import annotations
 import os, math, sqlite3, struct, re
 from pathlib import Path
 
-#PACqui
+#PACqui 1.3.0
 def _cpu_autotune(ctx_tokens: int):
     import os, multiprocessing
     cores = multiprocessing.cpu_count() or 4
@@ -302,6 +302,28 @@ class LLMService:
             except Exception:
                 pinned = {}
 
+            # --- BONUS/MALUS por feedback histórico (qa_feedback + qa_sources) ---
+            fb_by_path = {}
+            try:
+                cur.execute("""
+                    SELECT lower(S.path) AS p,
+                           AVG(CASE
+                                 WHEN F.rating >= 8 THEN 1.0
+                                 WHEN F.rating <= 3 THEN -1.0
+                                 ELSE 0.0
+                               END) AS fb
+                      FROM qa_sources S
+                      JOIN qa_feedback F ON F.qa_id = S.qa_id
+                     GROUP BY lower(S.path)
+                """)
+                fb_by_path = {
+                    os.path.normcase(os.path.normpath(p or "")): float(fb or 0.0)
+                    for (p, fb) in cur.fetchall()
+                    if p
+                }
+            except Exception:
+                fb_by_path = {}
+
             # 1) keywords
             for t in toks:
                 cur.execute("SELECT fullpath FROM doc_keywords WHERE lower(keyword) LIKE lower(?) LIMIT 1500",
@@ -394,6 +416,17 @@ class LLMService:
                         rank += int(round(10.0 * pinned[fp]))
                 except Exception:
                     pass
+
+                # --- BONUS/MALUS por feedback histórico ---
+                try:
+                    fb = fb_by_path.get(fp)
+                    if fb is not None:
+                        # Factor configurable por env (por defecto 6.0 → ±6 puntos)
+                        k = float(os.getenv("PACQUI_FB_BOOST", "6.0"))
+                        rank += int(round(k * fb))
+                except Exception:
+                    pass
+
 
                 # --- BOOST por "concept_sources" (más fuerte que pinned) ---
                 try:

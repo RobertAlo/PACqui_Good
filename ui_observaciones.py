@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional, Callable
 from pathlib import Path
-#PAcqui_
+#PAcqui_1.3.0
 try:
     from meta_store import MetaStore
 except Exception:

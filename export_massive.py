@@ -12,7 +12,7 @@ except Exception:
     from massive_indexer import export_massive_index  # type: ignore
     from meta_store import MetaStore  # type: ignore
 
-#PACqui_
+#PACqui_1.3.0
 class ExportProgress(tk.Toplevel):
     """
     Ventana de progreso en 2 fases:

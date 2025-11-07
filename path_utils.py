@@ -6,7 +6,7 @@ import sys
 import subprocess
 import urllib.parse
 from pathlib import Path
-#PACqui_
+#PACqui_1.3.0
 def norm_ext(name: str) -> str:
     """Devuelve la extensión en minúsculas sin el punto (e.g., 'pdf')."""
     return Path(name).suffix.lower().lstrip(".")
