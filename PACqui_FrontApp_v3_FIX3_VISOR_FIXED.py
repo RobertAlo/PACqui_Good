@@ -4508,11 +4508,17 @@ class ChatWithLLM(ChatFrame):
                 return max(1, int(len(s) / 4))
 
         # 1) Construcción de contextos
-        idx_ctx, hits = self.llm.build_index_context(user_text, top_k=idx_top, max_note_chars=idx_note_chars)
-        rag_q = user_text
-        if getattr(self, "_ext_filter", None):
-            rag_q = user_text + " " + " ".join(ext.lstrip(".") for ext in self._ext_filter)
-        rag_ctx = self.llm._rag_retrieve(rag_q, k=rag_k, max_chars=rag_frag_chars)
+        # 1) Construcción de contextos (RECUPERACIÓN con rewrite)
+        retrieval_q = self._rewrite_query_for_retrieval(user_text)
+        self._last_retrieval_q = retrieval_q  # diagnóstico opcional
+
+        idx_ctx, hits = self.llm.build_index_context(
+            retrieval_q, top_k=idx_top, max_note_chars=idx_note_chars
+        )
+
+        rag_ctx = self.llm._rag_retrieve(
+            retrieval_q, k=rag_k, max_chars=rag_frag_chars
+        )
 
         # contexto muy breve de conversación (no es fuente, sólo guía)
         prev_q = (getattr(self, "_last_user_q", "") or "").strip()
@@ -4530,7 +4536,8 @@ class ChatWithLLM(ChatFrame):
             obs_block, rutas_block = "", ""
 
         try:
-            concept_block = self.llm.concept_context(user_text, max_chars=300, top_k=3) or ""
+            concept_block = self.llm.concept_context(retrieval_q, max_chars=300, top_k=3) or ""
+
             # -- FUSIÓN CONCEPTOS→FRAGMENTOS (si no hay RAG)
             if (not rag_ctx or not rag_ctx.strip()) and concept_block.strip():
                 _lines = [ln.strip("—- ").strip() for ln in concept_block.splitlines() if ln.strip()]
@@ -4590,7 +4597,9 @@ class ChatWithLLM(ChatFrame):
                 idx_top = max(1, idx_top - 1)
                 idx_note_chars = max(120, int(idx_note_chars * 0.85))
                 idx_ctx, hits = self.llm.build_index_context(
-                    user_text, top_k=idx_top, max_note_chars=idx_note_chars
+                    retrieval_q, top_k=idx_top, max_note_chars=idx_note_chars
+
+
                 )
             elif resp_budget > 96:
                 resp_budget = max(96, int(resp_budget * 0.85))
@@ -4665,8 +4674,11 @@ class ChatWithLLM(ChatFrame):
         import os, re, time, threading
 
         q = self._get_user_text()
-        # guardar última pregunta del usuario para contexto
-        self._last_user_q = q
+
+        # --- contexto conversacional para recuperación ---
+        # Guardamos el "anterior" ANTES de pisar el último
+        self._prev_user_q = (getattr(self, "_last_user_q", "") or "").strip()
+        self._last_user_q = q  # el actual queda como "último" para el siguiente turno
 
         if not q:
             try:
@@ -4683,8 +4695,7 @@ class ChatWithLLM(ChatFrame):
         except Exception:
             pass
 
-        qlow = q.lower().strip()
-        qlow_clean = re.sub(r"\b(pacqui|pac|assistant)\b", "", qlow).strip()
+
 
         # small-talk SOLO en primer turno (full-match), para no secuestrar preguntas reales
         if not hasattr(self, "_user_turns"):
@@ -4721,10 +4732,15 @@ class ChatWithLLM(ChatFrame):
             pass
 
         # pintar fuentes sugeridas YA (ligero)
+        # pintar fuentes sugeridas YA (ligero) — usando query efectiva de recuperación
+        retrieval_q = self._rewrite_query_for_retrieval(q)
+        self._last_retrieval_q = retrieval_q  # útil para diagnóstico
+
         hits = self._collect_hits(
-            q, top_k=5, note_chars=220,
+            retrieval_q, top_k=5, note_chars=220,
             prefer_only=(sorted(self._ext_filter) if getattr(self, "_ext_filter", None) else None)
         ) or []
+
         self._hits = hits
         self._last_query = q
         self._last_hits = hits
@@ -4803,7 +4819,66 @@ class ChatWithLLM(ChatFrame):
         except Exception:
             return []
 
+    def _rewrite_query_for_retrieval(self, user_text: str) -> str:
+        """
+        Devuelve la query "efectiva" para RECUPERACIÓN (ÍNDICE + CHUNKS):
+        - Si el turno actual es un seguimiento ("eso", "lo anterior", "dentro del ámbito", etc.)
+          lo ancla al turno anterior.
+        - Si el turno actual NO menciona el dominio pero el anterior sí (SICOP/MIC/PEPAC...),
+          añade contexto del anterior.
+        - Añade filtro de extensiones si el usuario ha activado "solo pdf/docx/doc".
+        OJO: esto NO cambia la pregunta que se le pasa al LLM; solo cambia qué buscamos.
+        """
+        import re
 
+        q = (user_text or "").strip()
+        if not q:
+            return ""
+
+        ql = q.lower()
+        ql = re.sub(r"\b(pacqui|pac|assistant)\b", "", ql).strip()
+
+        prev_q = (getattr(self, "_prev_user_q", "") or "").strip()
+        prev_ql = prev_q.lower().strip()
+
+        # Heurística de "seguimiento"
+        follow_markers = (
+            "esto", "eso", "esa", "ese",
+            "anterior", "lo anterior", "lo de antes",
+            "en ese caso", "en este caso",
+            "me refería", "me refiero",
+            "respecto a", "sobre lo anterior",
+            "dentro", "ámbito", "en sicop", "en mic"
+        )
+        is_follow = (len(ql) < 70) or any(m in ql for m in follow_markers)
+
+        domain_terms = ("sicop", "mic", "feaga", "feader", "pepac", "iar", "singear", "siop", "serpa")
+
+        effective = q
+        if prev_q:
+            # Si parece seguimiento: fusiona para recuperar con contexto
+            if is_follow:
+                effective = f"{prev_q} | Seguimiento: {q}"
+            else:
+                # Si el dominio está en la anterior pero no en la actual, añade contexto
+                if any(t in prev_ql for t in domain_terms) and not any(t in ql for t in domain_terms):
+                    effective = f"{q} | Contexto: {prev_q}"
+
+        # Extensiones activas desde UI: conviértelo a tokens simples para que el RAG las use
+        try:
+            extf = set(getattr(self, "_ext_filter", set()) or set())
+        except Exception:
+            extf = set()
+
+        if extf:
+            if ".pdf" in extf:
+                effective += " pdf"
+            if ".docx" in extf:
+                effective += " docx"
+            if ".doc" in extf:
+                effective += " doc"
+
+        return effective.strip()
 
     def _build_obs_and_routes_blocks(self, hits, max_items: int = 3, max_obs_chars: int = 220):
         """Devuelve (obs_block, rutas_block, hits_usados).
@@ -5284,112 +5359,20 @@ class ChatWithLLM(ChatFrame):
                 return True
             return False
 
-        # === RAG/ÍNDICE: composición estricta del prompt (forzado) ===
-        import os
-
-        # 0) Pregunta del usuario leída de la entry
-        user_q = self.entry.get().strip() if hasattr(self, "entry") else ""
-
-        # 1) Contextos del índice y del RAG (respeta filtros de extensión de la UI)
-        idx_ctx, idx_hits = self.llm.build_index_context(user_q, top_k=3, max_note_chars=200)
-
-        q_for_rag = user_q
-        try:
-            extf = set(getattr(self, "_ext_filter", set()) or set())
-        except Exception:
-            extf = set()
-        if ".pdf" in extf or "pdf" in extf:
-            q_for_rag += " pdf"
-        if ".docx" in extf or "docx" in extf:
-            q_for_rag += " docx"
-        if ".doc" in extf or "doc" in extf:
-            q_for_rag += " doc"
-        rag_ctx = self.llm._rag_retrieve(q_for_rag, k=3, max_chars=900)
-        # -- FUSIÓN CONCEPTOS→FRAGMENTOS (si no hay RAG)
-        if not rag_ctx or not rag_ctx.strip():
+        # --- IMPORTANTE ---
+        # Aquí NO hacemos recuperación. La recuperación (ÍNDICE+RAG) se hace ANTES, en _compose_system_budgeted().
+        # Este método SOLO streamea el modelo con 'messages' ya preparados.
+        if not messages:
             try:
-                concept_block = self.llm.concept_context(user_q, max_chars=360, top_k=3) or ""
-            except Exception:
-                concept_block = ""
-            if concept_block.strip():
-                _lines = [ln.strip("—- ").strip() for ln in concept_block.splitlines() if ln.strip()]
-                if _lines:
-                    _frags = []
-                    for i, ln in enumerate(_lines, start=1):
-                        _frags.append(f"[{i}] {ln}\n    Fuente: Concepto")
-                    rag_ctx = "\n".join(_frags)
-
-
-
-        # 2) Cortafuegos: si no hay fragmentos, no llamamos al LLM
-        if not rag_ctx or not rag_ctx.strip():
-            aviso = ("No encuentro fragmentos relevantes en el repositorio para responder con garantías. "
-                     "Prueba a afinar la búsqueda (p. ej., 'MIC', 'fichero de pago', 'SICOP', 'condicionalidad', "
-                     "o usa 'solo pdf' / 'solo docx').")
-            try:
-                self._append_stream_text("PACqui: " + aviso, end_turn=True)
+                self._append_stream_text("PACqui: No hay mensajes preparados para enviar al modelo.", end_turn=True)
             except Exception:
                 pass
             try:
                 self._spinner_stop()
             except Exception:
                 pass
+            self._gen_active = False
             return
-
-        # 3) System duro: prohíbe saludar, pedir palabra clave o copiar preguntas del contexto
-        base_sys = (
-            "Eres PACqui, asistente experto en PAC/PEPAC/SICOP. Responde SIEMPRE en español neutro. "
-            "Usa EXCLUSIVAMENTE los FRAGMENTOS adjuntos como base factual y CITA con [n] (n = índice del fragmento). "
-            "PROHIBIDO: saludar, pedir palabra clave o proponer filtros (p. ej., 'solo pdf/docx'); "
-            "PROHIBIDO copiar o enumerar preguntas del contexto; no empieces con 'Pregunta:' ni con listados de '¿Cuáles son…?'. "
-            "Responde directo a la pregunta. Estructura en bloques SOLO si hay evidencia para cada bloque; "
-            "si NO hay evidencia para un bloque, omítelo. Si los fragmentos son insuficientes para parte de la respuesta, indícalo sin inventar. "
-            "No repitas etiquetas como [FRAGMENTOS] o [ÍNDICE] en la salida. "
-            "Al final, incluye 'Fuentes:' con la lista [n] y su ruta tal como aparecen en los FRAGMENTOS."
-        )
-
-        # 4) User estricto con etiquetas
-        ucontent = (
-            f"Pregunta del usuario:\n{user_q}\n\n"
-            "=== FRAGMENTOS (cítalos como [1], [2], ...) ===\n"
-            f"{rag_ctx}\n\n"
-            "=== ÍNDICE (observaciones/rutas del índice) ===\n"
-            f"{idx_ctx}\n\n"
-            "Instrucciones de uso:\n"
-            "- Responde a la PREGUNTA usando exclusivamente los FRAGMENTOS; el ÍNDICE es solo apoyo contextual.\n"
-            "- No pidas más datos ni hagas listas genéricas. Responde directamente.\n"
-            "- Cita con [n] cada punto que derives de un fragmento.\n"
-            "- Si no hay datos suficientes en los fragmentos para algún apartado, dilo."
-        )
-
-        # 5) Sobrescribe el 'messages' real que se enviará al modelo
-        # 5) Respeta los mensajes ya compuestos por el caller; si vienen vacíos, compón aquí.
-        if not messages:
-            messages = [
-                {"role": "system", "content": base_sys},
-                {"role": "user", "content": ucontent},
-            ]
-        # Si sí venían mensajes, NO los tocamos (evita duplicar RAG y agrandar el prompt)
-
-        # 6) Presupuesto de salida por env (opcional)
-        try:
-            mt_env = int(os.getenv("PACQUI_MAX_TOKENS", "0") or "0")
-            if mt_env > 0:
-                max_tokens = mt_env
-        except Exception:
-            pass
-
-        # 7) Trazas útiles
-        try:
-            ctx = int(getattr(self.llm, "ctx", 4096) or 4096)
-            tin = sum(self.llm.count_tokens((m.get("content") or "")) for m in messages)
-            print(f"[TOKENS] ctx={ctx}  in≈{tin}  out_max={int(max_tokens)}")
-            tin_u = self.llm.count_tokens(ucontent)
-            print(f"[RAG] frags={(rag_ctx.count('[', 0) if rag_ctx else 0)}  idx_len={len(idx_ctx)}  in_tokens≈{tin_u}")
-        except Exception:
-            pass
-
-        # === FIN composición estricta ===
 
         def _p(msg: str):
             try:

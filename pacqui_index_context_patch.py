@@ -86,7 +86,8 @@ def _patched_worker_chat_stream(self):
 
             # RAG del repositorio (si tu app lo expone)
             try:
-                rag_ctx = (self.app._retrieve_context(user_text, k=4) or "").strip()
+                rag_ctx = (self.app._retrieve_context(user_text, k=4, messages=self.messages) or "").strip()
+
             except Exception:
                 rag_ctx = ""
 

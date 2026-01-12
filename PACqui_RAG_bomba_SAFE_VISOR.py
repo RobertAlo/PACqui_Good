@@ -3891,7 +3891,9 @@ class LLMChatDialog(tk.Toplevel):
             rag_ctx = ""
             try:
                 if hasattr(self.app, "_retrieve_context"):
-                    rag_ctx = self.app._retrieve_context(text, k=6)
+                    rag_ctx = self.app._retrieve_context(text, k=6,
+                                                         messages=self.messages + [{"role": "user", "content": text}])
+
             except Exception:
                 pass
 
@@ -3908,7 +3910,8 @@ class LLMChatDialog(tk.Toplevel):
             rag_ctx = ""
             try:
                 if hasattr(self.app, "_retrieve_context"):
-                    rag_ctx = self.app._retrieve_context(text, k=6)
+                    rag_ctx = self.app._retrieve_context(text, k=6, messages=self.messages + [{"role": "user", "content": text}])
+
             except Exception:
                 pass
 
@@ -4122,7 +4125,8 @@ class LLMChatDialog(tk.Toplevel):
                         user_text = m.get("content", "")
                         break
                 try:
-                    ctx_text = (self.app._retrieve_context(user_text, k=6) or "").strip()
+                    ctx_text = (self.app._retrieve_context(user_text, k=6, messages=self.messages) or "").strip()
+
                 except Exception:
                     ctx_text = ""
                 policy = (
@@ -4618,41 +4622,126 @@ try:
             try: self.queue.put(('msg', (f'RAG: fallo indexando {os.path.basename(fullpath)}: {_e}','WARN')))
             except Exception: pass
             return 0
-    def __RAG__retrieve_context(self, query: str, k: int = 6) -> str:
+
+    def __RAG__rewrite_query_from_messages(self, messages, fallback_query: str = "") -> str:
+        """
+        Rewrite determinista para recuperación:
+        - Si el último turno es anafórico / muy corto ("me refería...", "eso", etc.), concatena con contexto previo.
+        - Si antes aparece un dominio (SICOP/FEADER/FEGA/MIC/PEPAC) y el último turno no lo menciona, lo ancla.
+        """
+        import re
+
+        try:
+            msgs = messages or []
+            user_msgs = [m.get("content", "").strip() for m in msgs if m.get("role") == "user" and m.get("content")]
+        except Exception:
+            user_msgs = []
+
+        if not user_msgs:
+            return (fallback_query or "").strip()
+
+        last = user_msgs[-1]
+        prev = " ".join(user_msgs[-3:-1]).strip()
+
+        # anáforas típicas
+        anaphora = re.search(r"\b(me refer[ií]a|esto|eso|aqu[ií]|ah[ií]|lo anterior|en ese caso|dentro del [aá]mbito)\b", last, re.I)
+        short = len(last) < 80
+
+        # ancla de dominio si venía en el historial
+        prev_l = prev.lower()
+        last_l = last.lower()
+        anchor = ""
+        for dom in ("sicop", "fega", "feader", "mic", "pepac", "singear"):
+            if dom in prev_l and dom not in last_l:
+                anchor = dom.upper()
+                break
+
+        if (short or anaphora) and prev:
+            q = f"{prev}\n{last}"
+        else:
+            q = last
+
+        if anchor:
+            q = f"{q}\n{anchor}"
+
+        return q.strip()
+
+    def __RAG__retrieve_context(self, query: str, k: int = 6, messages=None) -> str:
         import sqlite3, math, struct
         try:
-            conn = self._rag__conn(); c = conn.cursor()
+            # --- 1) rewrite de query si hay historial ---
+            effective_query = query or ""
+            try:
+                if messages:
+                    effective_query = self.__RAG__rewrite_query_from_messages(messages, fallback_query=effective_query)
+            except Exception:
+                pass
+
+            # Debug opcional (útil para verificar que el rewrite funciona)
+            try:
+                if effective_query.strip() != (query or "").strip():
+                    self._append_msg(f"RAG query rewrite: '{query}'  ->  '{effective_query}'", "DEBUG")
+            except Exception:
+                pass
+
+            # --- 2) recuperar candidatos ---
+            conn = self._rag__conn()
+            c = conn.cursor()
             base = getattr(self, 'base_path', None)
             if base:
                 like_param = str(base).rstrip('/\\') + '%'
-                rows = c.execute('SELECT c.id, c.text, c.file_path, e.vec FROM chunks c JOIN embeddings e ON e.chunk_id=c.id WHERE c.file_path LIKE ?', (like_param,)).fetchall()
+                rows = c.execute(
+                    'SELECT c.id, c.text, c.file_path, e.vec '
+                    'FROM chunks c JOIN embeddings e ON e.chunk_id=c.id '
+                    'WHERE c.file_path LIKE ?',
+                    (like_param,)
+                ).fetchall()
             else:
-                rows = c.execute('SELECT c.id, c.text, c.file_path, e.vec FROM chunks c JOIN embeddings e ON e.chunk_id=c.id').fetchall()
-            if not rows:
-                return "[0] (vacío)\n\"\"\"\n\n\"\"\""
-            def blob_to_vec(b: bytes):
-                n = len(b)//4; 
-                return list(struct.unpack('<'+'f'*n, b)) if n>0 else []
-            def dot(a,b): return sum((x*y for x,y in zip(a,b)))
-            def norm(a):
-                s = math.sqrt(sum((x*x for x in a))) or 1.0; return [x/s for x in a]
-            vq = norm(self._get_embedder()["encode"](query or ''))
+                rows = c.execute(
+                    'SELECT c.id, c.text, c.file_path, e.vec '
+                    'FROM chunks c JOIN embeddings e ON e.chunk_id=c.id'
+                ).fetchall()
 
-            scored=[]
-            for cid, txt, fp, blob in rows:
-                vv = norm(blob_to_vec(blob)); s = dot(vq, vv)
-                frag = (txt or '').strip()
-                if len(frag)>1200: frag = frag[:1200] + '…'
+            if not rows:
+                return ""
+
+            def blob_to_vec(b: bytes):
+                n = len(b)//4
+                return list(struct.unpack('<' + 'f'*n, b)) if n > 0 else []
+
+            def dot(a, b):
+                return sum((x*y for x, y in zip(a, b)))
+
+            def norm(a):
+                s = math.sqrt(sum((x*x for x in a))) or 1.0
+                return [x/s for x in a]
+
+            vq = norm(self._get_embedder()["encode"](effective_query or ""))
+
+            scored = []
+            for _cid, txt, fp, blob in rows:
+                vv = norm(blob_to_vec(blob))
+                s = dot(vq, vv)
+                frag = (txt or "").strip()
+                if len(frag) > 1200:
+                    frag = frag[:1200] + "…"
                 scored.append((s, frag, fp))
+
             scored.sort(reverse=True, key=lambda t: t[0])
-            top = scored[:max(1,int(k))]; partes=[]
-            for i,(_,frag,fp) in enumerate(top, start=1):
+            top = scored[:max(1, int(k))]
+
+            partes = []
+            for i, (_s, frag, fp) in enumerate(top, start=1):
                 partes.append(f"[{i}] {fp}\n\"\"\"\n{frag}\n\"\"\"")
-            return "\n\n".join(partes) if partes else "[0] (vacío)\n\"\"\"\n\n\"\"\""
+
+            return "\n\n".join(partes) if partes else ""
         except Exception as e:
-            try: self._append_msg(f'RAG retrieve error: {e}', 'WARN')
-            except Exception: pass
-            return "[0] (error)\n\"\"\"\n\n\"\"\""
+            try:
+                self._append_msg(f"RAG retrieve error: {e}", "WARN")
+            except Exception:
+                pass
+            return ""
+
     try:
         _ = OrganizadorFrame
         for name, fn in {

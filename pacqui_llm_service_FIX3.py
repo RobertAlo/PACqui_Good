@@ -458,29 +458,13 @@ class LLMService:
                 kws = "; ".join(_get_keywords(cur, fp))
                 note = _get_note(cur, fp)
                 if len(note) > max_note_chars: note = note[:max_note_chars] + "…"
-                out.append({"path": fp, "name": name, "score": _kw + _notes + _fn, "keywords": kws, "note": note})
+                out.append({"path": fp, "name": name, "score": float(_rank), "keywords": kws, "note": note})
+
             return out
         finally:
             con.close()
 
-        # >>> FEEDBACK BOOST
-            try:
-                cur2 = con.cursor()
-                cur2.execute("""
-                    SELECT COALESCE(SUM(CASE
-                        WHEN f.rating >= 8 THEN 3
-                        WHEN f.rating >= 6 THEN 1
-                        WHEN f.rating BETWEEN 0 AND 3 THEN -1
-                        ELSE 0 END), 0)
-                    FROM qa_sources s
-                    JOIN qa_feedback f ON f.qa_id = s.qa_id
-                    WHERE s.path = ?
-                """, (fp,))
-                fb = cur2.fetchone()[0] or 0
-                score_final += float(fb)
-            except Exception:
-                pass
-        # <<< FEEDBACK BOOST
+
 
     def build_index_context(self, query: str, top_k: int = 5, max_note_chars: int = 240):
         hits = self._index_hits(query, top_k=top_k, max_note_chars=max_note_chars)
@@ -496,6 +480,8 @@ class LLMService:
         con = sqlite3.connect(self.db_path, check_same_thread=False)
         try:
             cur = con.cursor()
+            if not (query or "").strip():
+                return []
 
             # tokens significativos de la query
             toks = [t.lower() for t in re.findall(r"[A-Za-zÁÉÍÓÚÜáéíóúüÑñ0-9]{3,}", (query or ""))]
@@ -539,6 +525,8 @@ class LLMService:
             return []
         finally:
             con.close()
+
+
 
     def _rag_retrieve(self, query: str, k: int = 8, max_chars: int = 1200) -> str:
         """
@@ -594,14 +582,26 @@ class LLMService:
             fname_bonus = sum(1 for t in toks if t in fname)
             ext_adj = EXT_BONUS.get(ext, 0) + EXT_MALUS.get(ext, 0)
 
+            txt_low = (text or "").lower()
+
             # --- BOOST dominio PAC/MIC/SICOP/PEPAC ---
             mic_terms = (
             " mic ", " ficheros de pago ", " fichero de pago ", " sicop ", " pepac ", " feaga ", " feader ")
-            txt_low = (text or "").lower()
             dom_boost = 1.5 if (
                         any(t in txt_low for t in mic_terms) or any(t.strip() in fname for t in mic_terms)) else 0.0
 
-            scored.append((base * 10 + ext_adj * 5 + fname_bonus * 2 + dom_boost, text or "", path or ""))
+            # --- PENALIZA chunks de metadatos/cabeceras (suelen dar respuestas tipo "Ref./Versión/Pág.") ---
+            meta_terms = (
+            "ref.:", "ref.", "versión", "version", "pág.", "pag.", "control del documento", "índice", "indice")
+            meta_hits = sum(1 for mt in meta_terms if mt in txt_low)
+            meta_penalty = -8.0 * meta_hits
+
+            # penaliza también fragmentos demasiado cortos (suelen ser cabeceras sueltas)
+            if len((text or "").strip()) < 120:
+                meta_penalty -= 6.0
+
+            score = (base * 10) + (ext_adj * 5) + (fname_bonus * 2) + dom_boost + meta_penalty
+            scored.append((score, text or "", path or ""))
 
         if not scored:
             return ""
