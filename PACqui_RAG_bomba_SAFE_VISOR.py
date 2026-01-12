@@ -4612,7 +4612,7 @@ try:
             count=0
             for ch in self._text_chunks(txt, max_chars=1200, overlap=200):
                 c.execute("INSERT INTO chunks(file_path, mtime, text) VALUES(?,?,?)", (fullpath, float(mtime_ts or 0.0), ch))
-                cid = c.lastrowid; vec = _hash_embedder(ch, dim=256)
+                cid = c.lastrowid; vec = self._hash_embedder(ch, dim=256)
                 c.execute("INSERT OR REPLACE INTO embeddings(chunk_id, vec) VALUES(?,?)", (cid, self._vec_to_blob(vec))); count+=1
             conn.commit()
             try: self.queue.put(('msg', (f'RAG: indexado {count} chunks — {os.path.basename(fullpath)}','DEBUG')))
@@ -4754,8 +4754,13 @@ try:
             '_index_file_chunks': __RAG__index_file_chunks,
             '_retrieve_context': __RAG__retrieve_context,
         }.items():
-            try: setattr(OrganizadorFrame, name, fn)
-            except Exception: pass
+            try:
+                # NO sobreescribir implementaciones ya presentes en OrganizadorFrame
+                if getattr(OrganizadorFrame, name, None) is None:
+                    setattr(OrganizadorFrame, name, fn)
+            except Exception:
+                pass
+
         try:
             attr = getattr(OrganizadorFrame, '_index_file_chunks', None)
             print('RAG monkey-patch listo:', 'OK' if callable(attr) else type(attr).__name__)
