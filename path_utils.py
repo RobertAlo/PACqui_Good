@@ -12,18 +12,26 @@ def norm_ext(name: str) -> str:
     return Path(name).suffix.lower().lstrip(".")
 
 def file_url_windows(path: str) -> str:
+    r"""
+    Construye una URL file:// robusta para Windows (incluido UNC).
+    - Local: C:\dir\file -> file:///C:/dir/file
+    - UNC:   \\srv\share\dir\file -> file://srv/share/dir/file
+    Evita caracteres raros: escapamos solo lo necesario (espacios, acentos, #, etc.)
     """
-    Construye una URL file:// válida para Windows (incluido UNC).
-    Ej.: file:///C:/Users/...  o  file://///servidor/compartida/dir/file.txt
-    """
-    p = Path(path)
-    s = str(p).replace("\\", "/")
-    if s.startswith("//") or s.startswith("\\\\"):
-        s = s.replace("\\\\", "//")
-        return "file:" + urllib.parse.quote("////" + s.lstrip("/"))
+    s = str(path).replace("\\", "/")
+
+    # UNC: \\servidor\recurso\dir\file  -> file://servidor/recurso/dir/file
+    if s.startswith("//"):
+        unc = s.lstrip("/")
+        return "file://" + urllib.parse.quote(unc, safe="/:")
+
+    # Unidad: C:\dir\file -> file:///C:/dir/file
     if len(s) > 1 and s[1] == ":":
-        return "file:///" + urllib.parse.quote(s)
-    return "file:///" + urllib.parse.quote(s)
+        return "file:///" + urllib.parse.quote(s, safe="/:")
+
+    # Posix u otras rutas relativas
+    return "file:///" + urllib.parse.quote(s, safe="/:")
+
 
 def rel_from_base(abs_path: str, base: str) -> str:
     """Ruta relativa a base; si está en otra unidad, devuelve el nombre de archivo."""

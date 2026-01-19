@@ -226,6 +226,107 @@ def _build_default_meta_provider(base: Path) -> Callable[[str], tuple[str, str]]
 
     return _provider
 
+class ExportWizardDialog(tk.Toplevel):
+    def __init__(self, master, base_path: Path):
+        super().__init__(master)
+        self.title("Asistente de exportación")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+
+        self.base_path = Path(base_path)
+        self._result = None
+
+        self.var_docs_only = tk.BooleanVar(value=True)
+
+        pad = 10
+        frm = ttk.Frame(self, padding=pad)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text=f"Base: {self.base_path}", font=("", 10, "bold")).grid(row=0, column=0, columnspan=4, sticky="w")
+
+        ttk.Checkbutton(frm, text="Solo documentos (PDF/Office/ODF/SQL…)", variable=self.var_docs_only).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(6, 8)
+        )
+
+        ttk.Label(frm, text="Incluir carpetas (si vacío: se incluye la base entera):").grid(row=2, column=0, columnspan=4, sticky="w")
+        self.lst_inc = tk.Listbox(frm, width=90, height=6)
+        self.lst_inc.grid(row=3, column=0, columnspan=4, sticky="we")
+
+        btn_inc_add = ttk.Button(frm, text="Añadir…", command=self._add_include)
+        btn_inc_del = ttk.Button(frm, text="Quitar", command=self._del_include)
+        btn_inc_add.grid(row=4, column=0, sticky="w", pady=(6, 0))
+        btn_inc_del.grid(row=4, column=1, sticky="w", pady=(6, 0))
+
+        ttk.Label(frm, text="Excluir carpetas (se podan subárboles completos):").grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self.lst_exc = tk.Listbox(frm, width=90, height=6)
+        self.lst_exc.grid(row=6, column=0, columnspan=4, sticky="we")
+
+        btn_exc_add = ttk.Button(frm, text="Añadir…", command=self._add_exclude)
+        btn_exc_del = ttk.Button(frm, text="Quitar", command=self._del_exclude)
+        btn_exc_add.grid(row=7, column=0, sticky="w", pady=(6, 0))
+        btn_exc_del.grid(row=7, column=1, sticky="w", pady=(6, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=8, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Cancelar", command=self._cancel).pack(side="right")
+        ttk.Button(btns, text="Continuar", command=self._ok).pack(side="right", padx=(0, 8))
+
+        self.columnconfigure(0, weight=1)
+        frm.columnconfigure(0, weight=1)
+        frm.columnconfigure(1, weight=1)
+        frm.columnconfigure(2, weight=1)
+        frm.columnconfigure(3, weight=1)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _ask_dir(self):
+        d = filedialog.askdirectory(title="Selecciona carpeta", initialdir=str(self.base_path))
+        return d or None
+
+    def _add_include(self):
+        d = self._ask_dir()
+        if not d:
+            return
+        self.lst_inc.insert(tk.END, d)
+
+    def _del_include(self):
+        sel = list(self.lst_inc.curselection())
+        sel.reverse()
+        for i in sel:
+            self.lst_inc.delete(i)
+
+    def _add_exclude(self):
+        d = self._ask_dir()
+        if not d:
+            return
+        self.lst_exc.insert(tk.END, d)
+
+    def _del_exclude(self):
+        sel = list(self.lst_exc.curselection())
+        sel.reverse()
+        for i in sel:
+            self.lst_exc.delete(i)
+
+    def _ok(self):
+        include_dirs = [self.lst_inc.get(i) for i in range(self.lst_inc.size())]
+        exclude_dirs = [self.lst_exc.get(i) for i in range(self.lst_exc.size())]
+        self._result = {
+            "include_dirs": include_dirs,
+            "exclude_dirs": exclude_dirs,
+            "docs_only": bool(self.var_docs_only.get()),
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self._result = None
+        self.destroy()
+
+    def wait(self):
+        self.wait_window(self)
+        return (self._result is not None, self._result or {})
+
+
 # ------------------ EXPORTACIÓN ------------------
 def export_massive_index(base_path: str | os.PathLike[str],
                          out_path: Optional[str] = None,
@@ -445,33 +546,396 @@ def _is_probable_noun_es(token: str):
         return False
     # Aceptamos siglas/palabras alfanuméricas si no pasan filtros anteriores
     return True
+class ScanWizardDialog(tk.Toplevel):
+    """
+    Wizard de escaneo:
+      - Perfil: documentos / documentos+sql / todo
+      - Inclusión: toda la base o solo subcarpetas
+      - Exclusiones: por nombre de carpeta o por ruta relativa
+      - Rendimiento: preconteo (progreso exacto) o rápido (indeterminado)
+      - RAG: off / texto+sql / docs
+      - “Recordar opciones” (persistencia en settings.json)
+    """
+
+    DEFAULT_EXCLUDES = [
+        ".git", ".svn", ".hg",
+        "__pycache__", ".mypy_cache", ".pytest_cache",
+        "node_modules", ".venv", "venv",
+        "dist", "build", "target", ".idea", ".vscode",
+        "$RECYCLE.BIN", "System Volume Information",
+        "thumbs.db",
+    ]
+
+    def __init__(self, parent, base_path: Path, initial_cfg: dict, rag_available: bool):
+        super().__init__(parent)
+        self.title("Wizard de escaneo — PACqui")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._result = None
+        self._base = Path(base_path)
+
+        # --- Copia segura de cfg inicial ---
+        cfg = dict(initial_cfg or {})
+        self.profile = tk.StringVar(value=str(cfg.get("profile", "docs+sql")))
+        self.sniff_docs = tk.BooleanVar(value=bool(cfg.get("sniff_docs", True)))
+        self.priority_docs = tk.BooleanVar(value=bool(cfg.get("priority_docs", True)))
+        self.precount = tk.BooleanVar(value=bool(cfg.get("precount", False)))
+        self.skip_over_mb = tk.IntVar(value=int(cfg.get("skip_over_mb", 0)))
+
+        # RAG
+        rag_default = str(cfg.get("rag_mode", "text" if rag_available else "off"))
+        if not rag_available:
+            rag_default = "off"
+        self.rag_mode = tk.StringVar(value=rag_default)
+        self.rag_max_mb = tk.IntVar(value=int(cfg.get("rag_max_mb", 25)))
+
+        # include/exclude
+        self.include_mode = tk.StringVar(value=str(cfg.get("include_mode", "all")))  # all | only
+        self._include_dirs = list(cfg.get("include_dirs", [])) if isinstance(cfg.get("include_dirs", []), list) else []
+        self._exclude_dirs = list(cfg.get("exclude_dirs", [])) if isinstance(cfg.get("exclude_dirs", []), list) else []
+        if not self._exclude_dirs:
+            self._exclude_dirs = list(self.DEFAULT_EXCLUDES)
+
+        self.remember = tk.BooleanVar(value=bool(cfg.get("remember", True)))
+
+        # --- UI ---
+        root = ttk.Frame(self, padding=12)
+        root.grid(row=0, column=0, sticky="nsew")
+        root.columnconfigure(0, weight=1)
+
+        self._steps = []
+        self._step_idx = 0
+
+        # Header
+        self.lbl_title = ttk.Label(root, text="", font=("Segoe UI", 12, "bold"))
+        self.lbl_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        # Body (stacked frames)
+        self.body = ttk.Frame(root)
+        self.body.grid(row=1, column=0, sticky="nsew")
+
+        # Footer
+        footer = ttk.Frame(root)
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        footer.columnconfigure(0, weight=1)
+
+        self.btn_back = ttk.Button(footer, text="◀ Atrás", command=self._back)
+        self.btn_back.grid(row=0, column=1, padx=(0, 6))
+        self.btn_next = ttk.Button(footer, text="Siguiente ▶", command=self._next)
+        self.btn_next.grid(row=0, column=2, padx=(0, 6))
+        self.btn_cancel = ttk.Button(footer, text="Cancelar", command=self._cancel)
+        self.btn_cancel.grid(row=0, column=3, padx=(0, 6))
+        self.btn_finish = ttk.Button(footer, text="Iniciar escaneo ✅", command=self._finish)
+        self.btn_finish.grid(row=0, column=4)
+
+        # Crear pasos
+        self._build_step_what()
+        self._build_step_folders()
+        self._build_step_perf()
+        self._build_step_rag(rag_available)
+        self._build_step_summary()
+
+        self._show_step(0)
+
+        # Centrado
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            self.geometry(f"+{px + (pw-w)//2}+{py + (ph-h)//2}")
+        except Exception:
+            pass
+
+    def show(self) -> dict | None:
+        self.wait_window(self)
+        return self._result
+
+    # ---------------- Steps ----------------
+    def _add_step(self, title: str, frame: ttk.Frame):
+        self._steps.append((title, frame))
+
+    def _build_step_what(self):
+        frm = ttk.Frame(self.body)
+        frm.columnconfigure(0, weight=1)
+
+        ttk.Label(frm, text="Perfil de escaneo:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        rb = ttk.Frame(frm)
+        rb.grid(row=1, column=0, sticky="w", pady=(6, 10))
+
+        ttk.Radiobutton(rb, text="Solo documentos (PDF/Word/Excel/PPT/OpenOffice/Textos)",
+                        value="docs", variable=self.profile).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(rb, text="Documentos + SQL (prioridad alta)",
+                        value="docs+sql", variable=self.profile).grid(row=1, column=0, sticky="w")
+        ttk.Radiobutton(rb, text="Todo (incluye binarios)",
+                        value="all", variable=self.profile).grid(row=2, column=0, sticky="w")
+
+        ttk.Checkbutton(frm, text="Detectar documentos aunque no tengan extensión (sniff)",
+                        variable=self.sniff_docs).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(frm, text="Priorizar documentos primero (mejor UX en árboles enormes)",
+                        variable=self.priority_docs).grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+        self._add_step("Qué escanear", frm)
+
+    def _build_step_folders(self):
+        frm = ttk.Frame(self.body)
+        frm.columnconfigure(0, weight=1)
+        frm.columnconfigure(1, weight=1)
+
+        ttk.Label(frm, text=f"Carpeta base:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", columnspan=2)
+        ttk.Label(frm, text=str(self._base), foreground="#444").grid(row=1, column=0, sticky="w", columnspan=2, pady=(0, 8))
+
+        # include mode
+        inc_box = ttk.LabelFrame(frm, text="Incluir")
+        inc_box.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
+        ttk.Radiobutton(inc_box, text="Toda la carpeta base", value="all", variable=self.include_mode).grid(row=0, column=0, sticky="w", pady=(4, 2))
+        ttk.Radiobutton(inc_box, text="Solo estas subcarpetas (lista)", value="only", variable=self.include_mode).grid(row=1, column=0, sticky="w")
+
+        self.lst_include = tk.Listbox(inc_box, height=8, width=48)
+        self.lst_include.grid(row=2, column=0, sticky="nsew", pady=(6, 4), padx=6)
+        for x in self._include_dirs:
+            self.lst_include.insert(tk.END, x)
+
+        inc_btns = ttk.Frame(inc_box)
+        inc_btns.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(inc_btns, text="Añadir…", command=self._add_include).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(inc_btns, text="Quitar", command=self._del_include).grid(row=0, column=1)
+
+        # excludes
+        exc_box = ttk.LabelFrame(frm, text="Excluir (nombre de carpeta o ruta relativa)")
+        exc_box.grid(row=2, column=1, sticky="nsew")
+
+        self.lst_exclude = tk.Listbox(exc_box, height=8, width=48)
+        self.lst_exclude.grid(row=0, column=0, sticky="nsew", pady=(6, 4), padx=6)
+        for x in self._exclude_dirs:
+            self.lst_exclude.insert(tk.END, x)
+
+        exc_entry = ttk.Frame(exc_box)
+        exc_entry.grid(row=1, column=0, sticky="ew", padx=6)
+        exc_entry.columnconfigure(0, weight=1)
+        self.txt_exclude = ttk.Entry(exc_entry)
+        self.txt_exclude.grid(row=0, column=0, sticky="ew")
+        ttk.Button(exc_entry, text="Añadir", command=self._add_exclude_from_entry).grid(row=0, column=1, padx=(6, 0))
+
+        exc_btns = ttk.Frame(exc_box)
+        exc_btns.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(exc_btns, text="Quitar", command=self._del_exclude).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(exc_btns, text="Reset recomendadas", command=self._reset_excludes).grid(row=0, column=1)
+
+        ttk.Label(exc_box, text="Tip: puedes poner rutas tipo  'temp'  o  'build'  o  'datos\\antiguo' (relativa a base).",
+                  foreground="#555").grid(row=3, column=0, sticky="w", padx=6, pady=(2, 6))
+
+        self._add_step("Carpetas", frm)
+
+    def _build_step_perf(self):
+        frm = ttk.Frame(self.body)
+        frm.columnconfigure(0, weight=1)
+
+        ttk.Label(frm, text="Rendimiento:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(frm, text="Preconteo (progreso exacto, tarda más)", variable=self.precount).grid(row=1, column=0, sticky="w", pady=(6, 4))
+
+        mb = ttk.Frame(frm)
+        mb.grid(row=2, column=0, sticky="w", pady=(2, 10))
+        ttk.Label(mb, text="Omitir archivos >").grid(row=0, column=0, sticky="w")
+        sp = ttk.Spinbox(mb, from_=0, to=102400, textvariable=self.skip_over_mb, width=8)
+        sp.grid(row=0, column=1, padx=(6, 6))
+        ttk.Label(mb, text="MB (0 = no omitir)").grid(row=0, column=2, sticky="w")
+
+        ttk.Label(frm, text="En modo rápido el progreso será indeterminado pero con contador y velocidad.",
+                  foreground="#555").grid(row=3, column=0, sticky="w")
+
+        self._add_step("Rendimiento", frm)
+
+    def _build_step_rag(self, rag_available: bool):
+        frm = ttk.Frame(self.body)
+        frm.columnconfigure(0, weight=1)
+
+        ttk.Label(frm, text="RAG / Chunks (opcional):", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+
+        if not rag_available:
+            ttk.Label(frm, text="RAG no disponible en esta build (se desactiva automáticamente).",
+                      foreground="#aa0000").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        else:
+            box = ttk.Frame(frm)
+            box.grid(row=1, column=0, sticky="w", pady=(6, 10))
+
+            ttk.Radiobutton(box, text="Desactivado", value="off", variable=self.rag_mode).grid(row=0, column=0, sticky="w")
+            ttk.Radiobutton(box, text="Solo texto + SQL (rápido)", value="text", variable=self.rag_mode).grid(row=1, column=0, sticky="w")
+            ttk.Radiobutton(box, text="Docs (PDF/DOCX/PPTX/XLSX…) (más lento)", value="docs", variable=self.rag_mode).grid(row=2, column=0, sticky="w")
+
+            mx = ttk.Frame(frm)
+            mx.grid(row=2, column=0, sticky="w")
+            ttk.Label(mx, text="No indexar en RAG archivos >").grid(row=0, column=0, sticky="w")
+            ttk.Spinbox(mx, from_=1, to=4096, textvariable=self.rag_max_mb, width=8).grid(row=0, column=1, padx=(6, 6))
+            ttk.Label(mx, text="MB").grid(row=0, column=2, sticky="w")
+
+        self._add_step("RAG", frm)
+
+    def _build_step_summary(self):
+        frm = ttk.Frame(self.body)
+        frm.columnconfigure(0, weight=1)
+
+        ttk.Label(frm, text="Resumen:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.txt_summary = tk.Text(frm, height=10, width=72)
+        self.txt_summary.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
+        self.txt_summary.configure(state="disabled")
+
+        ttk.Checkbutton(frm, text="Recordar estas opciones (settings.json)", variable=self.remember).grid(row=2, column=0, sticky="w")
+
+        self._add_step("Resumen", frm)
+
+    # ---------------- Buttons ----------------
+    def _show_step(self, idx: int):
+        self._step_idx = idx
+        for _, f in self._steps:
+            f.grid_forget()
+
+        title, frame = self._steps[idx]
+        self.lbl_title.configure(text=f"{idx+1}/{len(self._steps)} — {title}")
+        frame.grid(row=0, column=0, sticky="nsew")
+
+        self.btn_back.configure(state=("normal" if idx > 0 else "disabled"))
+        self.btn_next.configure(state=("normal" if idx < len(self._steps)-1 else "disabled"))
+        self.btn_finish.configure(state=("normal" if idx == len(self._steps)-1 else "disabled"))
+
+        if title == "Resumen":
+            self._refresh_summary()
+
+    def _next(self):
+        if self._step_idx < len(self._steps)-1:
+            self._show_step(self._step_idx + 1)
+
+    def _back(self):
+        if self._step_idx > 0:
+            self._show_step(self._step_idx - 1)
+
+    def _cancel(self):
+        self._result = None
+        self.destroy()
+
+    def _finish(self):
+        # capturar listas
+        include_dirs = list(self.lst_include.get(0, tk.END))
+        exclude_dirs = list(self.lst_exclude.get(0, tk.END))
+
+        cfg = {
+            "profile": self.profile.get(),
+            "sniff_docs": bool(self.sniff_docs.get()),
+            "priority_docs": bool(self.priority_docs.get()),
+            "precount": bool(self.precount.get()),
+            "skip_over_mb": int(self.skip_over_mb.get()),
+            "include_mode": self.include_mode.get(),  # all | only
+            "include_dirs": include_dirs,
+            "exclude_dirs": exclude_dirs,
+            "rag_mode": self.rag_mode.get(),
+            "rag_max_mb": int(self.rag_max_mb.get()),
+            "remember": bool(self.remember.get()),
+        }
+        self._result = cfg
+        self.destroy()
+
+    # ---------------- Helpers ----------------
+    def _refresh_summary(self):
+        include_dirs = list(self.lst_include.get(0, tk.END))
+        exclude_dirs = list(self.lst_exclude.get(0, tk.END))
+
+        lines = []
+        lines.append(f"BASE: {self._base}")
+        lines.append(f"Perfil: {self.profile.get()}")
+        lines.append(f"Sniff docs sin extensión: {self.sniff_docs.get()}")
+        lines.append(f"Prioridad docs: {self.priority_docs.get()}")
+        lines.append(f"Modo: {'Preconteo (exacto)' if self.precount.get() else 'Rápido (indeterminado)'}")
+        lines.append(f"Omitir > {self.skip_over_mb.get()} MB (0 = no)")
+        lines.append(f"Incluir: {'Toda la base' if self.include_mode.get()=='all' else 'Solo subcarpetas'}")
+        if self.include_mode.get() == "only":
+            lines.append("  - " + ("\n  - ".join(include_dirs) if include_dirs else "(lista vacía: no escaneará nada)"))
+        lines.append(f"Excluir ({len(exclude_dirs)}): " + ", ".join(exclude_dirs[:12]) + ("..." if len(exclude_dirs) > 12 else ""))
+
+        lines.append(f"RAG: {self.rag_mode.get()}  (max {self.rag_max_mb.get()} MB)")
+
+        self.txt_summary.configure(state="normal")
+        self.txt_summary.delete("1.0", "end")
+        self.txt_summary.insert("1.0", "\n".join(lines))
+        self.txt_summary.configure(state="disabled")
+
+    def _add_include(self):
+        rel = filedialog.askdirectory(title="Elige subcarpeta a incluir", initialdir=str(self._base))
+        if not rel:
+            return
+        try:
+            relpath = str(Path(rel).relative_to(self._base))
+        except Exception:
+            messagebox.showwarning("Incluir", "La carpeta elegida no cuelga de la carpeta base.")
+            return
+        self.lst_include.insert(tk.END, relpath)
+
+    def _del_include(self):
+        sel = list(self.lst_include.curselection())
+        sel.reverse()
+        for i in sel:
+            self.lst_include.delete(i)
+
+    def _add_exclude_from_entry(self):
+        v = (self.txt_exclude.get() or "").strip()
+        if not v:
+            return
+        self.lst_exclude.insert(tk.END, v)
+        self.txt_exclude.delete(0, tk.END)
+
+    def _del_exclude(self):
+        sel = list(self.lst_exclude.curselection())
+        sel.reverse()
+        for i in sel:
+            self.lst_exclude.delete(i)
+
+    def _reset_excludes(self):
+        self.lst_exclude.delete(0, tk.END)
+        for x in self.DEFAULT_EXCLUDES:
+            self.lst_exclude.insert(tk.END, x)
 
 class OrganizadorFrame(ttk.Frame):
-        # =================== CONFIG (load/save) ===================
-    def _config_dir(self):
-        import os
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        p = os.path.join(base, "IndexGenerator")
+       # ============================ CONFIG (load/save) ============================
+    def _read_settings(self) -> dict:
         try:
-            os.makedirs(p, exist_ok=True)
+            if CONFIG_PATH.exists():
+                return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-        return p
+        return {}
 
-    def _config_path(self):
-        import os
-        return os.path.join(self._config_dir(), "config.json")
-
-
+    def _write_settings(self, data: dict) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _save_config(self):
-        import json
+        """Guarda settings (base_path + últimas opciones de escaneo/export si aplica)."""
         try:
-            with open(self._config_path(), "w", encoding="utf-8") as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
+            data = {}
+            if CONFIG_PATH.exists():
+                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+            data["base_path"] = str(self.base_path) if self.base_path else ""
+            data["llm_model_path"] = getattr(self, "llm_model_path", "")
+
+            # Scan wizard
+            data["scan_last_cfg"] = getattr(self, "_scan_last_cfg", {}) or {}
+            data["scan_skip_wizard"] = bool(getattr(self, "_scan_skip_wizard", False))
+
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-    # ================= /CONFIG =================
+
+       # ============================ /CONFIG ============================
+
 
 # ===========================
     # Scraper entrypoint + stub
@@ -548,6 +1012,21 @@ class OrganizadorFrame(ttk.Frame):
         self.dir_nodes: dict[str, str] = {}     # iid -> ruta absoluta
         self._suspend_dir_select = False        # ← evita que el árbol pise resultados
 
+        # ---- Scan settings (Wizard) ----
+        self.scan_cfg = {
+            "profile": "docs+sql",  # docs | docs+sql | all
+            "sniff_docs": True,
+            "priority_docs": True,
+            "precount": False,  # False = rápido (indeterminado)
+            "skip_over_mb": 0,  # 0 = no omitir
+            "include_mode": "all",  # all | only
+            "include_dirs": [],  # rutas relativas a base (si include_mode=only)
+            "exclude_dirs": [],  # nombres de carpeta o rutas relativas
+            "rag_mode": "off",  # off | text | docs
+            "rag_max_mb": 25,
+            "remember": True,
+        }
+
         # Carga configuración y UI
         self._load_config()
         self._make_layout()
@@ -568,6 +1047,7 @@ class OrganizadorFrame(ttk.Frame):
         # Eventos
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
         self.master.bind("<F5>", lambda e: self.cmd_escanear())
+        self.master.bind("<Control-F5>", lambda e: self.cmd_escanear(quick=True))
         self.master.bind("<Control-l>", lambda e: self._limpiar_textos())
         self.after(80, self._poll_queue)
 
@@ -815,13 +1295,23 @@ class OrganizadorFrame(ttk.Frame):
         grp_res.grid(row=0, column=2, sticky="w")
         self.btn_escanear_bot = tk.Button(grp_res, text="Escanear (F5)", command=self.cmd_escanear,
                                           bg=self.colors["scan"], activebackground=self.colors["scan"])
+
+        self.btn_escanear_bot = tk.Button(grp_res, text="Escanear (F5)", command=self.cmd_escanear,
+                                          bg=self.colors["scan"], activebackground=self.colors["scan"])
         self.btn_escanear_bot.grid(row=0, column=0, padx=(0, 6))
+
+        self.btn_scan_wizard = tk.Button(grp_res, text="⚙ Escaneo…", command=self.cmd_scan_wizard,
+                                         bg=self.colors["scan"], activebackground=self.colors["scan"])
+        self.btn_scan_wizard.grid(row=0, column=1, padx=(0, 6))
+
         self.chk_dry_bot = tk.Checkbutton(grp_res, text="Simular (dry-run)", variable=self.simular_var,
-                                          bg=self.colors["dry"], activebackground=self.colors["dry"], selectcolor="#ffffff")
-        self.chk_dry_bot.grid(row=0, column=1, padx=(0, 6))
+                                          bg=self.colors["dry"], activebackground=self.colors["dry"],
+                                          selectcolor="#ffffff")
+        self.chk_dry_bot.grid(row=0, column=2, padx=(0, 6))
+
         self.btn_vaciar_bot = tk.Button(grp_res, text="Vaciar resultados", command=lambda: self._poblar_resultados([]),
                                         bg=self.colors["clear"], activebackground=self.colors["clear"])
-        self.btn_vaciar_bot.grid(row=0, column=2, padx=(0, 6))
+        self.btn_vaciar_bot.grid(row=0, column=3, padx=(0, 6))
 
         ttk.Separator(row_buttons, orient="vertical").grid(row=0, column=3, sticky="ns", padx=8)
 
@@ -917,95 +1407,103 @@ class OrganizadorFrame(ttk.Frame):
         self._set_progress(0, "0%")
         self._update_buttons_state()
 
-    def cmd_escanear(self):
+    def cmd_scan_wizard(self):
         if not self.base_path:
-            messagebox.showwarning(APP_NAME, "Selecciona primero la carpeta base (UNC en Windows: \\\\servidor\\recurso).")
+            messagebox.showwarning(APP_NAME, "Selecciona primero la carpeta base.")
             return
+
+        rag_available = callable(getattr(self, "_index_file_chunks", None))
+        dlg = ScanWizardDialog(self.master, base_path=self.base_path, initial_cfg=self.scan_cfg,
+                                  rag_available=rag_available)
+        cfg = dlg.show()
+        if not cfg:
+            return
+
+        # Guardamos en memoria y, si procede, persistimos
+        self.scan_cfg = dict(cfg)
+        if cfg.get("remember", True):
+            self._save_config()
+
+        # Lanzamos escaneo con estas opciones
+        self._start_scan(self.scan_cfg)
+        self._append_msg("Escaneo (wizard) iniciado en segundo plano…", "INFO")
+
+    def cmd_escanear(self, quick: bool = False):
+        if not self.base_path:
+            messagebox.showwarning(APP_NAME,
+                                    "Selecciona primero la carpeta base (UNC en Windows: \\\\servidor\\recurso).")
+            return
+
+        # Si ya está escaneando -> el mismo botón hace de DETENER
+        if getattr(self, "_scan_running", False):
+            self.cancel_event.set()
+            self._append_msg("Cancelación solicitada…", "WARN")
+            return
+
+        # Decide config a usar
+        last = getattr(self, "_scan_last_cfg", {}) or {}
+        cfg = (last.copy() if last else self._scan_default_cfg())
+
+        # Si quick o usuario decidió saltar wizard
+        skip = bool(getattr(self, "_scan_skip_wizard", False))
+        if quick or skip:
+            if not cfg:
+                cfg = self._scan_default_cfg()
+            self._start_scan_with_cfg(cfg)
+            return
+
+        # Wizard
+        dlg = ScanWizardDialog(self.master, base_path=str(self.base_path), initial_cfg=cfg,
+                                rag_available=callable(getattr(self, "_index_file_chunks", None)))
+        self.master.wait_window(dlg)
+
+        if not getattr(dlg, "result_cfg", None):
+            self._append_msg("Escaneo cancelado por el usuario (wizard).", "WARN")
+            return
+
+        cfg = dlg.result_cfg
+
+        # Persistencia
+        if cfg.get("remember", True):
+            self._scan_last_cfg = cfg.copy()
+            self._scan_skip_wizard = bool(cfg.get("skip_wizard_next", False))
+            self._save_config()
+
+        self._start_scan_with_cfg(cfg)
+
+    def _start_scan_with_cfg(self, cfg: dict):
+        """Arranca el escaneo con una cfg ya decidida."""
         self.cancel_event.clear()
+        self._scan_running = True
+        try:
+            self.btn_escanear_bot.configure(text="Detener")
+        except Exception:
+            pass
+
         self._set_progress(0)
+        self._progress_set_mode("determinate" if cfg.get("precount", True) else "indeterminate")
+
         self.file_index.clear()
         self._poblar_resultados([])
-        self.lbl_indexinfo.configure(text="Índice: escaneando...")
-        t = threading.Thread(target=self._worker_scan, daemon=True)
+        self.lbl_indexinfo.configure(text="Índice: escaneando…")
+
+        t = threading.Thread(target=self._worker_scan, args=(cfg,), daemon=True)
         t.start()
-        self._append_msg("Escaneo iniciado en segundo plano...", "INFO")
 
-    # ============================ WORKER SCAN ============================
-    def _worker_scan(self):
-        try:
-            total_files = 0
-            for _root, _dirs, files in os.walk(self.base_path):
-                total_files += len(files)
-            if total_files == 0:
-                self.queue.put(("msg", ("No se han encontrado archivos.", "WARN")))
-                self.queue.put(("progress", (0, "0%")))
-                self.queue.put(("index_ready", 0))
-                return
+        prof = cfg.get("profile", "docs_sql")
+        self._append_msg(
+            f"Escaneo iniciado (perfil={prof}, precount={cfg.get('precount', True)}, rag={cfg.get('rag_mode', 'off')})",
+            "INFO")
 
-            processed = 0
-            start = time.time()
-            tmp_index: list[dict] = []
-            self._db_open_for_scan()
-            for root, _dirs, files in os.walk(self.base_path):
-                for fname in files:
-                    if self.cancel_event.is_set():
-                        self.queue.put(("msg", ("Operación cancelada por el usuario.", "WARN")))
-                        self.queue.put(("index_ready", len(tmp_index)))
-                        return
-                    full = Path(root) / fname
-                    try:
-                        stat = full.stat()
-                        size = stat.st_size
-                        mtime = stat.st_mtime
-                        mod_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        continue
-                    ext = full.suffix.lower().lstrip(".") or ""
-                    entry = {
-                        "nombre": fname,
-                        "ext": ext,
-                        "tam": size,
-                        "mod_ts": mtime,
-                        "mod_str": mod_str,
-                        "carpeta": str(full.parent),
-                        "ruta": str(full),
-                    }
-                    tmp_index.append(entry)
-                    self._db_insert_row(entry)
-                    processed += 1
-                    
-                    # RAG index (llamada protegida y opcional)
-                    has_rag = hasattr(self.__class__, "_index_file_chunks") or callable(getattr(self, "_index_file_chunks", None))
-                    if has_rag:
-                        try:
-                            if ext in {'txt','py','md','csv','log','ini','json','xml','yaml','yml','sql','html','htm','docx','pptx','xlsx','xlsm','xltx','pdf'}:
-                                self._index_file_chunks(str(full), mtime)
-                        except Exception as _e:
-                            self.queue.put(("msg", (f"RAG: fallo indexando {fname}: {_e}", "WARN")))
-                    else:
-                        # Silencia el AttributeError y deja una traza discreta
-                        if ext in {'txt','py','md','csv','log','ini','json','xml','yaml','yml','sql','html','htm','docx','pptx','xlsx','xlsm','xltx','pdf'}:
-                            self.queue.put(("msg", (f"RAG: saltado (método no disponible) — {fname}", "DEBUG")))
+    def _start_scan(self, cfg: dict):
+        self.cancel_event.clear()
+        self.file_index.clear()
+        self._poblar_resultados([])
+        self.lbl_indexinfo.configure(text="Índice: escaneando…")
 
-                    if processed % 50 == 0 or processed == total_files:
-                        percent = int((processed / total_files) * 100)
-                        self.queue.put(("progress", (percent, f"{percent}%")))
-                        elapsed_now = time.time() - start
-                        speed = processed / elapsed_now if elapsed_now > 0 else 0.0
-                        rem = max(total_files - processed, 0)
-                        eta_sec = int(rem / speed) if speed > 0 else 0
-                        eta_h = eta_sec // 3600; eta_m = (eta_sec % 3600) // 60; eta_s = eta_sec % 60
-                        self.queue.put(("msg", (f"Escaneo: {processed}/{total_files} ({percent}%) · ~{speed:.0f} ficheros/s · ETA {eta_h:02d}:{eta_m:02d}:{eta_s:02d}", "INFO")))
+           # Modo
 
-            elapsed = time.time() - start
-            self._db_finalize_scan()
-            self.queue.put(("msg", (f"Escaneo completado. Archivos indexados: {processed}. Tiempo: {elapsed:.2f}s", "OK")))
-            self.queue.put(("index_set", tmp_index))
-        except Exception as e:
-            self.queue.put(("msg", (f"ERROR en escaneo: {e}", "ERR")))
-            self.queue.put(("index_ready", 0))
-
-    # ============================ SQLITE HELPERS (MÉTODOS) ============================
+       # ============================ SQLITE HELPERS (MÉTODOS) ============================
     def _db_path(self) -> str:
         """Ruta ÚNICA para el índice 'files' del visor (front y backend)."""
         try:
@@ -1176,6 +1674,11 @@ class OrganizadorFrame(ttk.Frame):
                 if kind == "msg":
                     text, tag = payload
                     self._append_msg(text, tag)
+
+                elif kind == "progress_mode":
+                    (mode,) = payload
+                    self._set_progress_mode(str(mode))
+
                 elif kind == "progress":
                     value, label = payload
                     self._set_progress(value, label)
@@ -1768,7 +2271,32 @@ class OrganizadorFrame(ttk.Frame):
         self.txt_msgs.insert(tk.END, text + "\n", (tag,))
         self.txt_msgs.see(tk.END)
 
+    def _set_progress_mode(self, mode: str):
+        try:
+            if mode == "indeterminate":
+                self.progress.configure(mode="indeterminate", maximum=100)
+                try:
+                    self.progress.start(10)
+                except Exception:
+                    pass
+                self.lbl_prog.configure(text="…")
+            else:
+                try:
+                    self.progress.stop()
+                except Exception:
+                    pass
+                self.progress.configure(mode="determinate", maximum=100)
+        except Exception:
+            pass
+
     def _set_progress(self, value: int, label: str | None = None):
+        try:
+            # si venimos de indeterminado, al tocar value volvemos a determinista
+            if str(self.progress.cget("mode")) == "indeterminate":
+                self._set_progress_mode("determinate")
+        except Exception:
+            pass
+
         value = max(0, min(100, int(value)))
         self.progress["value"] = value
         self.lbl_prog.configure(text=label if label is not None else f"{value}%")
@@ -1794,15 +2322,7 @@ class OrganizadorFrame(ttk.Frame):
         if getattr(self, '_export_menu', None) is not None:
             return
         m = tk.Menu(self, tearoff=0)
-        m.add_command(label='Exportar Excel (visibles, rápido)', command=self.cmd_exportar_excel_rapido_visibles)
-        m.add_command(label='Exportar Excel (todo, rápido 150k+)', command=self.cmd_exportar_excel_rapido)
-        m.add_separator()
-        m.add_command(
-            label='Exportar (motor masivo directo)',
-            command=self._exportar_masivo_directo
-        )
-        m.add_command(label='Exportar Excel (visibles, clásico)', command=lambda: self.cmd_exportar_excel(False))
-        m.add_command(label='Exportar Excel (todo, clásico)', command=lambda: self.cmd_exportar_excel(True))
+        m.add_command(label='Exportar a Excel (asistente)', command=self.cmd_exportar_excel_asistente)
         self._export_menu = m
 
     def _exportar_masivo_directo(self):
@@ -1937,6 +2457,175 @@ class OrganizadorFrame(ttk.Frame):
         except Exception as e:
             messagebox.showerror("Exportar (masivo)", str(e))
 
+    def cmd_exportar_excel_asistente(self):
+        from tkinter import filedialog, messagebox
+        import threading, os, time
+        from pathlib import Path
+
+        # 1) Base
+        base = self.base_path
+        if not base:
+            chosen = filedialog.askdirectory(title="Selecciona la CARPETA BASE")
+            if not chosen:
+                return
+            base = Path(chosen)
+            self.base_path = base
+
+        base = Path(base)
+        if not base.exists():
+            messagebox.showerror("Exportar", f"La carpeta base no existe:\n{base}")
+            return
+
+        # 2) Wizard mínimo (include/exclude)
+        dlg = ExportWizardDialog(self, base_path=base)
+        ok, cfg = dlg.wait()
+        if not ok:
+            return
+
+        include_dirs = cfg.get("include_dirs", [])
+        exclude_dirs = cfg.get("exclude_dirs", [])
+        docs_only = bool(cfg.get("docs_only", True))
+
+        # 3) Guardar como...
+        default_name = f"Indice_TREE_{base.name}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        out = filedialog.asksaveasfilename(
+            title="Guardar Excel",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("Todos", "*.*")]
+        )
+        if not out:
+            return
+
+        # 4) Progreso UI
+        self._task_open("Generando Excel…", total=100)
+        self._task_set_indeterminate("Pre-scan (contando + profundidad)…")
+        self._append_msg("Exportación asistida iniciada…", "INFO")
+
+        def _work():
+            try:
+                from meta_store import MetaStore
+                from massive_indexer import export_massive_tree_index
+
+                # PRE-SCAN: total + max depth (para headers jerárquicos)
+                total = 0
+                max_depth = 0
+
+                # reutilizamos la misma lógica de include/exclude del motor (sin duplicar demasiado)
+                # para no re-walkear 3 veces: aquí solo computamos total y profundidad.
+                roots = include_dirs[:] if include_dirs else [str(base)]
+                ex = exclude_dirs[:]
+
+                def _norm(p: str) -> str:
+                    import os
+                    return os.path.normcase(os.path.normpath(p))
+
+                ex_norm = [_norm(str(Path(e) if Path(e).is_absolute() else (base / e))) for e in ex]
+
+                def _is_excluded_dir(path_str: str) -> bool:
+                    import os
+                    k = _norm(path_str)
+                    for exx in ex_norm:
+                        if k == exx or k.startswith(exx + os.sep):
+                            return True
+                    return False
+
+                # doc filter (coherente con el motor)
+                DOC_EXTS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".odt", ".ods",
+                            ".odp", ".rtf", ".txt", ".md", ".csv", ".sql"}
+
+                import os
+                from pathlib import Path as _P
+                for r in roots:
+                    rr = _P(r)
+                    if not rr.is_absolute():
+                        rr = (base / rr).resolve()
+                    if not rr.exists():
+                        continue
+                    for root, dirs, files in os.walk(rr):
+                        if _is_excluded_dir(root):
+                            dirs[:] = []
+                            continue
+                        kept = []
+                        for d in dirs:
+                            child = os.path.join(root, d)
+                            if _is_excluded_dir(child):
+                                continue
+                            kept.append(d)
+                        dirs[:] = kept
+
+                        for fn in files:
+                            p = _P(root) / fn
+                            ext = (p.suffix or "").lower()
+                            if docs_only and ext and ext not in DOC_EXTS:
+                                continue
+                            total += 1
+                            try:
+                                rel_parent = p.parent.resolve().relative_to(base)
+                                depth = len(rel_parent.parts)
+                                if depth > max_depth:
+                                    max_depth = depth
+                            except Exception:
+                                pass
+
+                self.queue.put(("task_total", int(total if total > 0 else 1)))
+                if total == 0:
+                    self.queue.put(("msg", ("No hay ficheros con el filtro seleccionado.", "WARN")))
+                    self.queue.put(("task_close", None))
+                    return
+
+                store = MetaStore(self._db_path())
+
+                def _meta_provider(abs_path: str):
+                    try:
+                        kws_list = store.get_keywords(abs_path)
+                        note = store.get_note(abs_path) or ""
+                        return ("; ".join(kws_list), note)
+                    except Exception:
+                        return ("", "")
+
+                last = 0
+
+                def _cb(event: str, value: str):
+                    nonlocal last
+                    if event == "progress":
+                        try:
+                            n = int(value)
+                        except Exception:
+                            n = last
+                        inc = max(0, n - last)
+                        if inc:
+                            self.queue.put(("task_inc", inc))
+                            last = n
+
+                # Si el usuario eligió CSV, desactivar XLSX
+                prefer_xlsx = not str(out).lower().endswith(".csv")
+
+                self.queue.put(("task_status", "Exportando…"))
+
+                path = export_massive_tree_index(
+                    base_path=str(base),
+                    out_path=str(out),
+                    prefer_xlsx=prefer_xlsx,
+                    meta_provider=_meta_provider,
+                    progress_cb=_cb,
+                    include_dirs=include_dirs,
+                    exclude_dirs=exclude_dirs,
+                    docs_only=docs_only,
+                    pre_total=total,
+                    pre_max_depth=max_depth,
+                    tick_every=50,
+                )
+
+                self.queue.put(("task_close", None))
+                self.queue.put(("msg", (f"Excel guardado en: {path}", "OK")))
+
+            except Exception as e:
+                self.queue.put(("task_close", None))
+                self.queue.put(("msg", (f"ERROR exportando: {e}", "ERR")))
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def _task_open(self, title: str, total: int):
         try:
              self._task_win.destroy()
@@ -2037,12 +2726,25 @@ class OrganizadorFrame(ttk.Frame):
         try:
             if CONFIG_PATH.exists():
                 data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
                 base = data.get("base_path")
                 if base:
                     p = Path(base)
                     if p.exists():
                         self.base_path = p
                 self.llm_model_path = data.get("llm_model_path", "")
+                self._scan_last_cfg = data.get("scan_last_cfg", {}) or {}
+                self._scan_skip_wizard = bool(data.get("scan_skip_wizard", False))
+
+                # Wizard scan
+                cfg = data.get("scan_cfg", {})
+                if isinstance(cfg, dict):
+                    # merge: respeta defaults + sobreescribe lo guardado
+                    try:
+                        self.scan_cfg.update(cfg)
+                    except Exception:
+                        pass
+
         except Exception:
             pass
 

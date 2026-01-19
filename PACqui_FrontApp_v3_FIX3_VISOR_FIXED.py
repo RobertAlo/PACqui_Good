@@ -319,6 +319,8 @@ class AppRoot(tk.Tk):
         # Carga del módulo del Visor + (opcional) RAG patch
         try:
             base = _import_organizador()
+            print("Organizador cargado desde:", getattr(base, "__file__", "?"))
+
             try:
                 _import_rag_patch()
             except Exception:
@@ -961,6 +963,8 @@ class AdminPanel(ttk.Notebook):
         # === EMBED: Herramientas clásicas dentro de "Índice y herramientas" ===
         try:
             base = _import_organizador()     # Carga módulo del Organizador
+            print("Organizador cargado desde:", getattr(base, "__file__", "?"))
+
             try:
                 _import_rag_patch()          # Activa RAG monkey-patch (si está)
             except Exception:
@@ -3723,6 +3727,8 @@ class AdminPanel(ttk.Notebook):
     def _open_legacy(self):
         try:
             base = _import_organizador()
+            print("Organizador cargado desde:", getattr(base, "__file__", "?"))
+
         except Exception as e:
             messagebox.showerror(APP_NAME, f"No puedo abrir Admin (Organizador):\n{e}")
             return
